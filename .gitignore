@@ -1,0 +1,41 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python bytecode and package artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Test, type-checker, and linter caches
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyright/
+.tox/
+.nox/
+
+# Local agent tooling
+.agents/
+.codex/
+skills-lock.json
+
+# Runtime output
+runs/
+*.log
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
