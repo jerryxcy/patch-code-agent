@@ -5,17 +5,27 @@
 implementation 與 acceptance spec 見
 [GitHub Issue #2](https://github.com/jerryxcy/patch-code-agent/issues/2)。
 
-這份文件描述的是已確認的 **MVP target design**。目前 `main` 仍是唯讀 scaffold，實作與
-驗收進度以 GitHub Issue #2 為準。
+這份文件描述的是已確認的 **MVP target design**。目前已完成 Fixture Registry、明確 opt-in
+的 Trusted Repository Adapter、隔離 Run Workspace，以及 SQLite-backed `planned` status；
+模型編輯、Approval Gate、Verification 與 terminal report 仍待實作。驗收進度以 GitHub
+Issue #2 為準。
 
 ---
 
 ## 一、Patch Run lifecycle
 
+Repository acquisition 與 Patch Run execution 是不同的 seam。Patch Run 接收已驗證的
+Repository Source、Patch Run Contract 與 immutable snapshot，而不依賴來源位於 wheel、
+本機 checkout 或其他儲存位置。Required deterministic scenarios 使用 registry-backed Fixture
+Adapter；Trusted Repository Adapter 需要明確的 local path、外部 Patch Run Contract 與 trust
+acknowledgement，但不改變 Run Workspace、graph、Checkpoint、Approval 或 Verification 的
+interface。Trusted Repository code 具有 host execution authority，不因 path containment 而
+成為 sandbox，且不得送入 Gemini free tier。
+
 ```mermaid
 flowchart TD
     fixture["Fixture Repository<br/>registered · immutable · synthetic"]
-    workspace["建立 Run Workspace<br/>runs/&lt;run-id&gt;/workspace"]
+    workspace["建立 Run Workspace<br/>external data root / &lt;run-id&gt; / workspace"]
     baseline{"Baseline Verification"}
     inspect["受控 inspect<br/>list · read · search"]
     plan["Plan"]
@@ -26,7 +36,7 @@ flowchart TD
     budget{"Budget 或 attempts<br/>已耗盡？"}
     diagnosis["Diagnosis"]
 
-    invalid(["Invalid Fixture"])
+    not_reproduced(["Issue Not Reproduced"])
     rejected(["Rejected"])
     changed(["Workspace Changed / Error"])
     succeeded(["Succeeded"])
@@ -34,7 +44,7 @@ flowchart TD
     report["finalize Run Report"]
 
     fixture --> workspace --> baseline
-    baseline -->|pass| invalid
+    baseline -->|pass| not_reproduced
     baseline -->|error| changed
     baseline -->|fail| inspect
     inspect --> plan --> candidate --> approval
@@ -48,7 +58,7 @@ flowchart TD
     budget -->|是| exhausted
     budget -->|否| diagnosis --> candidate
 
-    invalid --> report
+    not_reproduced --> report
     rejected --> report
     changed --> report
     succeeded --> report
@@ -57,8 +67,8 @@ flowchart TD
 
 順序有三個不能交換的 invariant：
 
-1. **先跑 baseline，再呼叫模型。** Baseline 通過代表 Fixture Repository 無法證明修補效果，
-   Patch Run 直接成為 Invalid Fixture。
+1. **先跑 baseline，再呼叫模型。** Baseline 通過代表 Repository Source 未能重現 Issue，
+   Patch Run 直接成為 Issue Not Reproduced。
 2. **先保存 Candidate Patch，再暫停。** Approval Gate 顯示的 diff 與 checksum 必須是
    immutable Run Artifact，resume 時才能證明核准的仍是同一份內容。
 3. **先核准，再寫入。** 模型永遠沒有直接寫入能力；host 驗證所有 preconditions 後才套用
@@ -102,7 +112,7 @@ Verification summary。不能放 model client、open file、subprocess handle、
 Filesystem layout：
 
 ```text
-runs/
+~/.patch-code-agent/runs/  # default data root; must not overlap Repository Source
   checkpoints.sqlite
   <run-id>/
     workspace/
@@ -141,7 +151,7 @@ Run Event 使用 stable event ID，append 前先確認尚未存在。LangGraph r
 每一層 path 都拒絕 symlink；resolved path 必須仍位於 Run Workspace。掃描排除 `.git`、
 virtualenv、cache、build output 與 hidden directories。
 
-Candidate Patch 只能替換 Fixture Manifest `editable_paths` 中已存在、已由模型讀過的檔案。
+Candidate Patch 只能替換 Patch Run Contract `editable_paths` 中已存在、已由模型讀過的檔案。
 每個 replacement 包含 `path + expected_sha256 + new_content`；MVP 不支援 create、delete、rename
 或 binary changes。Host 驗證 replacements 後，自己計算供 Approval Gate 顯示的 unified diff。
 
@@ -197,7 +207,7 @@ pytest exit code 的分類：
 
 | Exit code | Baseline | Repair Attempt |
 |---:|---|---|
-| `0` | Invalid Fixture | Succeeded |
+| `0` | Issue Not Reproduced | Succeeded |
 | `1` | 正常的 failing baseline | 可診斷的 Verification failure |
 | `2`–`5` | Verification Error | Verification Error |
 | timeout | Budget Exceeded | Budget Exceeded |
@@ -210,7 +220,7 @@ excerpt。Free-tier quota、429 或 provider unavailable 讓外層 Live Smoke Ru
 
 ## 六、Outcomes 與 Run Report
 
-每個 terminal outcome 都執行 `finalize_report`：Succeeded、Rejected、Invalid Fixture、
+每個 terminal outcome 都執行 `finalize_report`：Succeeded、Rejected、Issue Not Reproduced、
 Attempts Exhausted、Budget Exceeded、Workspace Changed 或 Error。Rejected Candidate Patch
 不算 Repair Attempt。
 
@@ -220,7 +230,9 @@ Target Run Report：
 {
   "schema_version": "1",
   "run_id": "<run-id>",
-  "fixture_id": "cart-discount",
+  "source_kind": "fixture",
+  "source_id": "cart-discount",
+  "source_revision": "<source-revision>",
   "model_id": "gemini-3.7-flash",
   "outcome": "succeeded",
   "terminal_reason": null,
@@ -266,7 +278,7 @@ Target Run Report：
 ## 七、MVP 之外
 
 - Naive-agent versus harness comparison
-- Arbitrary 或 untrusted repositories
+- Untrusted repositories 或 implicit repository discovery
 - Hostile-code execution sandbox
 - Git branch / commit integration
 - Provider-agnostic model support

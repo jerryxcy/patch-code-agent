@@ -6,7 +6,7 @@ repository repairs. This glossary names the concepts used to discuss its behavio
 ## Language
 
 **Patch Run**:
-A resumable effort to resolve one Issue from a Fixture Repository in an isolated Run
+A resumable effort to resolve one Issue from a Repository Source in an isolated Run
 Workspace, including planning, approval, Repair Attempts, and its final outcome.
 _Avoid_: Session, job, agent run
 
@@ -44,7 +44,7 @@ its exact diff and checksum, before it is applied to the Run Workspace.
 _Avoid_: Confirmation, permission prompt
 
 **Verification**:
-Execution of the Fixture Repository's declared acceptance command against a Run Workspace.
+Execution of a Patch Run Contract's declared acceptance command against a Run Workspace.
 _Avoid_: Test run, check, evaluation
 
 **Run Report**:
@@ -73,20 +73,39 @@ Verification duration, Repair Attempts, and active Patch Run duration; time paus
 Approval Gate is excluded.
 _Avoid_: Rate limit, quota, retry limit
 
+**Repository Source**:
+The immutable repository content selected as the origin of a Run Workspace and paired with a
+Patch Run Contract.
+_Avoid_: Selected repository, input repo, repo path
+
+**Source Revision**:
+The content identity of the effective Repository Source snapshot copied into a Run Workspace,
+independent of Git history.
+_Avoid_: Git revision, commit SHA, workspace hash
+
+**Patch Run Contract**:
+The validated association between a Repository Source, its Issue, argv-based Verification
+command, and exact set of editable paths.
+_Avoid_: Config file, metadata
+
 **Fixture Repository**:
-A small, immutable, registered synthetic repository with a known Issue and declared
-Verification command whose baseline is expected to fail, used as the input to Patch Runs.
+A small, registered synthetic Repository Source whose known Issue has a reproducible failing
+baseline, used for deterministic Patch Runs and integration checks.
 _Avoid_: Example repo, sample project, test repo
 
 **Fixture Manifest**:
-The validated contract that identifies a Fixture Repository's Issue, argv-based
-Verification command, and exact set of editable paths.
-_Avoid_: Config file, metadata
+The packaged representation of a Fixture Repository's Patch Run Contract.
+_Avoid_: Fixture config, fixture metadata
+
+**Trusted Repository**:
+A local Repository Source explicitly selected by a user who accepts that its code and
+Verification command execute with host authority.
+_Avoid_: Arbitrary repository, safe repository
 
 **Run Workspace**:
-The isolated, durable copy of a Fixture Repository that one Patch Run may inspect, modify,
+The isolated, durable copy of a Repository Source that one Patch Run may inspect, modify,
 verify, and resume.
-_Avoid_: Selected repository, working directory, repo path
+_Avoid_: Working directory, checkout
 
 **Naive Baseline**:
 The minimally constrained coding-agent behavior used as the comparison point for
@@ -113,9 +132,10 @@ _Avoid_: Passed, fixed
 A Patch Run ended because a human rejected its Candidate Patch at an Approval Gate.
 _Avoid_: Denied, cancelled
 
-**Invalid Fixture**:
-A Patch Run that cannot demonstrate a repair because its baseline Verification passed.
-_Avoid_: Already passing, no-op
+**Issue Not Reproduced**:
+A Patch Run whose baseline Verification passed, so its Repository Source did not reproduce
+the Issue under the declared Patch Run Contract.
+_Avoid_: Invalid Fixture, already passing, no-op
 
 **Attempts Exhausted**:
 A Patch Run that used every permitted Repair Attempt without successful Verification.
