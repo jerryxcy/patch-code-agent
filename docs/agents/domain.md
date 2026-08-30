@@ -5,6 +5,8 @@ How the engineering skills should consume this repo's domain documentation when 
 ## Before exploring, read these
 
 - **`CONTEXT.md`** at the repo root.
+- **`docs/design.md`** when the task touches Patch Run control flow, trust boundaries,
+  persistence, Approval, Verification, Resource Budgets, or Run Artifacts.
 - **`docs/adr/`**: read ADRs that touch the area you're about to work in.
 
 If either location doesn't exist, proceed silently. The domain-modeling skill creates files lazily when terms or decisions are resolved.
@@ -16,9 +18,11 @@ This is a single-context repository:
 ```text
 /
 ├── CONTEXT.md
-├── docs/adr/
-│   ├── 0001-example-decision.md
-│   └── 0002-another-decision.md
+├── docs/
+│   ├── design.md
+│   └── adr/
+│       ├── 0001-example-decision.md
+│       └── 0002-another-decision.md
 └── src/
 ```
 
