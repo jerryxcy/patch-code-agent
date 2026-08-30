@@ -1,7 +1,9 @@
 from pathlib import Path
 
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
+from langgraph.graph.state import CompiledStateGraph
 
 from patch_code_agent.state import RunState
 
@@ -44,7 +46,11 @@ def create_plan(state: RunState) -> RunState:
     }
 
 
-def build_graph():
+def build_graph(
+    *,
+    checkpointer: BaseCheckpointSaver | None = None,
+) -> CompiledStateGraph:
+    selected_checkpointer = checkpointer if checkpointer is not None else InMemorySaver()
     builder = StateGraph(RunState)
     builder.add_node("validate_input", validate_input)
     builder.add_node("inspect_repo", inspect_repo)
@@ -53,4 +59,4 @@ def build_graph():
     builder.add_edge("validate_input", "inspect_repo")
     builder.add_edge("inspect_repo", "create_plan")
     builder.add_edge("create_plan", END)
-    return builder.compile(checkpointer=InMemorySaver())
+    return builder.compile(checkpointer=selected_checkpointer)
