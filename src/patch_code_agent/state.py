@@ -41,6 +41,8 @@ class RunState(TypedDict, total=False):
         issue: Validated natural-language problem statement from the Patch Run Contract.
         verification_argv: Controlled command arguments executed without a shell.
         editable_paths: Contract paths future patch application is allowed to modify.
+        protected_paths: Issue, manifest, and Verification files that Candidate Patches cannot
+            replace even if a malformed editable allowlist includes them.
         model_requests: Durable count of model calls made so far; initialized before baseline.
         workspace_path: Absolute path to this Run's isolated mutable workspace.
         baseline_verification: Bounded serialized ``BaselineVerificationSummary``.
@@ -77,6 +79,7 @@ class RunState(TypedDict, total=False):
     issue: str
     verification_argv: list[str]
     editable_paths: list[str]
+    protected_paths: list[str]
     model_requests: int
     workspace_path: str
     baseline_verification: dict[str, object]

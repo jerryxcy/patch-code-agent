@@ -84,6 +84,15 @@ def create_cli(
                 return "Trusted Repository"
         assert_never(source_kind)
 
+    def print_candidate_patch(reference: CandidatePatchReference, diff: str) -> None:
+        """Render the one canonical CLI view of an immutable Candidate Patch."""
+        console.print("[bold yellow]Candidate Patch[/]")
+        console.print(diff, markup=False, highlight=False, soft_wrap=True)
+        console.print(f"[dim]Candidate Artifact:[/] {reference.path}")
+        console.print(f"[dim]Candidate Checksum:[/] {reference.sha256}", soft_wrap=True)
+        console.print(f"[dim]Candidate Diff:[/] {reference.diff_path}")
+        console.print(f"[dim]Diff Checksum:[/] {reference.diff_sha256}", soft_wrap=True)
+
     def outcome_label(status: str) -> str | None:
         """Translate terminal internal states into stable CLI outcome labels."""
         return {
@@ -113,18 +122,7 @@ def create_cli(
                 result["run_id"],
                 candidate_reference,
             )
-            console.print("[bold yellow]Candidate Patch[/]")
-            console.print(candidate.diff, markup=False, highlight=False, soft_wrap=True)
-            console.print(f"[dim]Candidate Artifact:[/] {candidate_reference.path}")
-            console.print(
-                f"[dim]Candidate Checksum:[/] {candidate_reference.sha256}",
-                soft_wrap=True,
-            )
-            console.print(f"[dim]Candidate Diff:[/] {candidate_reference.diff_path}")
-            console.print(
-                f"[dim]Diff Checksum:[/] {candidate_reference.diff_sha256}",
-                soft_wrap=True,
-            )
+            print_candidate_patch(candidate_reference, candidate.diff)
         console.print(f"[dim]Run Identifier:[/] {result['run_id']}")
         console.print(
             f"[dim]{source_label(result['source_kind'])}:[/] {result['source_id']}"
@@ -195,27 +193,7 @@ def create_cli(
             and patch_run.candidate_diff is not None
             and patch_run.candidate_artifact is not None
         ):
-            console.print("[bold yellow]Candidate Patch[/]")
-            console.print(
-                patch_run.candidate_diff,
-                markup=False,
-                highlight=False,
-                soft_wrap=True,
-            )
-            console.print(
-                f"[dim]Candidate Artifact:[/] {patch_run.candidate_artifact.path}"
-            )
-            console.print(
-                f"[dim]Candidate Checksum:[/] {patch_run.candidate_artifact.sha256}",
-                soft_wrap=True,
-            )
-            console.print(
-                f"[dim]Candidate Diff:[/] {patch_run.candidate_artifact.diff_path}"
-            )
-            console.print(
-                f"[dim]Diff Checksum:[/] {patch_run.candidate_artifact.diff_sha256}",
-                soft_wrap=True,
-            )
+            print_candidate_patch(patch_run.candidate_artifact, patch_run.candidate_diff)
 
 
     @cli.command()

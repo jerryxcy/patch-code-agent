@@ -110,6 +110,7 @@ def create_candidate(state: RunState, builder: CandidatePatchBuilder) -> RunStat
         workspace=Path(state["workspace_path"]),
         issue=state["issue"],
         editable_paths=state["editable_paths"],
+        protected_paths=state.get("protected_paths", []),
         plan_reference=plan_reference,
         attempt=state.get("attempt", 0) + 1,
         expected_reference=(

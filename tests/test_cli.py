@@ -409,12 +409,47 @@ def test_candidate_patch_rejects_tests_issue_and_manifest_changes(
     )
 
     assert result.exit_code == 2
-    assert f"Candidate Patch path is not editable: {path}" in result.output
+    assert f"Candidate Patch path is protected: {path}" in result.output
     run_root = next(path for path in data_root.iterdir() if path.is_dir())
     assert (run_root / "workspace" / "cart.py").read_bytes() == (
         Path(__file__).parents[1] / "examples" / "tiny_repo" / "cart.py"
     ).read_bytes()
     assert not (run_root / "attempts" / "1" / "candidate.json").exists()
+
+
+@pytest.mark.parametrize("path", ["test_cart.py", "issue.md", "fixture.toml"])
+def test_candidate_patch_rejects_protected_files_even_when_manifest_marks_them_editable(
+    tmp_path: Path,
+    path: str,
+) -> None:
+    fixture = tmp_path / "unsafe-fixture"
+    fixture.mkdir()
+    (fixture / "fixture.toml").write_text(
+        '''fixture_id = "unsafe-fixture"
+issue_path = "issue.md"
+verification = ["pytest", "test_cart.py"]
+editable_paths = ["cart.py", "test_cart.py", "issue.md", "fixture.toml"]
+''',
+        encoding="utf-8",
+    )
+    (fixture / "issue.md").write_text("# Protected files stay immutable\n", encoding="utf-8")
+    (fixture / "cart.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (fixture / "test_cart.py").write_text(
+        "def test_failure():\n    assert False\n",
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(
+        create_cli(
+            model_gateway=CandidateScenarioModel("protected", path),
+            data_root=tmp_path / "runs",
+            fixture_roots=(fixture,),
+        ),
+        ["run", "unsafe-fixture"],
+    )
+
+    assert result.exit_code == 2
+    assert f"Candidate Patch path is protected: {path}" in result.output
 
 
 @pytest.mark.parametrize(
@@ -446,6 +481,20 @@ def test_candidate_patch_rejects_unsafe_structured_replacements(
 
     assert result.exit_code == 2
     assert message in result.output
+
+
+def test_candidate_diff_marks_a_missing_trailing_newline_exactly(tmp_path: Path) -> None:
+    result, data_root = _run_trusted_inspection(
+        tmp_path,
+        CandidateScenarioModel("valid"),
+        extra_files={"cart.py": b"VALUE = 1"},
+    )
+    run_identifier = _run_identifier(result.output)
+    diff = (data_root / run_identifier / "attempts" / "1" / "candidate.diff").read_text()
+
+    assert result.exit_code == 0, result.output
+    assert "-VALUE = 1\n\\ No newline at end of file\n" in diff
+    assert "+VALUE = 1# proposed change\n" in diff
 
 
 def test_model_cannot_read_an_absolute_workspace_path(tmp_path: Path) -> None:

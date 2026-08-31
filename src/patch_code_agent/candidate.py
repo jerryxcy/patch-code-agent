@@ -3,7 +3,8 @@
 import difflib
 import hashlib
 import json
-from pathlib import Path
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -41,6 +42,37 @@ class CandidatePatchReference(BaseModel):
     diff_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
+@dataclass(frozen=True, slots=True)
+class _CandidateArtifactPaths:
+    """Keep one attempt's Candidate Artifact path family together."""
+
+    attempt_root: Path
+
+    @classmethod
+    def for_attempt(cls, run_root: Path, attempt: int) -> "_CandidateArtifactPaths":
+        return cls(run_root / "attempts" / str(attempt))
+
+    @classmethod
+    def from_reference(
+        cls,
+        run_root: Path,
+        reference: CandidatePatchReference,
+    ) -> "_CandidateArtifactPaths":
+        return cls((run_root / reference.path).parent)
+
+    @property
+    def candidate(self) -> Path:
+        return self.attempt_root / "candidate.json"
+
+    @property
+    def diff(self) -> Path:
+        return self.attempt_root / "candidate.diff"
+
+    @property
+    def completion(self) -> Path:
+        return self.attempt_root / ".candidate-complete"
+
+
 class CandidatePatchResult(BaseModel):
     """Candidate artifact, exact diff, and durable reference returned by creation or replay."""
 
@@ -65,34 +97,22 @@ class CandidatePatchBuilder:
         workspace: Path,
         issue: str,
         editable_paths: list[str],
+        protected_paths: list[str] | tuple[str, ...] = (),
         plan_reference: PlanArtifactReference,
         attempt: int,
         expected_reference: CandidatePatchReference | None = None,
     ) -> CandidatePatchResult:
         """Create one Candidate Patch or load the completed artifact during graph replay."""
         run_root = self._data_root / run_id
-        attempt_root = run_root / "attempts" / str(attempt)
-        candidate_path = attempt_root / "candidate.json"
-        diff_path = attempt_root / "candidate.diff"
-        completion_path = attempt_root / ".candidate-complete"
-        if attempt_root.exists():
-            return _load_completed_result(
-                candidate_path,
-                diff_path,
-                completion_path,
-                expected_reference,
-            )
+        paths = _CandidateArtifactPaths.for_attempt(run_root, attempt)
+        if paths.attempt_root.exists():
+            return _load_completed_result(paths, expected_reference)
 
-        attempt_root.parent.mkdir(exist_ok=True)
+        paths.attempt_root.parent.mkdir(exist_ok=True)
         try:
-            attempt_root.mkdir(exist_ok=False)
+            paths.attempt_root.mkdir(exist_ok=False)
         except FileExistsError:
-            return _load_completed_result(
-                candidate_path,
-                diff_path,
-                completion_path,
-                expected_reference,
-            )
+            return _load_completed_result(paths, expected_reference)
 
         inspector = WorkspaceInspector(workspace)
         plan = load_plan_artifact(self._data_root, run_id, plan_reference).plan
@@ -107,6 +127,7 @@ class CandidatePatchBuilder:
         candidate, exact_diff = _validate_and_diff(
             workspace=workspace,
             editable_paths=editable_paths,
+            protected_paths=protected_paths,
             candidate=candidate,
             inspector=inspector,
         )
@@ -123,9 +144,9 @@ class CandidatePatchBuilder:
         )
         artifact_bytes = (artifact.model_dump_json(indent=2) + "\n").encode("utf-8")
         candidate_checksum = hashlib.sha256(artifact_bytes).hexdigest()
-        diff_path.write_bytes(diff_bytes)
-        candidate_path.write_bytes(artifact_bytes)
-        completion_path.write_text(
+        paths.diff.write_bytes(diff_bytes)
+        paths.candidate.write_bytes(artifact_bytes)
+        paths.completion.write_text(
             json.dumps(
                 {"candidate_sha256": candidate_checksum, "diff_sha256": diff_checksum},
                 sort_keys=True,
@@ -152,31 +173,30 @@ def load_candidate_patch(
 ) -> CandidatePatchResult:
     """Load a completed Candidate Patch and verify both durable artifact checksums."""
     run_root = data_root.resolve() / run_id
-    attempt_root = (run_root / reference.path).parent
-    return _load_completed_result(
-        run_root / reference.path,
-        run_root / reference.diff_path,
-        attempt_root / ".candidate-complete",
-        reference,
-    )
+    paths = _CandidateArtifactPaths.from_reference(run_root, reference)
+    return _load_completed_result(paths, reference)
 
 
 def _validate_and_diff(
     *,
     workspace: Path,
     editable_paths: list[str],
+    protected_paths: list[str] | tuple[str, ...],
     candidate: CandidatePatch,
     inspector: WorkspaceInspector,
 ) -> tuple[CandidatePatch, str]:
     editable = set(editable_paths)
+    protected = set(protected_paths)
     read_hashes = inspector.read_hashes
     observed_paths: set[str] = set()
-    validated = []
+    validated_replacements = []
     diff_parts: list[str] = []
     for replacement in sorted(candidate.replacements, key=lambda item: item.path):
         if replacement.path in observed_paths:
             raise ValueError(f"Candidate Patch contains duplicate path: {replacement.path}")
         observed_paths.add(replacement.path)
+        if replacement.path in protected or _is_test_path(replacement.path):
+            raise ValueError(f"Candidate Patch path is protected: {replacement.path}")
         if replacement.path not in editable:
             raise ValueError(f"Candidate Patch path is not editable: {replacement.path}")
         if replacement.path not in read_hashes:
@@ -205,32 +225,60 @@ def _validate_and_diff(
             raise ValueError(f"Candidate Patch replacement must be text: {replacement.path}")
         if replacement.new_content == current:
             raise ValueError(f"Candidate Patch replacement must change content: {replacement.path}")
-        diff_parts.extend(
-            difflib.unified_diff(
-                current.splitlines(keepends=True),
-                replacement.new_content.splitlines(keepends=True),
-                fromfile=f"a/{replacement.path}",
-                tofile=f"b/{replacement.path}",
+        diff_parts.append(
+            _unified_diff(
+                path=replacement.path,
+                before=current,
+                after=replacement.new_content,
             )
         )
-        validated.append(replacement)
-    return CandidatePatch(replacements=tuple(validated)), "".join(diff_parts)
+        validated_replacements.append(replacement)
+    return CandidatePatch(replacements=tuple(validated_replacements)), "".join(diff_parts)
+
+
+def _is_test_path(path: str) -> bool:
+    """Recognize conventional test paths that must stay outside Candidate Patches."""
+    parsed = PurePosixPath(path)
+    name = parsed.name.lower()
+    return (
+        any(part.lower() in {"test", "tests", "spec", "specs"} for part in parsed.parts[:-1])
+        or name == "conftest.py"
+        or name.startswith("test_")
+        or ".test." in name
+        or ".spec." in name
+        or name.endswith("_test.py")
+    )
+
+
+def _unified_diff(*, path: str, before: str, after: str) -> str:
+    """Return an applicable unified diff, including missing-newline markers."""
+    rendered: list[str] = []
+    for line in difflib.unified_diff(
+        before.splitlines(keepends=True),
+        after.splitlines(keepends=True),
+        fromfile=f"a/{path}",
+        tofile=f"b/{path}",
+    ):
+        if line.endswith("\n"):
+            rendered.append(line)
+            continue
+        rendered.append(line + "\n")
+        rendered.append("\\ No newline at end of file\n")
+    return "".join(rendered)
 
 
 def _load_completed_result(
-    candidate_path: Path,
-    diff_path: Path,
-    completion_path: Path,
+    paths: _CandidateArtifactPaths,
     expected_reference: CandidatePatchReference | None,
 ) -> CandidatePatchResult:
-    if not candidate_path.is_file() or not diff_path.is_file() or not completion_path.is_file():
+    if not paths.candidate.is_file() or not paths.diff.is_file() or not paths.completion.is_file():
         raise RuntimeError("Candidate Patch has an incomplete replay ledger; refusing a new request")
-    artifact_bytes = candidate_path.read_bytes()
-    diff_bytes = diff_path.read_bytes()
+    artifact_bytes = paths.candidate.read_bytes()
+    diff_bytes = paths.diff.read_bytes()
     artifact = CandidatePatchArtifact.model_validate_json(artifact_bytes)
     candidate_checksum = hashlib.sha256(artifact_bytes).hexdigest()
     diff_checksum = hashlib.sha256(diff_bytes).hexdigest()
-    recorded = json.loads(completion_path.read_text(encoding="utf-8"))
+    recorded = json.loads(paths.completion.read_text(encoding="utf-8"))
     if recorded != {
         "candidate_sha256": candidate_checksum,
         "diff_sha256": diff_checksum,

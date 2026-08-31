@@ -254,6 +254,7 @@ class PatchCodeAgent:
                 "issue": source.contract.issue,
                 "verification_argv": list(source.contract.verification),
                 "editable_paths": list(source.contract.editable_paths),
+                "protected_paths": list(source.contract.protected_paths),
                 "model_requests": 0,
                 "tool_executions": 0,
                 "files_read": [],
