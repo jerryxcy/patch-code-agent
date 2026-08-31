@@ -114,6 +114,8 @@ class PatchRunContract(BaseModel):
         issue: Non-empty problem statement, limited to 32,768 characters.
         verification: Non-empty argv tuple executed directly without shell parsing.
         editable_paths: Non-empty tuple of bounded, relative, non-traversing source paths.
+        protected_paths: Source files that remain immutable even if an unsafe allowlist includes
+            them, such as a Fixture Issue, manifest, or Verification test.
 
     Example:
         >>> contract = PatchRunContract(
@@ -130,6 +132,7 @@ class PatchRunContract(BaseModel):
     issue: IssueText
     verification: VerificationArgv
     editable_paths: EditablePaths
+    protected_paths: tuple[RelativeSourcePath, ...] = ()
 
 
 class TrustedRepositoryContract(PatchRunContract):

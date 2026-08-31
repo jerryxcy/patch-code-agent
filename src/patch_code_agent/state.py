@@ -19,6 +19,7 @@ RunStatus = Literal[
     "error",
     "inspected",
     "planned",
+    "pending_approval",
     "editing",
     "testing",
     "passed",
@@ -40,10 +41,13 @@ class RunState(TypedDict, total=False):
         issue: Validated natural-language problem statement from the Patch Run Contract.
         verification_argv: Controlled command arguments executed without a shell.
         editable_paths: Contract paths future patch application is allowed to modify.
+        protected_paths: Issue, manifest, and Verification files that Candidate Patches cannot
+            replace even if a malformed editable allowlist includes them.
         model_requests: Durable count of model calls made so far; initialized before baseline.
         workspace_path: Absolute path to this Run's isolated mutable workspace.
         baseline_verification: Bounded serialized ``BaselineVerificationSummary``.
         plan_artifact: Path and checksum of the immutable runtime-validated Plan.
+        candidate_artifact: Paths and checksums of the pending Candidate Patch and exact diff.
         tool_executions: Host-counted bounded inspection operations.
         files_read: Stable paths successfully read through the bounded tool interface.
         attempt: Zero-based repair-attempt counter used by later workflow milestones.
@@ -75,10 +79,12 @@ class RunState(TypedDict, total=False):
     issue: str
     verification_argv: list[str]
     editable_paths: list[str]
+    protected_paths: list[str]
     model_requests: int
     workspace_path: str
     baseline_verification: dict[str, object]
     plan_artifact: dict[str, object]
+    candidate_artifact: dict[str, object]
     tool_executions: int
     files_read: list[str]
     attempt: int

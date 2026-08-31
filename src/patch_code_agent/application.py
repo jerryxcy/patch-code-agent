@@ -15,6 +15,12 @@ from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph.state import CompiledStateGraph
 
+from patch_code_agent.candidate import (
+    CandidatePatchArtifact,
+    CandidatePatchBuilder,
+    CandidatePatchReference,
+    load_candidate_patch,
+)
 from patch_code_agent.fixtures import (
     FixtureRegistry,
     FixtureRepository,
@@ -53,6 +59,10 @@ class PatchRunStatus:
         files_read: Stable paths successfully read by the model.
         plan: Validated Plan loaded from its checksummed artifact, when present.
         plan_artifact: Durable path/checksum reference, when planning completed.
+        candidate: Validated pending Candidate Patch artifact, when present.
+        candidate_diff: Exact host-computed unified diff awaiting Approval.
+        candidate_artifact: Durable paths/checksums for Candidate JSON and diff.
+        attempts: Approved and verified Repair Attempts consumed so far.
 
     Example:
         >>> status = PatchRunStatus(
@@ -66,6 +76,10 @@ class PatchRunStatus:
         ...     files_read=(),
         ...     plan=None,
         ...     plan_artifact=None,
+        ...     candidate=None,
+        ...     candidate_diff=None,
+        ...     candidate_artifact=None,
+        ...     attempts=0,
         ... )
         >>> status.phase
         'planned'
@@ -81,6 +95,10 @@ class PatchRunStatus:
     files_read: tuple[str, ...]
     plan: Plan | None
     plan_artifact: PlanArtifactReference | None
+    candidate: CandidatePatchArtifact | None
+    candidate_diff: str | None
+    candidate_artifact: CandidatePatchReference | None
+    attempts: int
 
 
 class PatchRunStatusReader:
@@ -134,6 +152,16 @@ class PatchRunStatusReader:
             if plan_reference is not None
             else None
         )
+        candidate_reference = (
+            CandidatePatchReference.model_validate(state["candidate_artifact"])
+            if "candidate_artifact" in state
+            else None
+        )
+        candidate_result = (
+            load_candidate_patch(self._database_path.parent, run_id, candidate_reference)
+            if candidate_reference is not None
+            else None
+        )
         return PatchRunStatus(
             run_id=state["run_id"],
             source_kind=state["source_kind"],
@@ -145,6 +173,10 @@ class PatchRunStatusReader:
             files_read=tuple(state.get("files_read", [])),
             plan=plan,
             plan_artifact=plan_reference,
+            candidate=(candidate_result.artifact if candidate_result is not None else None),
+            candidate_diff=(candidate_result.diff if candidate_result is not None else None),
+            candidate_artifact=candidate_reference,
+            attempts=state.get("attempt", 0),
         )
 
 
@@ -175,6 +207,7 @@ class PatchCodeAgent:
             timeout_seconds=verification_timeout_seconds,
         )
         self._planner = Planner(self._data_root, model_gateway)
+        self._candidate_builder = CandidatePatchBuilder(self._data_root, model_gateway)
         self._checkpoint_connection: sqlite3.Connection | None = None
         self._graph: CompiledStateGraph | None = None
 
@@ -221,6 +254,7 @@ class PatchCodeAgent:
                 "issue": source.contract.issue,
                 "verification_argv": list(source.contract.verification),
                 "editable_paths": list(source.contract.editable_paths),
+                "protected_paths": list(source.contract.protected_paths),
                 "model_requests": 0,
                 "tool_executions": 0,
                 "files_read": [],
@@ -266,6 +300,7 @@ class PatchCodeAgent:
             self._graph = build_graph(
                 baseline_verifier=self._baseline_verifier,
                 planner=self._planner,
+                candidate_builder=self._candidate_builder,
                 checkpointer=checkpointer,
             )
         return self._graph

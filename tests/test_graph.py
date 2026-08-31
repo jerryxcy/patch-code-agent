@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+from patch_code_agent.candidate import CandidatePatchBuilder
 from patch_code_agent.graph import build_graph
 from patch_code_agent.model import ScriptedModel
 from patch_code_agent.planning import Planner
@@ -13,14 +14,19 @@ class CountingModel:
     model_id = "counting"
 
     def __init__(self) -> None:
-        self.requests = 0
+        self.plan_requests = 0
+        self.candidate_requests = 0
 
     def create_plan(self, request, tools):
-        self.requests += 1
+        self.plan_requests += 1
         return ScriptedModel().create_plan(request, tools)
 
+    def create_candidate(self, request, tools):
+        self.candidate_requests += 1
+        return ScriptedModel().create_candidate(request, tools)
 
-def test_graph_builds_a_plan(tmp_path):
+
+def test_graph_pauses_after_persisting_a_candidate_patch(tmp_path):
     source = tmp_path / "cart.py"
     source.write_text("def total(items):\n    return sum(items)\n")
     data_root = tmp_path / "runs"
@@ -29,11 +35,13 @@ def test_graph_builds_a_plan(tmp_path):
     result = build_graph(
         baseline_verifier=BaselineVerifier(data_root),
         planner=Planner(data_root, ScriptedModel()),
+        candidate_builder=CandidatePatchBuilder(data_root, ScriptedModel()),
     ).invoke(
         {
             "run_id": "test-run",
             "issue": "Fix the cart total",
             "verification_argv": [sys.executable, "-c", "raise SystemExit(1)"],
+            "editable_paths": ["cart.py"],
             "model_requests": 0,
             "workspace_path": str(tmp_path),
             "status": "created",
@@ -41,9 +49,11 @@ def test_graph_builds_a_plan(tmp_path):
         config={"configurable": {"thread_id": "test-run"}},
     )
 
-    assert result["status"] == "planned"
+    assert result["status"] == "pending_approval"
     assert result["files_read"] == ["cart.py"]
     assert result["plan_artifact"]["path"] == "plan.json"
+    assert result["candidate_artifact"]["path"] == "attempts/1/candidate.json"
+    assert result["__interrupt__"]
 
 
 def test_baseline_verification_is_replay_safe(tmp_path: Path) -> None:
@@ -86,11 +96,13 @@ def test_graph_replay_does_not_create_a_second_plan(tmp_path: Path) -> None:
     graph = build_graph(
         baseline_verifier=BaselineVerifier(data_root),
         planner=Planner(data_root, model),
+        candidate_builder=CandidatePatchBuilder(data_root, model),
     )
     initial_state = {
         "run_id": "test-run",
         "issue": "Fix the discount",
         "verification_argv": [sys.executable, "-c", "raise SystemExit(1)"],
+        "editable_paths": ["cart.py"],
         "model_requests": 0,
         "tool_executions": 0,
         "files_read": [],
@@ -102,9 +114,11 @@ def test_graph_replay_does_not_create_a_second_plan(tmp_path: Path) -> None:
     first = graph.invoke(initial_state, config=config)
     replayed = graph.invoke(initial_state, config=config)
 
-    assert model.requests == 1
+    assert model.plan_requests == 1
+    assert model.candidate_requests == 1
     assert first["plan_artifact"] == replayed["plan_artifact"]
-    assert first["model_requests"] == replayed["model_requests"] == 1
+    assert first["candidate_artifact"] == replayed["candidate_artifact"]
+    assert first["model_requests"] == replayed["model_requests"] == 2
 
 
 def test_plan_replay_rejects_a_replaced_artifact(tmp_path: Path) -> None:
@@ -131,4 +145,41 @@ def test_plan_replay_rejects_a_replaced_artifact(tmp_path: Path) -> None:
             issue="Fix the discount",
             verification=["pytest"],
             expected_reference=first.reference,
+        )
+
+
+def test_candidate_replay_rejects_a_replaced_exact_diff(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "cart.py").write_text("discount = 0.1\n")
+    data_root = tmp_path / "runs"
+    (data_root / "test-run").mkdir(parents=True)
+    model = ScriptedModel()
+    plan = Planner(data_root, model).create_once(
+        run_id="test-run",
+        workspace=workspace,
+        issue="Fix the discount",
+        verification=["pytest"],
+    )
+    builder = CandidatePatchBuilder(data_root, model)
+    candidate = builder.create_once(
+        run_id="test-run",
+        workspace=workspace,
+        issue="Fix the discount",
+        editable_paths=["cart.py"],
+        plan_reference=plan.reference,
+        attempt=1,
+    )
+    diff_path = data_root / "test-run" / candidate.reference.diff_path
+    diff_path.write_text(diff_path.read_text().replace("discount", "tampered", 1))
+
+    with pytest.raises(RuntimeError, match="completion checksums"):
+        builder.create_once(
+            run_id="test-run",
+            workspace=workspace,
+            issue="Fix the discount",
+            editable_paths=["cart.py"],
+            plan_reference=plan.reference,
+            attempt=1,
+            expected_reference=candidate.reference,
         )

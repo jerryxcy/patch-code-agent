@@ -22,6 +22,7 @@ from patch_code_agent.sources import (
     VerificationArgv,
     reject_source_symlinks,
     resolve_source_file,
+    validate_relative_path,
 )
 
 
@@ -171,6 +172,7 @@ def _load_fixture_repository(root: Path) -> FixtureRepository:
             issue=issue,
             verification=manifest.verification,
             editable_paths=manifest.editable_paths,
+            protected_paths=_fixture_protected_paths(resolved_root, manifest),
         )
     except ValueError as error:
         raise ValueError(f"Invalid Fixture Manifest at {manifest_path}: {error}") from error
@@ -180,3 +182,18 @@ def _load_fixture_repository(root: Path) -> FixtureRepository:
         root=resolved_root,
         contract=contract,
     )
+
+
+def _fixture_protected_paths(root: Path, manifest: FixtureManifest) -> tuple[str, ...]:
+    """Identify the Issue, manifest, and file arguments used by Verification."""
+    protected = [manifest.issue_path, "fixture.toml"]
+    for argument in manifest.verification:
+        candidate_value = argument.split("::", 1)[0]
+        try:
+            validate_relative_path(candidate_value)
+        except ValueError:
+            continue
+        candidate = root.joinpath(*Path(candidate_value).parts)
+        if candidate.is_file():
+            protected.append(Path(candidate_value).as_posix())
+    return tuple(dict.fromkeys(protected))

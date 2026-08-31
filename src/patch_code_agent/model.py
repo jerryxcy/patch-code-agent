@@ -1,5 +1,6 @@
-"""Define typed planning output and the replaceable Model Gateway seam."""
+"""Define typed model outputs and the replaceable Model Gateway seam."""
 
+import hashlib
 from dataclasses import dataclass
 from typing import Annotated, Literal, Protocol
 
@@ -9,6 +10,7 @@ from patch_code_agent.inspection import InspectionTools
 from patch_code_agent.sources import RelativeSourcePath, VerificationArgv
 
 PlanText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=4096)]
+ContentHash = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 
 
 class Plan(BaseModel):
@@ -51,6 +53,43 @@ class PlanningRequest:
     verification: VerificationArgv
 
 
+class FileReplacement(BaseModel):
+    """One complete text-file replacement proposed by a model.
+
+    The host treats this as untrusted data. ``expected_sha256`` must identify the exact UTF-8
+    content returned by a preceding model read, while ``new_content`` contains the complete
+    replacement rather than a model-generated diff.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    path: RelativeSourcePath
+    expected_sha256: ContentHash
+    new_content: str
+
+
+class CandidatePatch(BaseModel):
+    """Bounded structured model proposal validated before host diff generation."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    replacements: tuple[FileReplacement, ...] = Field(min_length=1, max_length=3)
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateRequest:
+    """Context supplied for one Candidate Patch request.
+
+    ``editable_paths`` informs the model of the contract allowlist but is never trusted as
+    enforcement: the host validates every returned replacement independently.
+    """
+
+    issue: str
+    plan: Plan
+    editable_paths: tuple[RelativeSourcePath, ...]
+    attempt: int
+
+
 class ModelGateway(Protocol):
     """Model adapter that can inspect only through host-provided tools."""
 
@@ -60,6 +99,9 @@ class ModelGateway(Protocol):
 
     def create_plan(self, request: PlanningRequest, tools: InspectionTools) -> object:
         """Use bounded inspection and return untrusted structured Plan data."""
+
+    def create_candidate(self, request: CandidateRequest, tools: InspectionTools) -> object:
+        """Use bounded inspection and return untrusted structured replacements."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,4 +167,29 @@ class ScriptedModel:
             "relevant_files": relevant_files,
             "repair_strategy": "Apply the smallest change that addresses the reported Issue.",
             "verification_strategy": f"Run: {' '.join(request.verification)}",
+        }
+
+    def create_candidate(self, request: CandidateRequest, tools: InspectionTools) -> object:
+        """Read one editable file and return a deterministic complete replacement."""
+        path = request.editable_paths[0]
+        observed = tools.read_file(path)
+        old_content = observed.content
+        incorrect_line = "    return sum(prices) - discount\n"
+        corrected_lines = (
+            "    subtotal = sum(prices)\n"
+            "    return subtotal * (1 - discount)\n"
+        )
+        if incorrect_line in old_content:
+            new_content = old_content.replace(incorrect_line, corrected_lines, 1)
+        else:
+            separator = "" if old_content.endswith("\n") else "\n"
+            new_content = f"{old_content}{separator}# Scripted Candidate Patch\n"
+        return {
+            "replacements": [
+                {
+                    "path": path,
+                    "expected_sha256": hashlib.sha256(old_content.encode("utf-8")).hexdigest(),
+                    "new_content": new_content,
+                }
+            ]
         }
