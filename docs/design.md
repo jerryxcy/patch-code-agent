@@ -10,8 +10,9 @@ implementation 與 acceptance spec 見
 durable status，以及透過 bounded inspection tools 產生的 typed Plan Artifact。Baseline 失敗後，
 模型會提出 bounded structured replacements；host 驗證 editable path、read hash 與大小，產生
 exact diff、保存 immutable Candidate Patch Artifact，再以 LangGraph interrupt 跨程序停在
-Approval Gate。核准、拒絕、修補後 Verification 與 terminal report 仍待實作。驗收進度以
-GitHub Issue #2 為準。
+Approval Gate。另一個 CLI process 已可在 per-run exclusive lock 下拒絕 Candidate，讓 Patch Run
+形成 durable Rejected outcome，workspace 與 Repair Attempt 均不改變。核准、修補後 Verification
+與 terminal report 仍待實作。驗收進度以 GitHub Issue #2 為準。
 完整 Resource Budget enforcement、typed-output correction retry 與 provider retry 分別由後續
 MVP tickets 實作；本階段只保存 planning 已實際使用的 counters。
 

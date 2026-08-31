@@ -14,6 +14,7 @@ from typing import cast
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph.state import CompiledStateGraph
+from langgraph.types import Command
 
 from patch_code_agent.candidate import (
     CandidatePatchArtifact,
@@ -28,6 +29,7 @@ from patch_code_agent.fixtures import (
     load_fixture_registry,
 )
 from patch_code_agent.graph import build_graph
+from patch_code_agent.locking import RunMutationLock
 from patch_code_agent.model import ModelGateway, Plan
 from patch_code_agent.planning import (
     PlanArtifactReference,
@@ -235,6 +237,21 @@ class PatchCodeAgent:
         """Start a Patch Run from an explicitly selected Trusted Repository."""
         source = load_trusted_repository(repository, contract_path)
         return self._start_patch_run(source=source, run_id=run_id)
+
+    def reject_patch_run(self, *, run_id: str) -> RunState:
+        """Resume one pending Approval Gate with a durable rejection decision."""
+        with RunMutationLock(self._data_root, run_id):
+            status = PatchRunStatusReader(self._data_root).get(run_id)
+            if status.phase != "pending_approval":
+                raise ValueError(
+                    "Patch Run is not awaiting Approval "
+                    f"(current phase: {status.phase})"
+                )
+            result = self._run_graph().invoke(
+                Command(resume="reject"),
+                config={"configurable": {"thread_id": run_id}},
+            )
+            return cast(RunState, result)
 
     def _start_patch_run(self, *, source: RepositorySource, run_id: str) -> RunState:
         """Snapshot a normalized source and invoke its graph under one thread ID.

@@ -13,8 +13,9 @@ Candidate Patch 與 Diagnosis。
 > planning；Scripted Model 只能透過 bounded list/read/search 工具觀察 workspace，產生 typed、
 > checksummed Plan Artifact 與 bounded structured replacements。Host 會驗證 replacement 的
 > editable path、read hash 與大小，自行產生 exact diff 和 checksummed Candidate Patch Artifact，
-> 再跨程序停在 Approval Gate；此時 workspace 尚未修改。核准／拒絕、修補後 Verification 與
-> Run Report 仍是尚待完成的 MVP 功能。
+> 再跨程序停在 Approval Gate；此時 workspace 尚未修改。另一個 CLI process 可以取得 per-run
+> exclusive lock 後拒絕 Candidate，交付 durable Rejected outcome 且不消耗 Repair Attempt。
+> 核准、修補後 Verification 與 Run Report 仍是尚待完成的 MVP 功能。
 
 完整的 MVP implementation 與 acceptance spec 見
 [GitHub Issue #2](https://github.com/jerryxcy/patch-code-agent/issues/2)。
@@ -104,6 +105,7 @@ patch-code-agent fixtures
 patch-code-agent run cart-discount
 patch-code-agent run-local <repository> --contract <contract.toml> --trust-repository
 patch-code-agent status <run-id>
+patch-code-agent reject <run-id>
 ```
 
 目標 MVP 還會加入：
@@ -111,7 +113,6 @@ patch-code-agent status <run-id>
 ```text
 patch-code-agent approve <run-id>
 patch-code-agent approve <run-id> --yes
-patch-code-agent reject <run-id>
 ```
 
 ---
@@ -139,6 +140,7 @@ src/patch_code_agent/
   fixtures/            Fixture manifest validation 與 registry
   graph.py             LangGraph nodes、edges 與 checkpoint 組裝
   inspection.py        bounded list、read、search 與 workspace 安全規則
+  locking.py           mutating CLI commands 的 per-run exclusive lock
   planning.py          typed Plan validation、artifact checksum 與 replay ledger
   sources.py           Repository Source、Patch Run Contract 與 trusted-local validation
   state.py             Patch Run graph state
