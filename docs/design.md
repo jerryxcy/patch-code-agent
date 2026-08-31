@@ -6,9 +6,10 @@ implementation 與 acceptance spec 見
 [GitHub Issue #2](https://github.com/jerryxcy/patch-code-agent/issues/2)。
 
 這份文件描述的是已確認的 **MVP target design**。目前已完成 Fixture Registry、明確 opt-in
-的 Trusted Repository Adapter、隔離 Run Workspace，以及 SQLite-backed `planned` status；
-模型編輯、Approval Gate、Verification 與 terminal report 仍待實作。驗收進度以 GitHub
-Issue #2 為準。
+的 Trusted Repository Adapter、隔離 Run Workspace、Baseline Verification 與 SQLite-backed
+durable status。Baseline 失敗會進入 planning；通過、執行錯誤與逾時會形成對應 terminal
+outcome。模型編輯、Approval Gate、修補後 Verification 與 terminal report 仍待實作。驗收進度
+以 GitHub Issue #2 為準。
 
 ---
 

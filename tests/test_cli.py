@@ -1,10 +1,23 @@
+import json
 import re
+import sys
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from patch_code_agent.cli import create_cli
 from patch_code_agent.model import ScriptedModel
+
+
+class RecordingModel:
+    def __init__(self) -> None:
+        self.model_id_accesses = 0
+
+    @property
+    def model_id(self) -> str:
+        self.model_id_accesses += 1
+        return "recording"
 
 
 def _run_identifier(output: str) -> str:
@@ -149,8 +162,9 @@ def test_user_starts_registered_patch_run_in_isolated_workspace(tmp_path: Path) 
     fixture_repository = Path(__file__).parents[1] / "examples" / "tiny_repo"
     original_cart = (fixture_repository / "cart.py").read_bytes()
     data_root = tmp_path / "runs"
+    model = RecordingModel()
     cli = create_cli(
-        model_gateway=ScriptedModel(),
+        model_gateway=model,
         data_root=data_root,
     )
 
@@ -166,8 +180,16 @@ def test_user_starts_registered_patch_run_in_isolated_workspace(tmp_path: Path) 
     assert not (workspace / "__pycache__").exists()
     assert (fixture_repository / "cart.py").read_bytes() == original_cart
     assert "PatchCodeAgent plan" in result.output
+    assert "Baseline Verification: failed" in result.output
+    assert "Model Requests: 0" in result.output
+    assert model.model_id_accesses == 0
     assert "Run Identifier:" in result.output
     assert "status: planned" in result.output
+    baseline = json.loads((data_root / run_identifier / "baseline" / "result.json").read_text())
+    assert baseline["outcome"] == "failed"
+    assert baseline["exit_code"] == 1
+    output_log = (data_root / run_identifier / "baseline" / "output.log").read_text()
+    assert "test_discounted_total" in output_log
 
 
 def test_user_starts_trusted_repository_run_from_explicit_contract(tmp_path: Path) -> None:
@@ -177,9 +199,9 @@ def test_user_starts_trusted_repository_run_from_explicit_contract(tmp_path: Pat
     (repository / "cart.py").write_bytes(original_source)
     contract = tmp_path / "patch-run.toml"
     contract.write_text(
-        """source_id = "trusted-cart"
+        f"""source_id = "trusted-cart"
 issue = "Fix the incorrect cart total"
-verification = ["pytest", "test_cart.py"]
+verification = {json.dumps([sys.executable, "-c", "raise SystemExit(1)"])}
 editable_paths = ["cart.py"]
 """,
         encoding="utf-8",
@@ -225,9 +247,9 @@ def test_run_workspace_excludes_visible_virtual_environment(tmp_path: Path) -> N
     (virtual_environment / "dependency.py").write_text("SECRET = True\n", encoding="utf-8")
     contract = tmp_path / "patch-run.toml"
     contract.write_text(
-        """source_id = "trusted-cart"
+        f"""source_id = "trusted-cart"
 issue = "Fix the incorrect cart total"
-verification = ["pytest"]
+verification = {json.dumps([sys.executable, "-c", "raise SystemExit(1)"])}
 editable_paths = ["cart.py"]
 """,
         encoding="utf-8",
@@ -250,6 +272,184 @@ editable_paths = ["cart.py"]
     workspace = data_root / _run_identifier(result.output) / "workspace"
     assert not (workspace / "venv").exists()
     assert "python files inspected: 1" in result.output
+
+
+def test_passing_baseline_becomes_issue_not_reproduced(tmp_path: Path) -> None:
+    repository = tmp_path / "trusted-repository"
+    repository.mkdir()
+    (repository / "cart.py").write_text("VALUE = 1\n", encoding="utf-8")
+    contract = tmp_path / "patch-run.toml"
+    contract.write_text(
+        f"""source_id = "trusted-passing"
+issue = "Reproduce the reported issue"
+verification = {json.dumps([sys.executable, "-c", "raise SystemExit(0)"])}
+editable_paths = ["cart.py"]
+""",
+        encoding="utf-8",
+    )
+    data_root = tmp_path / "runs"
+    cli = create_cli(model_gateway=ScriptedModel(), data_root=data_root)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "run-local",
+            str(repository),
+            "--contract",
+            str(contract),
+            "--trust-repository",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Baseline Verification: passed" in result.output
+    assert "Outcome: Issue Not Reproduced" in result.output
+    assert "Model Requests: 0" in result.output
+    assert "PatchCodeAgent plan" not in result.output
+    run_identifier = _run_identifier(result.output)
+
+    status_cli = create_cli(model_gateway=ScriptedModel(), data_root=data_root)
+    status = CliRunner().invoke(status_cli, ["status", run_identifier])
+    assert status.exit_code == 0, status.output
+    assert "Phase: issue_not_reproduced" in status.output
+    assert "Model Requests: 0" in status.output
+
+
+def test_baseline_exit_code_two_becomes_verification_error(tmp_path: Path) -> None:
+    repository = tmp_path / "trusted-repository"
+    repository.mkdir()
+    (repository / "cart.py").write_text("VALUE = 1\n", encoding="utf-8")
+    contract = tmp_path / "patch-run.toml"
+    contract.write_text(
+        f"""source_id = "trusted-error"
+issue = "Reproduce the reported issue"
+verification = {json.dumps([sys.executable, "-c", "raise SystemExit(2)"])}
+editable_paths = ["cart.py"]
+""",
+        encoding="utf-8",
+    )
+    data_root = tmp_path / "runs"
+    cli = create_cli(model_gateway=ScriptedModel(), data_root=data_root)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "run-local",
+            str(repository),
+            "--contract",
+            str(contract),
+            "--trust-repository",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Baseline Verification: error" in result.output
+    assert "Outcome: Error" in result.output
+    run_identifier = _run_identifier(result.output)
+    baseline = json.loads((data_root / run_identifier / "baseline" / "result.json").read_text())
+    assert baseline["exit_code"] == 2
+    assert baseline["error_kind"] == "verification_exit_code"
+
+    status_cli = create_cli(model_gateway=ScriptedModel(), data_root=data_root)
+    status = CliRunner().invoke(status_cli, ["status", run_identifier])
+    assert status.exit_code == 0, status.output
+    assert "Phase: error" in status.output
+
+
+def test_baseline_timeout_becomes_budget_exceeded(tmp_path: Path) -> None:
+    repository = tmp_path / "trusted-repository"
+    repository.mkdir()
+    (repository / "cart.py").write_text("VALUE = 1\n", encoding="utf-8")
+    contract = tmp_path / "patch-run.toml"
+    contract.write_text(
+        f"""source_id = "trusted-timeout"
+issue = "Reproduce the reported issue"
+verification = {json.dumps([sys.executable, "-c", "import time; time.sleep(1)"])}
+editable_paths = ["cart.py"]
+""",
+        encoding="utf-8",
+    )
+    data_root = tmp_path / "runs"
+    cli = create_cli(
+        model_gateway=ScriptedModel(),
+        data_root=data_root,
+        verification_timeout_seconds=0.01,
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "run-local",
+            str(repository),
+            "--contract",
+            str(contract),
+            "--trust-repository",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Baseline Verification: timeout" in result.output
+    assert "Outcome: Budget Exceeded" in result.output
+    assert "PatchCodeAgent plan" not in result.output
+    run_identifier = _run_identifier(result.output)
+    baseline = json.loads((data_root / run_identifier / "baseline" / "result.json").read_text())
+    assert baseline["error_kind"] == "verification_timeout"
+    assert baseline["timeout_seconds"] == 0.01
+
+    status_cli = create_cli(model_gateway=ScriptedModel(), data_root=data_root)
+    status = CliRunner().invoke(status_cli, ["status", run_identifier])
+    assert status.exit_code == 0, status.output
+    assert "Phase: budget_exceeded" in status.output
+
+
+def test_baseline_uses_minimal_environment_and_bounded_checkpoint_summary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GEMINI_API_KEY", "must-not-reach-verification")
+    repository = tmp_path / "trusted-repository"
+    repository.mkdir()
+    (repository / "cart.py").write_text("VALUE = 1\n", encoding="utf-8")
+    script = (
+        "import os; "
+        "print(os.getenv('GEMINI_API_KEY', 'secret-not-present')); "
+        "print('x' * 40000); "
+        "raise SystemExit(1)"
+    )
+    contract = tmp_path / "patch-run.toml"
+    contract.write_text(
+        f"""source_id = "trusted-environment"
+issue = "Reproduce the reported issue"
+verification = {json.dumps([sys.executable, "-c", script])}
+editable_paths = ["cart.py"]
+""",
+        encoding="utf-8",
+    )
+    data_root = tmp_path / "runs"
+    cli = create_cli(model_gateway=ScriptedModel(), data_root=data_root)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "run-local",
+            str(repository),
+            "--contract",
+            str(contract),
+            "--trust-repository",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    run_identifier = _run_identifier(result.output)
+    baseline_root = data_root / run_identifier / "baseline"
+    full_output = (baseline_root / "output.log").read_text()
+    assert "secret-not-present" in full_output
+    assert "must-not-reach-verification" not in full_output
+    assert len(full_output) > 32 * 1024
+    baseline = json.loads((baseline_root / "result.json").read_text())
+    assert baseline["output_truncated"] is True
+    assert len(baseline["output_excerpt"].encode()) <= 32 * 1024
+    assert "must-not-reach-verification" not in baseline["output_excerpt"]
 
 
 def test_user_must_explicitly_acknowledge_trusted_repository_execution(tmp_path: Path) -> None:

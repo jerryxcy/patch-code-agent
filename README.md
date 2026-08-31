@@ -9,8 +9,9 @@ Candidate Patch 與 Diagnosis。
 > [!IMPORTANT]
 > 目前程式已支援列出 bundled fixtures、建立具唯一 Run Identifier 的隔離 workspace，
 > 也可用外部 Patch Run Contract 明確啟動本機 Trusted Repository，並以 SQLite 保存可跨程序
-> 查詢的 `planned` 狀態。模型編輯、Approval Gate 與 Verification 仍是下方架構中尚待完成的
-> MVP 功能。
+> 查詢的狀態。Baseline Verification 會在隔離 workspace 中以受限環境執行：失敗才進入
+> `planned`，通過、執行錯誤或逾時則直接形成 terminal outcome。模型編輯、Approval Gate、
+> 修補後 Verification 與 Run Report 仍是下方架構中尚待完成的 MVP 功能。
 
 完整的 MVP implementation 與 acceptance spec 見
 [GitHub Issue #2](https://github.com/jerryxcy/patch-code-agent/issues/2)。
@@ -68,8 +69,10 @@ uv run patch-code-agent status <run-id>
 ```
 
 `run` 只接受 registry 中的 Fixture Repository ID，並將 fixture 複製到
-`~/.patch-code-agent/runs/<run-id>/workspace/`。目前流程會輸出 starter Plan、Run Identifier、掃描到的 Python
-檔案數與 `planned` status；不會修改來源 fixture，也還不會執行 failing test。
+`~/.patch-code-agent/runs/<run-id>/workspace/`。系統會先以 Patch Run Contract 的 argv 執行
+Baseline Verification；`cart-discount` 的預期失敗會進入 `planned`，並輸出 starter Plan、
+Run Identifier 與掃描到的 Python 檔案數。Baseline 通過時結果為 `Issue Not Reproduced`，
+非測試失敗的 exit code 為 `Error`，60 秒逾時則為 `Budget Exceeded`。來源 fixture 不會被修改。
 
 指定本機 Trusted Repository 時，Patch Run Contract 必須放在 repository 外面：
 
@@ -132,10 +135,11 @@ src/patch_code_agent/
   graph.py             LangGraph nodes、edges 與 checkpoint 組裝
   sources.py           Repository Source、Patch Run Contract 與 trusted-local validation
   state.py             Patch Run graph state
+  verification.py      Baseline subprocess、結果分類與完整輸出 artifact
   workspace.py         隔離 Run Workspace 的建立規則
 
 tests/
-  test_cli.py          Registry、trusted source、run isolation、durable status 與錯誤路徑
+  test_cli.py          Registry、workspace、baseline outcomes、artifacts 與 durable status
   test_graph.py        Graph smoke test
 
 examples/tiny_repo/
