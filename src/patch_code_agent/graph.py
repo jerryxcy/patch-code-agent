@@ -6,7 +6,15 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
 from patch_code_agent.sources import is_ignored_source_path
-from patch_code_agent.state import RunState
+from patch_code_agent.state import RunState, RunStatus
+from patch_code_agent.verification import BaselineVerificationOutcome, BaselineVerifier
+
+_BASELINE_STATUS: dict[BaselineVerificationOutcome, RunStatus] = {
+    "failed": "baseline_failed",
+    "passed": "issue_not_reproduced",
+    "error": "error",
+    "timeout": "budget_exceeded",
+}
 
 
 def validate_input(state: RunState) -> RunState:
@@ -26,6 +34,24 @@ def inspect_workspace(state: RunState) -> RunState:
         if not is_ignored_source_path(path.relative_to(workspace))
     )
     return {"inspected_files": files[:100], "status": "inspected"}
+
+
+def run_baseline_verification(state: RunState, verifier: BaselineVerifier) -> RunState:
+    summary = verifier.verify(
+        run_id=state["run_id"],
+        workspace=Path(state["workspace_path"]),
+        argv=state["verification_argv"],
+    )
+    return {
+        "baseline_verification": summary.model_dump(mode="json"),
+        "status": _BASELINE_STATUS[summary.outcome],
+    }
+
+
+def route_after_baseline(state: RunState) -> str:
+    if state["status"] == "baseline_failed":
+        return "inspect_workspace"
+    return "end"
 
 
 def create_plan(state: RunState) -> RunState:
@@ -49,15 +75,25 @@ def create_plan(state: RunState) -> RunState:
 
 def build_graph(
     *,
+    baseline_verifier: BaselineVerifier,
     checkpointer: BaseCheckpointSaver | None = None,
 ) -> CompiledStateGraph:
     selected_checkpointer = checkpointer if checkpointer is not None else InMemorySaver()
     builder = StateGraph(RunState)
     builder.add_node("validate_input", validate_input)
+    builder.add_node(
+        "baseline_verification",
+        lambda state: run_baseline_verification(state, baseline_verifier),
+    )
     builder.add_node("inspect_workspace", inspect_workspace)
     builder.add_node("create_plan", create_plan)
     builder.add_edge(START, "validate_input")
-    builder.add_edge("validate_input", "inspect_workspace")
+    builder.add_edge("validate_input", "baseline_verification")
+    builder.add_conditional_edges(
+        "baseline_verification",
+        route_after_baseline,
+        {"inspect_workspace": "inspect_workspace", "end": END},
+    )
     builder.add_edge("inspect_workspace", "create_plan")
     builder.add_edge("create_plan", END)
     return builder.compile(checkpointer=selected_checkpointer)

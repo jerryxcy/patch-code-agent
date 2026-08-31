@@ -21,6 +21,7 @@ from patch_code_agent.sources import (
     load_trusted_repository,
 )
 from patch_code_agent.state import RunState
+from patch_code_agent.verification import BaselineVerifier
 from patch_code_agent.workspace import RunWorkspaceStore
 
 
@@ -33,6 +34,7 @@ class PatchRunStatus:
     source_id: str
     source_revision: str
     phase: str
+    model_requests: int
 
 
 class PatchRunStatusReader:
@@ -72,6 +74,7 @@ class PatchRunStatusReader:
             source_id=state["source_id"],
             source_revision=state["source_revision"],
             phase=state["status"],
+            model_requests=state["model_requests"],
         )
 
 
@@ -84,12 +87,17 @@ class PatchCodeAgent:
         model_gateway: ModelGateway,
         data_root: Path,
         fixture_roots: tuple[Path, ...] | None = None,
+        verification_timeout_seconds: float = 60.0,
     ) -> None:
         self._model_gateway = model_gateway
         self._data_root = data_root.resolve()
         self._fixture_roots = fixture_roots if fixture_roots is not None else bundled_fixture_roots()
         self._fixtures: FixtureRegistry | None = None
         self._workspaces = RunWorkspaceStore(self._data_root)
+        self._baseline_verifier = BaselineVerifier(
+            self._data_root,
+            timeout_seconds=verification_timeout_seconds,
+        )
         self._checkpoint_connection: sqlite3.Connection | None = None
         self._graph: CompiledStateGraph | None = None
 
@@ -130,6 +138,7 @@ class PatchCodeAgent:
                 "issue": source.contract.issue,
                 "verification_argv": list(source.contract.verification),
                 "editable_paths": list(source.contract.editable_paths),
+                "model_requests": 0,
                 "workspace_path": str(workspace.path),
                 "status": "created",
             },
@@ -163,5 +172,8 @@ class PatchCodeAgent:
                 connection,
                 serde=JsonPlusSerializer(allowed_msgpack_modules=None),
             )
-            self._graph = build_graph(checkpointer=checkpointer)
+            self._graph = build_graph(
+                baseline_verifier=self._baseline_verifier,
+                checkpointer=checkpointer,
+            )
         return self._graph

@@ -17,6 +17,7 @@ def create_cli(
     model_gateway: ModelGateway | None = None,
     data_root: Path | None = None,
     fixture_roots: tuple[Path, ...] | None = None,
+    verification_timeout_seconds: float = 60.0,
 ) -> typer.Typer:
     """Create the CLI with all application dependencies at one seam."""
     cli = typer.Typer(no_args_is_help=True, help="Run the PatchCodeAgent coding-agent harness.")
@@ -34,6 +35,7 @@ def create_cli(
                 model_gateway=selected_model,
                 data_root=selected_data_root,
                 fixture_roots=fixture_roots,
+                verification_timeout_seconds=verification_timeout_seconds,
             )
         return cast(PatchCodeAgent, application)
 
@@ -51,15 +53,29 @@ def create_cli(
                 return "Trusted Repository"
         assert_never(source_kind)
 
+    def outcome_label(status: str) -> str | None:
+        return {
+            "issue_not_reproduced": "Issue Not Reproduced",
+            "budget_exceeded": "Budget Exceeded",
+            "error": "Error",
+        }.get(status)
+
     def print_run_result(result: RunState) -> None:
-        plan = "\n".join(f"{index}. {step}" for index, step in enumerate(result["plan"], 1))
-        console.print(Panel.fit(plan, title="PatchCodeAgent plan", border_style="green"))
+        if plan_steps := result.get("plan"):
+            plan = "\n".join(f"{index}. {step}" for index, step in enumerate(plan_steps, 1))
+            console.print(Panel.fit(plan, title="PatchCodeAgent plan", border_style="green"))
         console.print(f"[dim]Run Identifier:[/] {result['run_id']}")
         console.print(
             f"[dim]{source_label(result['source_kind'])}:[/] {result['source_id']}"
         )
         console.print(f"[dim]Source Revision:[/] {result['source_revision']}", soft_wrap=True)
-        console.print(f"[dim]python files inspected:[/] {len(result['inspected_files'])}")
+        baseline = result["baseline_verification"]
+        console.print(f"[dim]Baseline Verification:[/] {baseline['outcome']}")
+        if inspected_files := result.get("inspected_files"):
+            console.print(f"[dim]python files inspected:[/] {len(inspected_files)}")
+        if outcome := outcome_label(result["status"]):
+            console.print(f"[dim]Outcome:[/] {outcome}")
+        console.print(f"[dim]Model Requests:[/] {result['model_requests']}")
         console.print(f"[dim]status:[/] {result['status']}")
 
     @cli.callback()
@@ -100,6 +116,7 @@ def create_cli(
             soft_wrap=True,
         )
         console.print(f"[dim]Phase:[/] {patch_run.phase}")
+        console.print(f"[dim]Model Requests:[/] {patch_run.model_requests}")
 
 
     @cli.command()
