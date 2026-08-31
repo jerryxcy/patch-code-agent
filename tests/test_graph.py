@@ -8,7 +8,7 @@ def test_graph_builds_a_plan(tmp_path):
     result = build_graph().invoke(
         {
             "issue": "Fix the cart total",
-            "repo_path": str(tmp_path),
+            "workspace_path": str(tmp_path),
             "status": "created",
         },
         config={"configurable": {"thread_id": "test-run"}},

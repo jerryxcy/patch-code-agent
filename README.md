@@ -7,8 +7,10 @@ PatchCodeAgent 的重點不是讓模型自由操作 shell，而是把一次程�
 Candidate Patch 與 Diagnosis。
 
 > [!IMPORTANT]
-> 目前程式仍是唯讀 scaffold：會驗證輸入、列出 Python 檔案並產生固定 Plan。
-> 下方架構與 CLI 是已確認的 MVP 目標；尚未完成的功能不會被描述成可直接使用。
+> 目前程式已支援列出 bundled fixtures、建立具唯一 Run Identifier 的隔離 workspace，
+> 也可用外部 Patch Run Contract 明確啟動本機 Trusted Repository，並以 SQLite 保存可跨程序
+> 查詢的 `planned` 狀態。模型編輯、Approval Gate 與 Verification 仍是下方架構中尚待完成的
+> MVP 功能。
 
 完整的 MVP implementation 與 acceptance spec 見
 [GitHub Issue #2](https://github.com/jerryxcy/patch-code-agent/issues/2)。
@@ -20,7 +22,9 @@ Candidate Patch 與 Diagnosis。
 ```mermaid
 flowchart LR
     human["使用者"] -->|run · status · approve · reject| cli["Typer CLI"]
-    fixture["Fixture Repository<br/>immutable · synthetic"] --> workspace["Run Workspace"]
+    fixture["Fixture Repository<br/>bundled · synthetic"] --> source["Repository Source Adapter"]
+    trusted["Trusted Repository<br/>explicit local opt-in"] --> source
+    source --> workspace["Run Workspace"]
     cli --> workflow["LangGraph<br/>host-controlled flow"]
     workspace <--> workflow
 
@@ -42,7 +46,8 @@ flowchart LR
 | **Scripted Model** | 在 pytest 中穩定重現成功、Diagnosis、拒絕與 terminal outcomes |
 | **Gemini 3.7 Flash** | 只用於 opt-in Live Smoke Run，只能接觸 bundled synthetic fixtures |
 | **SQLite Checkpoint** | 保存 bounded control state，不保存大型輸出或原始碼 |
-| **Run Workspace** | 每個 Patch Run 的獨立副本；Fixture Repository 永不回寫 |
+| **Repository Source Adapter** | 將 bundled fixture 或明確信任的本機 repository 正規化為同一份 Patch Run input |
+| **Run Workspace** | 每個 Patch Run 的獨立副本；Repository Source 永不回寫 |
 | **Run Artifacts** | 保存 Plan、Diagnosis、diff、完整 Verification logs 與 Run Report |
 
 完整狀態機、工具與信任邊界、Approval/replay safety、Resource Budgets、artifact layout 與
@@ -57,18 +62,46 @@ Run Report schema 見 [docs/design.md](./docs/design.md)。單一決策的理由
 
 ```bash
 uv sync --dev
-uv run patch-code-agent run "Fix the failing cart discount tests" --repo examples/tiny_repo
+uv run patch-code-agent fixtures
+uv run patch-code-agent run cart-discount
+uv run patch-code-agent status <run-id>
 ```
 
-目前 CLI 只會輸出 starter Plan、Run Identifier、掃描到的 Python 檔案數與 `planned` status；
-不會修改 cart fixture，也不會執行它的 failing test。
+`run` 只接受 registry 中的 Fixture Repository ID，並將 fixture 複製到
+`~/.patch-code-agent/runs/<run-id>/workspace/`。目前流程會輸出 starter Plan、Run Identifier、掃描到的 Python
+檔案數與 `planned` status；不會修改來源 fixture，也還不會執行 failing test。
 
-目標 MVP CLI：
+指定本機 Trusted Repository 時，Patch Run Contract 必須放在 repository 外面：
+
+```toml
+source_id = "my-repository"
+issue = "Fix the described defect"
+verification = ["pytest"]
+editable_paths = ["src/example.py"]
+```
+
+```bash
+uv run patch-code-agent run-local /path/to/repository \
+  --contract /path/to/patch-run.toml \
+  --trust-repository
+```
+
+`--trust-repository` 表示使用者接受該 repository 的 Verification 將以 host authority 執行；
+path containment 不是 hostile-code sandbox。Trusted Repository 內容不會送進 Gemini free tier。
+Run storage 固定在來源樹外；任何自訂 data root 與 Repository Source 重疊時都會被拒絕。
+
+目前可用的 CLI：
 
 ```text
 patch-code-agent fixtures
 patch-code-agent run cart-discount
+patch-code-agent run-local <repository> --contract <contract.toml> --trust-repository
 patch-code-agent status <run-id>
+```
+
+目標 MVP 還會加入：
+
+```text
 patch-code-agent approve <run-id>
 patch-code-agent approve <run-id> --yes
 patch-code-agent reject <run-id>
@@ -81,9 +114,9 @@ patch-code-agent reject <run-id>
 | 指令 | 做什麼 |
 |---|---|
 | `uv sync --dev` | 安裝 runtime 與 development dependencies |
-| `uv run pytest` | 執行目前的 graph smoke test |
+| `uv run pytest` | 執行 graph 與 CLI acceptance tests |
 | `uv run ruff check .` | 執行 Python lint |
-| `uv run patch-code-agent run "Fix the cart" --repo examples/tiny_repo` | 執行目前的 CLI smoke check |
+| `uv run patch-code-agent run cart-discount` | 建立隔離的 CLI smoke run |
 | `uv run pytest examples/tiny_repo/test_cart.py` | 執行 fixture baseline；目前預期失敗 |
 
 ---
@@ -93,14 +126,20 @@ patch-code-agent reject <run-id>
 ```text
 src/patch_code_agent/
   __main__.py          python -m patch_code_agent 入口
+  application.py       Fixture、workspace 與 checkpoint 的應用層 seam
   cli.py               Typer CLI 與 Rich 輸出
+  fixtures/            Fixture manifest validation 與 registry
   graph.py             LangGraph nodes、edges 與 checkpoint 組裝
+  sources.py           Repository Source、Patch Run Contract 與 trusted-local validation
   state.py             Patch Run graph state
+  workspace.py         隔離 Run Workspace 的建立規則
 
 tests/
-  test_graph.py        目前的 graph smoke test
+  test_cli.py          Registry、trusted source、run isolation、durable status 與錯誤路徑
+  test_graph.py        Graph smoke test
 
 examples/tiny_repo/
+  fixture.toml         Fixture ID、Issue、Verification 與 editable paths
   issue.md             Cart discount Issue
   cart.py              刻意保留的錯誤實作
   test_cart.py         Fixture baseline 與 acceptance test
@@ -122,7 +161,7 @@ uv.lock                鎖定 dependencies
 |---|---|
 | **[GitHub Issue #2](https://github.com/jerryxcy/patch-code-agent/issues/2)** | MVP implementation 與 acceptance spec：user stories、驗收 seam、測試矩陣、完成條件與 non-goals |
 | **[docs/design.md](./docs/design.md)** | 從上方架構圖逐層展開：Patch Run lifecycle、工具邊界、Approval、replay safety、artifacts 與 Run Report |
-| **[CONTEXT.md](./CONTEXT.md)** | Patch Run、Fixture Repository、Candidate Patch、Verification 與 terminal outcomes 的正式詞彙 |
+| **[CONTEXT.md](./CONTEXT.md)** | Repository Source、Patch Run、Candidate Patch、Verification 與 terminal outcomes 的正式詞彙 |
 | [ADR-0001](./docs/adr/0001-prioritize-engineering-demonstration.md) | 一日 MVP 優先完成可解釋的 end-to-end engineering demonstration |
 | [ADR-0002](./docs/adr/0002-make-patch-runs-resumable.md) · [ADR-0004](./docs/adr/0004-isolate-each-run-workspace.md) · [ADR-0006](./docs/adr/0006-accumulate-repair-attempts.md) | Run resume、workspace isolation 與累加 Repair Attempts |
 | [ADR-0003](./docs/adr/0003-constrain-the-mvp-trust-boundary.md) · [ADR-0005](./docs/adr/0005-keep-side-effects-outside-the-model.md) · [ADR-0011](./docs/adr/0011-protect-the-verification-boundary.md) | Repository、model side effects 與 Verification 的信任邊界 |

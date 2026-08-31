@@ -5,24 +5,25 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
+from patch_code_agent.sources import is_ignored_source_path
 from patch_code_agent.state import RunState
 
 
 def validate_input(state: RunState) -> RunState:
-    repo = Path(state["repo_path"]).resolve()
-    if not repo.is_dir():
-        raise ValueError(f"Repository directory does not exist: {repo}")
+    workspace = Path(state["workspace_path"]).resolve()
+    if not workspace.is_dir():
+        raise ValueError(f"Run Workspace directory does not exist: {workspace}")
     if not state["issue"].strip():
         raise ValueError("Issue must not be empty")
-    return {"repo_path": str(repo), "status": "validated"}
+    return {"workspace_path": str(workspace), "status": "validated"}
 
 
-def inspect_repo(state: RunState) -> RunState:
-    repo = Path(state["repo_path"])
+def inspect_workspace(state: RunState) -> RunState:
+    workspace = Path(state["workspace_path"])
     files = sorted(
-        str(path.relative_to(repo))
-        for path in repo.rglob("*.py")
-        if not any(part.startswith(".") for part in path.relative_to(repo).parts)
+        str(path.relative_to(workspace))
+        for path in workspace.rglob("*.py")
+        if not is_ignored_source_path(path.relative_to(workspace))
     )
     return {"inspected_files": files[:100], "status": "inspected"}
 
@@ -53,10 +54,10 @@ def build_graph(
     selected_checkpointer = checkpointer if checkpointer is not None else InMemorySaver()
     builder = StateGraph(RunState)
     builder.add_node("validate_input", validate_input)
-    builder.add_node("inspect_repo", inspect_repo)
+    builder.add_node("inspect_workspace", inspect_workspace)
     builder.add_node("create_plan", create_plan)
     builder.add_edge(START, "validate_input")
-    builder.add_edge("validate_input", "inspect_repo")
-    builder.add_edge("inspect_repo", "create_plan")
+    builder.add_edge("validate_input", "inspect_workspace")
+    builder.add_edge("inspect_workspace", "create_plan")
     builder.add_edge("create_plan", END)
     return builder.compile(checkpointer=selected_checkpointer)

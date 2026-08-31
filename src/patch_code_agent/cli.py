@@ -1,30 +1,66 @@
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, assert_never, cast
 from uuid import uuid4
 
 import typer
 from rich.console import Console
 from rich.panel import Panel
 
-from patch_code_agent.application import PatchCodeAgent
+from patch_code_agent.application import PatchCodeAgent, PatchRunStatusReader
 from patch_code_agent.model import ModelGateway, ScriptedModel
+from patch_code_agent.sources import RepositorySourceKind
+from patch_code_agent.state import RunState
 
 
 def create_cli(
     *,
     model_gateway: ModelGateway | None = None,
     data_root: Path | None = None,
+    fixture_roots: tuple[Path, ...] | None = None,
 ) -> typer.Typer:
     """Create the CLI with all application dependencies at one seam."""
     cli = typer.Typer(no_args_is_help=True, help="Run the PatchCodeAgent coding-agent harness.")
     console = Console()
     selected_model = model_gateway if model_gateway is not None else ScriptedModel()
-    selected_data_root = data_root if data_root is not None else Path(".patch-code-agent")
-    application = PatchCodeAgent(
-        model_gateway=selected_model,
-        data_root=selected_data_root,
+    selected_data_root = (
+        data_root if data_root is not None else Path.home() / ".patch-code-agent" / "runs"
     )
+    application: PatchCodeAgent | None = None
 
+    def get_application() -> PatchCodeAgent:
+        nonlocal application
+        if application is None:
+            application = PatchCodeAgent(
+                model_gateway=selected_model,
+                data_root=selected_data_root,
+                fixture_roots=fixture_roots,
+            )
+        return cast(PatchCodeAgent, application)
+
+    def close_application() -> None:
+        nonlocal application
+        if application is not None:
+            application.close()
+            application = None
+
+    def source_label(source_kind: RepositorySourceKind) -> str:
+        match source_kind:
+            case "fixture":
+                return "Fixture Repository"
+            case "trusted":
+                return "Trusted Repository"
+        assert_never(source_kind)
+
+    def print_run_result(result: RunState) -> None:
+        plan = "\n".join(f"{index}. {step}" for index, step in enumerate(result["plan"], 1))
+        console.print(Panel.fit(plan, title="PatchCodeAgent plan", border_style="green"))
+        console.print(f"[dim]Run Identifier:[/] {result['run_id']}")
+        console.print(
+            f"[dim]{source_label(result['source_kind'])}:[/] {result['source_id']}"
+        )
+        console.print(f"[dim]Source Revision:[/] {result['source_revision']}", soft_wrap=True)
+        console.print(f"[dim]python files inspected:[/] {len(result['inspected_files'])}")
+        console.print(f"[dim]status:[/] {result['status']}")
 
     @cli.callback()
     def main() -> None:
@@ -32,36 +68,108 @@ def create_cli(
 
 
     @cli.command()
+    def fixtures() -> None:
+        """List registered Fixture Repositories."""
+        try:
+            repositories = get_application().list_fixture_repositories()
+        except ValueError as error:
+            console.print(f"[red]{error}[/]")
+            raise typer.Exit(code=2) from error
+        finally:
+            close_application()
+        for repository in repositories:
+            console.print(f"[bold]{repository.manifest.fixture_id}[/]: {repository.issue_title}")
+
+
+    @cli.command()
+    def status(
+        run_id: Annotated[str, typer.Argument(help="Run Identifier to inspect.")],
+    ) -> None:
+        """Show persisted Patch Run status without advancing it."""
+        try:
+            patch_run = PatchRunStatusReader(selected_data_root).get(run_id)
+        except ValueError as error:
+            console.print(f"[red]{error}[/]")
+            raise typer.Exit(code=2) from error
+        console.print(f"[dim]Run Identifier:[/] {patch_run.run_id}")
+        console.print(
+            f"[dim]{source_label(patch_run.source_kind)}:[/] {patch_run.source_id}"
+        )
+        console.print(
+            f"[dim]Source Revision:[/] {patch_run.source_revision}",
+            soft_wrap=True,
+        )
+        console.print(f"[dim]Phase:[/] {patch_run.phase}")
+
+
+    @cli.command()
     def run(
-        issue: Annotated[str, typer.Argument(help="Bug report or coding task.")],
-        repo: Annotated[
+        fixture_id: Annotated[
+            str,
+            typer.Argument(help="Registered Fixture Repository identifier."),
+        ],
+    ) -> None:
+        """Start a Patch Run for a registered Fixture Repository."""
+        run_id = str(uuid4())
+        try:
+            result = get_application().start_patch_run(fixture_id=fixture_id, run_id=run_id)
+        except ValueError as error:
+            console.print(f"[red]{error}[/]")
+            raise typer.Exit(code=2) from error
+        finally:
+            close_application()
+
+        print_run_result(result)
+
+
+    @cli.command(name="run-local")
+    def run_local(
+        repository: Annotated[
             Path,
-            typer.Option(
-                "--repo",
+            typer.Argument(
                 exists=True,
                 file_okay=False,
-                resolve_path=True,
-                help="Repository that the harness may inspect.",
+                help="Explicitly selected local Trusted Repository.",
             ),
-        ] = Path("."),
-        thread_id: Annotated[
-            str | None,
-            typer.Option(help="Checkpoint thread identifier."),
-        ] = None,
+        ],
+        contract: Annotated[
+            Path,
+            typer.Option(
+                "--contract",
+                exists=True,
+                dir_okay=False,
+                help="TOML Patch Run Contract outside the repository.",
+            ),
+        ],
+        trust_repository: Annotated[
+            bool,
+            typer.Option(
+                "--trust-repository",
+                help="Acknowledge that repository Verification executes with host authority.",
+            ),
+        ] = False,
     ) -> None:
-        """Run the current harness graph against a repository."""
-        run_id = thread_id or str(uuid4())
-        result = application.start_patch_run(
-            issue=issue,
-            repo_path=repo,
-            run_id=run_id,
-        )
+        """Start a Patch Run from an explicitly trusted local repository."""
+        if not trust_repository:
+            console.print(
+                "[red]Trusted Repository requires explicit --trust-repository acknowledgement[/]"
+            )
+            raise typer.Exit(code=2)
 
-        plan = "\n".join(f"{index}. {step}" for index, step in enumerate(result["plan"], 1))
-        console.print(Panel.fit(plan, title="PatchCodeAgent plan", border_style="green"))
-        console.print(f"[dim]thread_id:[/] {run_id}")
-        console.print(f"[dim]python files inspected:[/] {len(result['inspected_files'])}")
-        console.print(f"[dim]status:[/] {result['status']}")
+        run_id = str(uuid4())
+        try:
+            result = get_application().start_trusted_patch_run(
+                repository=repository,
+                contract_path=contract,
+                run_id=run_id,
+            )
+        except ValueError as error:
+            console.print(f"[red]{error}[/]")
+            raise typer.Exit(code=2) from error
+        finally:
+            close_application()
+
+        print_run_result(result)
 
     return cli
 
