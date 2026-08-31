@@ -1,3 +1,4 @@
+import hashlib
 import json
 import re
 import sys
@@ -7,23 +8,84 @@ import pytest
 from typer.testing import CliRunner
 
 from patch_code_agent.cli import create_cli
-from patch_code_agent.model import ScriptedModel
+from patch_code_agent.model import ScriptedInspectionCall, ScriptedModel
 
 
 class RecordingModel:
     def __init__(self) -> None:
         self.model_id_accesses = 0
+        self.plan_requests = 0
 
     @property
     def model_id(self) -> str:
         self.model_id_accesses += 1
         return "recording"
 
+    def create_plan(self, request, tools):
+        self.plan_requests += 1
+        return ScriptedModel().create_plan(request, tools)
+
+
+class SearchRecordingModel:
+    model_id = "search-recording"
+
+    def __init__(self) -> None:
+        self.search_result = None
+
+    def create_plan(self, request, tools):
+        self.search_result = tools.search_code("needle")
+        return {
+            "issue_summary": "Inspect bounded search output",
+            "relevant_files": ["large.txt"],
+            "repair_strategy": "Use the matching lines to locate the defect.",
+            "verification_strategy": "Run the declared Verification command.",
+        }
+
+
+class InvalidPlanModel:
+    model_id = "invalid-plan"
+
+    def create_plan(self, request, tools):
+        tools.list_files()
+        return {"issue_summary": "Missing required Plan fields"}
+
 
 def _run_identifier(output: str) -> str:
     match = re.search(r"Run Identifier: ([0-9a-f-]{36})", output)
     assert match is not None
     return match.group(1)
+
+
+def _run_trusted_inspection(
+    tmp_path: Path,
+    model,
+    *,
+    extra_files: dict[str, bytes] | None = None,
+    baseline_program: str = "raise SystemExit(1)",
+):
+    repository = tmp_path / "inspection-repository"
+    repository.mkdir()
+    (repository / "cart.py").write_text("VALUE = 1\n", encoding="utf-8")
+    for relative, content in (extra_files or {}).items():
+        target = repository / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+    contract = tmp_path / "inspection-contract.toml"
+    contract.write_text(
+        f'''source_id = "inspection-repository"
+issue = "Inspect the reported problem"
+verification = {json.dumps([sys.executable, "-c", baseline_program])}
+editable_paths = ["cart.py"]
+''',
+        encoding="utf-8",
+    )
+    data_root = tmp_path / "runs"
+    cli = create_cli(model_gateway=model, data_root=data_root)
+    result = CliRunner().invoke(
+        cli,
+        ["run-local", str(repository), "--contract", str(contract), "--trust-repository"],
+    )
+    return result, data_root
 
 
 def test_user_lists_registered_fixture_repositories(tmp_path: Path) -> None:
@@ -181,8 +243,9 @@ def test_user_starts_registered_patch_run_in_isolated_workspace(tmp_path: Path) 
     assert (fixture_repository / "cart.py").read_bytes() == original_cart
     assert "PatchCodeAgent plan" in result.output
     assert "Baseline Verification: failed" in result.output
-    assert "Model Requests: 0" in result.output
-    assert model.model_id_accesses == 0
+    assert "Model Requests: 1" in result.output
+    assert model.plan_requests == 1
+    assert model.model_id_accesses == 1
     assert "Run Identifier:" in result.output
     assert "status: planned" in result.output
     baseline = json.loads((data_root / run_identifier / "baseline" / "result.json").read_text())
@@ -190,6 +253,134 @@ def test_user_starts_registered_patch_run_in_isolated_workspace(tmp_path: Path) 
     assert baseline["exit_code"] == 1
     output_log = (data_root / run_identifier / "baseline" / "output.log").read_text()
     assert "test_discounted_total" in output_log
+
+
+def test_failing_baseline_creates_a_typed_checksummed_plan_artifact(tmp_path: Path) -> None:
+    data_root = tmp_path / "runs"
+    cli = create_cli(model_gateway=ScriptedModel(), data_root=data_root)
+
+    result = CliRunner().invoke(cli, ["run", "cart-discount"])
+
+    assert result.exit_code == 0, result.output
+    run_identifier = _run_identifier(result.output)
+    plan_path = data_root / run_identifier / "plan.json"
+    plan_bytes = plan_path.read_bytes()
+    plan_artifact = json.loads(plan_bytes)
+    checksum = hashlib.sha256(plan_bytes).hexdigest()
+    assert plan_artifact == {
+        "files_read": ["cart.py", "test_cart.py"],
+        "model_id": "scripted",
+        "model_requests": 1,
+        "plan": {
+            "issue_summary": "Incorrect discount calculation",
+            "relevant_files": ["cart.py", "test_cart.py"],
+            "repair_strategy": "Apply the smallest change that addresses the reported Issue.",
+            "verification_strategy": "Run: pytest test_cart.py",
+        },
+        "schema_version": "1",
+        "tool_executions": 4,
+    }
+    assert f"Plan Checksum: {checksum}" in result.output
+    assert "Model Requests: 1" in result.output
+    assert "Tool Executions: 4" in result.output
+
+    status_cli = create_cli(model_gateway=ScriptedModel(), data_root=data_root)
+    status = CliRunner().invoke(status_cli, ["status", run_identifier])
+    assert status.exit_code == 0, status.output
+    assert "Plan Artifact: plan.json" in status.output
+    assert f"Plan Checksum: {checksum}" in status.output
+    assert "Issue: Incorrect discount calculation" in status.output
+    assert "Relevant Files: cart.py, test_cart.py" in status.output
+    assert "Repair: Apply the smallest change that addresses the reported Issue." in status.output
+    assert "Verification: Run: pytest test_cart.py" in status.output
+
+
+def test_model_cannot_read_an_absolute_workspace_path(tmp_path: Path) -> None:
+    cli = create_cli(
+        model_gateway=ScriptedModel(
+            inspection_calls=(ScriptedInspectionCall(operation="read", argument="/etc/passwd"),)
+        ),
+        data_root=tmp_path / "runs",
+    )
+
+    result = CliRunner().invoke(cli, ["run", "cart-discount"])
+
+    assert result.exit_code == 2
+    assert "paths must be relative and without traversal" in result.output
+
+
+@pytest.mark.parametrize("path", ["../outside.py", ".git/config", "venv/secret.py"])
+def test_model_cannot_read_traversing_or_ignored_paths(tmp_path: Path, path: str) -> None:
+    result, _ = _run_trusted_inspection(
+        tmp_path,
+        ScriptedModel(inspection_calls=(ScriptedInspectionCall("read", path),)),
+    )
+
+    assert result.exit_code == 2
+    assert "traversal" in result.output or "hidden or ignored" in result.output
+
+
+@pytest.mark.parametrize(
+    ("name", "content", "message"),
+    [
+        ("binary.dat", b"abc\x00def", "binary"),
+        ("non-utf8.txt", b"\xff\xfe", "not UTF-8"),
+        ("oversized.txt", b"x" * (100 * 1024 + 1), "exceeds 100 KiB"),
+    ],
+)
+def test_model_can_only_read_bounded_utf8_text(
+    tmp_path: Path,
+    name: str,
+    content: bytes,
+    message: str,
+) -> None:
+    result, _ = _run_trusted_inspection(
+        tmp_path,
+        ScriptedModel(inspection_calls=(ScriptedInspectionCall("read", name),)),
+        extra_files={name: content},
+    )
+
+    assert result.exit_code == 2
+    assert message in result.output
+
+
+def test_model_cannot_read_a_symlink_created_during_baseline(tmp_path: Path) -> None:
+    outside = tmp_path / "outside.py"
+    outside.write_text("SECRET = True\n", encoding="utf-8")
+    program = f"import os; os.symlink({str(outside)!r}, 'link.py'); raise SystemExit(1)"
+    result, _ = _run_trusted_inspection(
+        tmp_path,
+        ScriptedModel(inspection_calls=(ScriptedInspectionCall("read", "link.py"),)),
+        baseline_program=program,
+    )
+
+    assert result.exit_code == 2
+    assert "must not contain a symbolic link" in result.output
+
+
+def test_search_response_is_predictably_limited_to_32_kib(tmp_path: Path) -> None:
+    model = SearchRecordingModel()
+    result, _ = _run_trusted_inspection(
+        tmp_path,
+        model,
+        extra_files={"large.txt": ("needle: matching source line\n" * 2500).encode()},
+    )
+
+    assert result.exit_code == 0, result.output
+    assert model.search_result is not None
+    assert len(model.search_result.text.encode("utf-8")) == 32 * 1024
+    assert model.search_result.truncated is True
+    assert model.search_result.text.startswith("large.txt:1:needle")
+
+
+def test_model_plan_is_runtime_validated_before_artifact_persistence(tmp_path: Path) -> None:
+    result, data_root = _run_trusted_inspection(tmp_path, InvalidPlanModel())
+
+    assert result.exit_code == 2
+    assert "validation error" in result.output
+    run_roots = [path for path in data_root.iterdir() if path.is_dir()]
+    assert len(run_roots) == 1
+    assert not (run_roots[0] / "plan.json").exists()
 
 
 def test_user_starts_trusted_repository_run_from_explicit_contract(tmp_path: Path) -> None:
@@ -271,7 +462,7 @@ editable_paths = ["cart.py"]
     assert result.exit_code == 0, result.output
     workspace = data_root / _run_identifier(result.output) / "workspace"
     assert not (workspace / "venv").exists()
-    assert "python files inspected: 1" in result.output
+    assert "Relevant Files: cart.py" in result.output
 
 
 def test_passing_baseline_becomes_issue_not_reproduced(tmp_path: Path) -> None:

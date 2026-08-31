@@ -22,7 +22,12 @@ from patch_code_agent.fixtures import (
     load_fixture_registry,
 )
 from patch_code_agent.graph import build_graph
-from patch_code_agent.model import ModelGateway
+from patch_code_agent.model import ModelGateway, Plan
+from patch_code_agent.planning import (
+    PlanArtifactReference,
+    Planner,
+    load_plan_artifact,
+)
 from patch_code_agent.sources import (
     RepositorySource,
     RepositorySourceKind,
@@ -44,6 +49,10 @@ class PatchRunStatus:
         source_revision: Digest of the immutable initial source snapshot.
         phase: Latest persisted graph status without advancing graph execution.
         model_requests: Durable number of model calls consumed by this Run.
+        tool_executions: Durable number of bounded inspection operations.
+        files_read: Stable paths successfully read by the model.
+        plan: Validated Plan loaded from its checksummed artifact, when present.
+        plan_artifact: Durable path/checksum reference, when planning completed.
 
     Example:
         >>> status = PatchRunStatus(
@@ -53,6 +62,10 @@ class PatchRunStatus:
         ...     source_revision="9f86d081884c7d659a2feaa0c55ad015",
         ...     phase="planned",
         ...     model_requests=0,
+        ...     tool_executions=0,
+        ...     files_read=(),
+        ...     plan=None,
+        ...     plan_artifact=None,
         ... )
         >>> status.phase
         'planned'
@@ -64,6 +77,10 @@ class PatchRunStatus:
     source_revision: str
     phase: str
     model_requests: int
+    tool_executions: int
+    files_read: tuple[str, ...]
+    plan: Plan | None
+    plan_artifact: PlanArtifactReference | None
 
 
 class PatchRunStatusReader:
@@ -107,6 +124,16 @@ class PatchRunStatusReader:
             raise ValueError(f"Unknown Run Identifier: {run_id}")
         checkpoint = cast(dict[str, object], self._serializer.loads_typed(row))
         state = cast(RunState, checkpoint["channel_values"])
+        plan_reference = (
+            PlanArtifactReference.model_validate(state["plan_artifact"])
+            if "plan_artifact" in state
+            else None
+        )
+        plan = (
+            load_plan_artifact(self._database_path.parent, run_id, plan_reference).plan
+            if plan_reference is not None
+            else None
+        )
         return PatchRunStatus(
             run_id=state["run_id"],
             source_kind=state["source_kind"],
@@ -114,6 +141,10 @@ class PatchRunStatusReader:
             source_revision=state["source_revision"],
             phase=state["status"],
             model_requests=state["model_requests"],
+            tool_executions=state.get("tool_executions", 0),
+            files_read=tuple(state.get("files_read", [])),
+            plan=plan,
+            plan_artifact=plan_reference,
         )
 
 
@@ -143,6 +174,7 @@ class PatchCodeAgent:
             self._data_root,
             timeout_seconds=verification_timeout_seconds,
         )
+        self._planner = Planner(self._data_root, model_gateway)
         self._checkpoint_connection: sqlite3.Connection | None = None
         self._graph: CompiledStateGraph | None = None
 
@@ -190,6 +222,8 @@ class PatchCodeAgent:
                 "verification_argv": list(source.contract.verification),
                 "editable_paths": list(source.contract.editable_paths),
                 "model_requests": 0,
+                "tool_executions": 0,
+                "files_read": [],
                 "workspace_path": str(workspace.path),
                 "status": "created",
             },
@@ -231,6 +265,7 @@ class PatchCodeAgent:
             )
             self._graph = build_graph(
                 baseline_verifier=self._baseline_verifier,
+                planner=self._planner,
                 checkpointer=checkpointer,
             )
         return self._graph

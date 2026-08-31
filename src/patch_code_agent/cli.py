@@ -14,9 +14,20 @@ from rich.console import Console
 from rich.panel import Panel
 
 from patch_code_agent.application import PatchCodeAgent, PatchRunStatusReader
-from patch_code_agent.model import ModelGateway, ScriptedModel
+from patch_code_agent.model import ModelGateway, Plan, ScriptedModel
+from patch_code_agent.planning import PlanArtifactReference, load_plan_artifact
 from patch_code_agent.sources import RepositorySourceKind
 from patch_code_agent.state import RunState
+
+
+def _plan_lines(plan: Plan) -> tuple[tuple[str, str], ...]:
+    """Return the one canonical CLI presentation of a typed Plan."""
+    return (
+        ("Issue", plan.issue_summary),
+        ("Relevant Files", ", ".join(plan.relevant_files)),
+        ("Repair", plan.repair_strategy),
+        ("Verification", plan.verification_strategy),
+    )
 
 
 def create_cli(
@@ -83,13 +94,17 @@ def create_cli(
     def print_run_result(result: RunState) -> None:
         """Render fields that exist on either planning or terminal graph branches.
 
-        A failing baseline has a Plan and inspected files; terminal baseline outcomes have neither.
-        Optional lookups keep one renderer valid for both state shapes while identity, baseline,
-        model-request count, and raw status remain visible on every successful invocation.
+        A failing baseline has a Plan Artifact; terminal baseline outcomes do not. Optional lookups
+        keep one renderer valid for both state shapes while identity, baseline, counters, and raw
+        status remain visible on every successful invocation.
         """
-        if plan_steps := result.get("plan"):
-            plan = "\n".join(f"{index}. {step}" for index, step in enumerate(plan_steps, 1))
-            console.print(Panel.fit(plan, title="PatchCodeAgent plan", border_style="green"))
+        if raw_reference := result.get("plan_artifact"):
+            reference = PlanArtifactReference.model_validate(raw_reference)
+            artifact = load_plan_artifact(selected_data_root, result["run_id"], reference)
+            plan_text = "\n".join(f"{label}: {value}" for label, value in _plan_lines(artifact.plan))
+            console.print(Panel.fit(plan_text, title="PatchCodeAgent plan", border_style="green"))
+            console.print(f"[dim]Plan Artifact:[/] {reference.path}")
+            console.print(f"[dim]Plan Checksum:[/] {reference.sha256}", soft_wrap=True)
         console.print(f"[dim]Run Identifier:[/] {result['run_id']}")
         console.print(
             f"[dim]{source_label(result['source_kind'])}:[/] {result['source_id']}"
@@ -97,11 +112,10 @@ def create_cli(
         console.print(f"[dim]Source Revision:[/] {result['source_revision']}", soft_wrap=True)
         baseline = result["baseline_verification"]
         console.print(f"[dim]Baseline Verification:[/] {baseline['outcome']}")
-        if inspected_files := result.get("inspected_files"):
-            console.print(f"[dim]python files inspected:[/] {len(inspected_files)}")
         if outcome := outcome_label(result["status"]):
             console.print(f"[dim]Outcome:[/] {outcome}")
         console.print(f"[dim]Model Requests:[/] {result['model_requests']}")
+        console.print(f"[dim]Tool Executions:[/] {result.get('tool_executions', 0)}")
         console.print(f"[dim]status:[/] {result['status']}")
 
     @cli.callback()
@@ -143,6 +157,15 @@ def create_cli(
         )
         console.print(f"[dim]Phase:[/] {patch_run.phase}")
         console.print(f"[dim]Model Requests:[/] {patch_run.model_requests}")
+        console.print(f"[dim]Tool Executions:[/] {patch_run.tool_executions}")
+        if patch_run.plan is not None and patch_run.plan_artifact is not None:
+            console.print(f"[dim]Plan Artifact:[/] {patch_run.plan_artifact.path}")
+            console.print(
+                f"[dim]Plan Checksum:[/] {patch_run.plan_artifact.sha256}",
+                soft_wrap=True,
+            )
+            for label, value in _plan_lines(patch_run.plan):
+                console.print(f"[dim]{label}:[/] {value}")
 
 
     @cli.command()

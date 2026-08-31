@@ -7,9 +7,11 @@ implementation 與 acceptance spec 見
 
 這份文件描述的是已確認的 **MVP target design**。目前已完成 Fixture Registry、明確 opt-in
 的 Trusted Repository Adapter、隔離 Run Workspace、Baseline Verification 與 SQLite-backed
-durable status。Baseline 失敗會進入 planning；通過、執行錯誤與逾時會形成對應 terminal
-outcome。模型編輯、Approval Gate、修補後 Verification 與 terminal report 仍待實作。驗收進度
-以 GitHub Issue #2 為準。
+durable status，以及透過 bounded inspection tools 產生的 typed Plan Artifact。Baseline 失敗會
+進入 planning；通過、執行錯誤與逾時會形成對應 terminal outcome。Candidate Patch、Approval
+Gate、修補後 Verification 與 terminal report 仍待實作。驗收進度以 GitHub Issue #2 為準。
+完整 Resource Budget enforcement、typed-output correction retry 與 provider retry 分別由後續
+MVP tickets 實作；本階段只保存 planning 已實際使用的 counters。
 
 ---
 
