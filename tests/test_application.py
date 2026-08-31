@@ -24,4 +24,5 @@ def test_status_reader_sees_committed_checkpoint_still_in_wal(tmp_path: Path) ->
     assert status.source_kind == "fixture"
     assert status.source_id == "cart-discount"
     assert len(status.source_revision) == 64
-    assert status.phase == "planned"
+    assert status.phase == "pending_approval"
+    assert status.candidate_artifact is not None

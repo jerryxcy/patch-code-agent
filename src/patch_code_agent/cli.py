@@ -14,6 +14,7 @@ from rich.console import Console
 from rich.panel import Panel
 
 from patch_code_agent.application import PatchCodeAgent, PatchRunStatusReader
+from patch_code_agent.candidate import CandidatePatchReference, load_candidate_patch
 from patch_code_agent.model import ModelGateway, Plan, ScriptedModel
 from patch_code_agent.planning import PlanArtifactReference, load_plan_artifact
 from patch_code_agent.sources import RepositorySourceKind
@@ -105,6 +106,25 @@ def create_cli(
             console.print(Panel.fit(plan_text, title="PatchCodeAgent plan", border_style="green"))
             console.print(f"[dim]Plan Artifact:[/] {reference.path}")
             console.print(f"[dim]Plan Checksum:[/] {reference.sha256}", soft_wrap=True)
+        if raw_candidate_reference := result.get("candidate_artifact"):
+            candidate_reference = CandidatePatchReference.model_validate(raw_candidate_reference)
+            candidate = load_candidate_patch(
+                selected_data_root,
+                result["run_id"],
+                candidate_reference,
+            )
+            console.print("[bold yellow]Candidate Patch[/]")
+            console.print(candidate.diff, markup=False, highlight=False, soft_wrap=True)
+            console.print(f"[dim]Candidate Artifact:[/] {candidate_reference.path}")
+            console.print(
+                f"[dim]Candidate Checksum:[/] {candidate_reference.sha256}",
+                soft_wrap=True,
+            )
+            console.print(f"[dim]Candidate Diff:[/] {candidate_reference.diff_path}")
+            console.print(
+                f"[dim]Diff Checksum:[/] {candidate_reference.diff_sha256}",
+                soft_wrap=True,
+            )
         console.print(f"[dim]Run Identifier:[/] {result['run_id']}")
         console.print(
             f"[dim]{source_label(result['source_kind'])}:[/] {result['source_id']}"
@@ -116,6 +136,8 @@ def create_cli(
             console.print(f"[dim]Outcome:[/] {outcome}")
         console.print(f"[dim]Model Requests:[/] {result['model_requests']}")
         console.print(f"[dim]Tool Executions:[/] {result.get('tool_executions', 0)}")
+        console.print(f"[dim]Files Read:[/] {len(result.get('files_read', []))}")
+        console.print(f"[dim]Repair Attempts:[/] {result.get('attempt', 0)}")
         console.print(f"[dim]status:[/] {result['status']}")
 
     @cli.callback()
@@ -158,6 +180,8 @@ def create_cli(
         console.print(f"[dim]Phase:[/] {patch_run.phase}")
         console.print(f"[dim]Model Requests:[/] {patch_run.model_requests}")
         console.print(f"[dim]Tool Executions:[/] {patch_run.tool_executions}")
+        console.print(f"[dim]Files Read:[/] {len(patch_run.files_read)}")
+        console.print(f"[dim]Repair Attempts:[/] {patch_run.attempts}")
         if patch_run.plan is not None and patch_run.plan_artifact is not None:
             console.print(f"[dim]Plan Artifact:[/] {patch_run.plan_artifact.path}")
             console.print(
@@ -166,6 +190,32 @@ def create_cli(
             )
             for label, value in _plan_lines(patch_run.plan):
                 console.print(f"[dim]{label}:[/] {value}")
+        if (
+            patch_run.candidate is not None
+            and patch_run.candidate_diff is not None
+            and patch_run.candidate_artifact is not None
+        ):
+            console.print("[bold yellow]Candidate Patch[/]")
+            console.print(
+                patch_run.candidate_diff,
+                markup=False,
+                highlight=False,
+                soft_wrap=True,
+            )
+            console.print(
+                f"[dim]Candidate Artifact:[/] {patch_run.candidate_artifact.path}"
+            )
+            console.print(
+                f"[dim]Candidate Checksum:[/] {patch_run.candidate_artifact.sha256}",
+                soft_wrap=True,
+            )
+            console.print(
+                f"[dim]Candidate Diff:[/] {patch_run.candidate_artifact.diff_path}"
+            )
+            console.print(
+                f"[dim]Diff Checksum:[/] {patch_run.candidate_artifact.diff_sha256}",
+                soft_wrap=True,
+            )
 
 
     @cli.command()

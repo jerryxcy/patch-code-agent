@@ -15,6 +15,7 @@ class RecordingModel:
     def __init__(self) -> None:
         self.model_id_accesses = 0
         self.plan_requests = 0
+        self.candidate_requests = 0
 
     @property
     def model_id(self) -> str:
@@ -24,6 +25,10 @@ class RecordingModel:
     def create_plan(self, request, tools):
         self.plan_requests += 1
         return ScriptedModel().create_plan(request, tools)
+
+    def create_candidate(self, request, tools):
+        self.candidate_requests += 1
+        return ScriptedModel().create_candidate(request, tools)
 
 
 class SearchRecordingModel:
@@ -41,6 +46,9 @@ class SearchRecordingModel:
             "verification_strategy": "Run the declared Verification command.",
         }
 
+    def create_candidate(self, request, tools):
+        return ScriptedModel().create_candidate(request, tools)
+
 
 class InvalidPlanModel:
     model_id = "invalid-plan"
@@ -48,6 +56,45 @@ class InvalidPlanModel:
     def create_plan(self, request, tools):
         tools.list_files()
         return {"issue_summary": "Missing required Plan fields"}
+
+
+class CandidateScenarioModel:
+    model_id = "candidate-scenario"
+
+    def __init__(self, scenario: str, path: str = "cart.py") -> None:
+        self.scenario = scenario
+        self.path = path
+
+    def create_plan(self, request, tools):
+        return ScriptedModel().create_plan(request, tools)
+
+    def create_candidate(self, request, tools):
+        if self.scenario in {"create", "unread"}:
+            expected_sha256 = "0" * 64
+            old_content = ""
+        else:
+            observed = tools.read_file(self.path)
+            old_content = observed.content
+            expected_sha256 = hashlib.sha256(old_content.encode()).hexdigest()
+
+        replacement = {
+            "path": self.path,
+            "expected_sha256": expected_sha256,
+            "new_content": old_content + "# proposed change\n",
+        }
+        if self.scenario == "delete":
+            replacement["new_content"] = ""
+        elif self.scenario == "binary":
+            replacement["new_content"] = old_content + "\x00binary"
+        elif self.scenario == "stale_hash":
+            replacement["expected_sha256"] = "f" * 64
+        elif self.scenario == "oversized":
+            replacement["new_content"] = "x" * (100 * 1024 + 1)
+        elif self.scenario == "rename":
+            replacement["new_path"] = "renamed.py"
+        elif self.scenario == "too_many":
+            return {"replacements": [replacement] * 4}
+        return {"replacements": [replacement]}
 
 
 def _run_identifier(output: str) -> str:
@@ -243,11 +290,12 @@ def test_user_starts_registered_patch_run_in_isolated_workspace(tmp_path: Path) 
     assert (fixture_repository / "cart.py").read_bytes() == original_cart
     assert "PatchCodeAgent plan" in result.output
     assert "Baseline Verification: failed" in result.output
-    assert "Model Requests: 1" in result.output
+    assert "Model Requests: 2" in result.output
     assert model.plan_requests == 1
-    assert model.model_id_accesses == 1
+    assert model.candidate_requests == 1
+    assert model.model_id_accesses == 2
     assert "Run Identifier:" in result.output
-    assert "status: planned" in result.output
+    assert "status: pending_approval" in result.output
     baseline = json.loads((data_root / run_identifier / "baseline" / "result.json").read_text())
     assert baseline["outcome"] == "failed"
     assert baseline["exit_code"] == 1
@@ -281,8 +329,8 @@ def test_failing_baseline_creates_a_typed_checksummed_plan_artifact(tmp_path: Pa
         "tool_executions": 4,
     }
     assert f"Plan Checksum: {checksum}" in result.output
-    assert "Model Requests: 1" in result.output
-    assert "Tool Executions: 4" in result.output
+    assert "Model Requests: 2" in result.output
+    assert "Tool Executions: 5" in result.output
 
     status_cli = create_cli(model_gateway=ScriptedModel(), data_root=data_root)
     status = CliRunner().invoke(status_cli, ["status", run_identifier])
@@ -293,6 +341,111 @@ def test_failing_baseline_creates_a_typed_checksummed_plan_artifact(tmp_path: Pa
     assert "Relevant Files: cart.py, test_cart.py" in status.output
     assert "Repair: Apply the smallest change that addresses the reported Issue." in status.output
     assert "Verification: Run: pytest test_cart.py" in status.output
+
+
+def test_run_pauses_with_an_immutable_candidate_patch_visible_from_status(
+    tmp_path: Path,
+) -> None:
+    fixture_repository = Path(__file__).parents[1] / "examples" / "tiny_repo"
+    original_source = (fixture_repository / "cart.py").read_bytes()
+    data_root = tmp_path / "runs"
+
+    run_result = CliRunner().invoke(
+        create_cli(model_gateway=ScriptedModel(), data_root=data_root),
+        ["run", "cart-discount"],
+    )
+
+    assert run_result.exit_code == 0, run_result.output
+    run_identifier = _run_identifier(run_result.output)
+    run_root = data_root / run_identifier
+    workspace_source = run_root / "workspace" / "cart.py"
+    candidate_path = run_root / "attempts" / "1" / "candidate.json"
+    diff_path = run_root / "attempts" / "1" / "candidate.diff"
+    candidate_checksum = hashlib.sha256(candidate_path.read_bytes()).hexdigest()
+    diff_checksum = hashlib.sha256(diff_path.read_bytes()).hexdigest()
+    exact_diff = diff_path.read_text(encoding="utf-8")
+
+    assert workspace_source.read_bytes() == original_source
+    assert (fixture_repository / "cart.py").read_bytes() == original_source
+    assert "status: pending_approval" in run_result.output
+    assert "Candidate Patch" in run_result.output
+    assert f"Candidate Checksum: {candidate_checksum}" in run_result.output
+    assert f"Diff Checksum: {diff_checksum}" in run_result.output
+    assert "-    return sum(prices) - discount" in exact_diff
+    assert "+    subtotal = sum(prices)" in exact_diff
+    assert "+    return subtotal * (1 - discount)" in exact_diff
+
+    status_result = CliRunner().invoke(
+        create_cli(model_gateway=ScriptedModel(), data_root=data_root),
+        ["status", run_identifier],
+    )
+
+    assert status_result.exit_code == 0, status_result.output
+    assert "Phase: pending_approval" in status_result.output
+    assert "Candidate Artifact: attempts/1/candidate.json" in status_result.output
+    assert f"Candidate Checksum: {candidate_checksum}" in status_result.output
+    assert "Candidate Diff: attempts/1/candidate.diff" in status_result.output
+    assert f"Diff Checksum: {diff_checksum}" in status_result.output
+    assert exact_diff in status_result.output
+    assert "Model Requests: 2" in status_result.output
+    assert "Tool Executions: 5" in status_result.output
+    assert "Files Read: 2" in status_result.output
+    assert "Repair Attempts: 0" in status_result.output
+
+
+@pytest.mark.parametrize("path", ["test_cart.py", "issue.md", "fixture.toml"])
+def test_candidate_patch_rejects_tests_issue_and_manifest_changes(
+    tmp_path: Path,
+    path: str,
+) -> None:
+    data_root = tmp_path / "runs"
+
+    result = CliRunner().invoke(
+        create_cli(
+            model_gateway=CandidateScenarioModel("noneditable", path),
+            data_root=data_root,
+        ),
+        ["run", "cart-discount"],
+    )
+
+    assert result.exit_code == 2
+    assert f"Candidate Patch path is not editable: {path}" in result.output
+    run_root = next(path for path in data_root.iterdir() if path.is_dir())
+    assert (run_root / "workspace" / "cart.py").read_bytes() == (
+        Path(__file__).parents[1] / "examples" / "tiny_repo" / "cart.py"
+    ).read_bytes()
+    assert not (run_root / "attempts" / "1" / "candidate.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("scenario", "path", "message"),
+    [
+        ("create", "new.py", "not editable"),
+        ("unread", "cart.py", "not explicitly read"),
+        ("delete", "cart.py", "cannot delete"),
+        ("binary", "cart.py", "must be text"),
+        ("stale_hash", "cart.py", "does not match the model read"),
+        ("oversized", "cart.py", "exceeds 100 KiB"),
+        ("rename", "cart.py", "validation error"),
+        ("too_many", "cart.py", "validation error"),
+    ],
+)
+def test_candidate_patch_rejects_unsafe_structured_replacements(
+    tmp_path: Path,
+    scenario: str,
+    path: str,
+    message: str,
+) -> None:
+    result = CliRunner().invoke(
+        create_cli(
+            model_gateway=CandidateScenarioModel(scenario, path),
+            data_root=tmp_path / "runs",
+        ),
+        ["run", "cart-discount"],
+    )
+
+    assert result.exit_code == 2
+    assert message in result.output
 
 
 def test_model_cannot_read_an_absolute_workspace_path(tmp_path: Path) -> None:
@@ -417,7 +570,7 @@ editable_paths = ["cart.py"]
     assert (workspace / "cart.py").read_bytes() == original_source
     assert (repository / "cart.py").read_bytes() == original_source
     assert "Trusted Repository: trusted-cart" in result.output
-    assert "status: planned" in result.output
+    assert "status: pending_approval" in result.output
     revision_match = re.search(r"Source Revision: ([0-9a-f]{64})", result.output)
     assert revision_match is not None
 
@@ -426,7 +579,7 @@ editable_paths = ["cart.py"]
     assert status.exit_code == 0, status.output
     assert "Trusted Repository: trusted-cart" in status.output
     assert f"Source Revision: {revision_match.group(1)}" in status.output
-    assert "Phase: planned" in status.output
+    assert "Phase: pending_approval" in status.output
 
 
 def test_run_workspace_excludes_visible_virtual_environment(tmp_path: Path) -> None:
@@ -906,7 +1059,7 @@ def test_user_reads_patch_run_status_from_separate_cli_invocations(tmp_path: Pat
     assert first_status.output == second_status.output
     assert f"Run Identifier: {run_identifier}" in first_status.output
     assert "Fixture Repository: cart-discount" in first_status.output
-    assert "Phase: planned" in first_status.output
+    assert "Phase: pending_approval" in first_status.output
     assert database_after == database_before
 
 

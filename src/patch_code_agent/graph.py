@@ -2,8 +2,8 @@
 
 Nodes return bounded state updates and LangGraph persists those updates through the supplied
 checkpointer. Repository execution remains behind ``BaselineVerifier`` rather than being exposed
-to the model. The current milestone creates one typed, checksummed Plan through bounded inspection;
-later milestones add Candidate Patch generation, approval, application, and post-change Verification.
+to the model. Candidate Patch persistence completes before ``interrupt`` pauses at the Approval
+Gate, so a later process can inspect the exact immutable proposal without changing the workspace.
 """
 
 from pathlib import Path
@@ -12,7 +12,9 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
+from langgraph.types import interrupt
 
+from patch_code_agent.candidate import CandidatePatchBuilder, CandidatePatchReference
 from patch_code_agent.planning import PlanArtifactReference, Planner
 from patch_code_agent.state import RunState, RunStatus
 from patch_code_agent.verification import BaselineVerificationOutcome, BaselineVerifier
@@ -95,15 +97,58 @@ def create_plan(state: RunState, planner: Planner) -> RunState:
         "report": {
             "success": False,
             "phase": "planned",
-            "note": "Candidate Patch generation and Approval are the next milestone.",
+            "note": "Plan is complete; Candidate Patch generation follows.",
         },
     }
+
+
+def create_candidate(state: RunState, builder: CandidatePatchBuilder) -> RunState:
+    """Persist one validated Candidate Patch before the Approval Gate can interrupt."""
+    plan_reference = PlanArtifactReference.model_validate(state["plan_artifact"])
+    result = builder.create_once(
+        run_id=state["run_id"],
+        workspace=Path(state["workspace_path"]),
+        issue=state["issue"],
+        editable_paths=state["editable_paths"],
+        plan_reference=plan_reference,
+        attempt=state.get("attempt", 0) + 1,
+        expected_reference=(
+            CandidatePatchReference.model_validate(state["candidate_artifact"])
+            if "candidate_artifact" in state
+            else None
+        ),
+    )
+    return {
+        "candidate_artifact": result.reference.model_dump(mode="json"),
+        "model_requests": state["model_requests"] + result.artifact.model_requests,
+        "tool_executions": state["tool_executions"] + result.artifact.tool_executions,
+        "files_read": sorted(set(state["files_read"]) | set(result.artifact.files_read)),
+        "approved": False,
+        "status": "pending_approval",
+        "report": {
+            "success": False,
+            "phase": "pending_approval",
+            "note": "Candidate Patch is immutable and awaiting an Approval decision.",
+        },
+    }
+
+
+def await_approval(state: RunState) -> RunState:
+    """Pause after persistence and expose only the immutable Candidate Patch reference."""
+    decision = interrupt(
+        {
+            "run_id": state["run_id"],
+            "candidate_artifact": state["candidate_artifact"],
+        }
+    )
+    return {"approved": decision == "approve"}
 
 
 def build_graph(
     *,
     baseline_verifier: BaselineVerifier,
     planner: Planner,
+    candidate_builder: CandidatePatchBuilder,
     checkpointer: BaseCheckpointSaver | None = None,
 ) -> CompiledStateGraph:
     """Compile the Patch Run graph with durable or in-memory checkpointing.
@@ -120,6 +165,11 @@ def build_graph(
         lambda state: run_baseline_verification(state, baseline_verifier),
     )
     builder.add_node("create_plan", lambda state: create_plan(state, planner))
+    builder.add_node(
+        "create_candidate",
+        lambda state: create_candidate(state, candidate_builder),
+    )
+    builder.add_node("approval_gate", await_approval)
     builder.add_edge(START, "validate_input")
     builder.add_edge("validate_input", "baseline_verification")
     builder.add_conditional_edges(
@@ -127,5 +177,7 @@ def build_graph(
         route_after_baseline,
         {"create_plan": "create_plan", "end": END},
     )
-    builder.add_edge("create_plan", END)
+    builder.add_edge("create_plan", "create_candidate")
+    builder.add_edge("create_candidate", "approval_gate")
+    builder.add_edge("approval_gate", END)
     return builder.compile(checkpointer=selected_checkpointer)

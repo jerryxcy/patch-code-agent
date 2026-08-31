@@ -19,6 +19,7 @@ RunStatus = Literal[
     "error",
     "inspected",
     "planned",
+    "pending_approval",
     "editing",
     "testing",
     "passed",
@@ -44,6 +45,7 @@ class RunState(TypedDict, total=False):
         workspace_path: Absolute path to this Run's isolated mutable workspace.
         baseline_verification: Bounded serialized ``BaselineVerificationSummary``.
         plan_artifact: Path and checksum of the immutable runtime-validated Plan.
+        candidate_artifact: Paths and checksums of the pending Candidate Patch and exact diff.
         tool_executions: Host-counted bounded inspection operations.
         files_read: Stable paths successfully read through the bounded tool interface.
         attempt: Zero-based repair-attempt counter used by later workflow milestones.
@@ -79,6 +81,7 @@ class RunState(TypedDict, total=False):
     workspace_path: str
     baseline_verification: dict[str, object]
     plan_artifact: dict[str, object]
+    candidate_artifact: dict[str, object]
     tool_executions: int
     files_read: list[str]
     attempt: int

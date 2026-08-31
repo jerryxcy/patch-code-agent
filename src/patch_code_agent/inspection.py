@@ -1,5 +1,6 @@
 """Expose a bounded, read-only view of one Run Workspace to a model adapter."""
 
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Protocol
@@ -83,6 +84,7 @@ class WorkspaceInspector:
         self._workspace = workspace.resolve()
         self._tool_executions = 0
         self._files_read: set[str] = set()
+        self._read_hashes: dict[str, str] = {}
 
     @property
     def tool_executions(self) -> int:
@@ -93,6 +95,11 @@ class WorkspaceInspector:
     def files_read(self) -> tuple[str, ...]:
         """Return successfully read paths in stable order."""
         return tuple(sorted(self._files_read))
+
+    @property
+    def read_hashes(self) -> dict[str, str]:
+        """Return a copy of SHA-256 preimages observed by explicit model reads."""
+        return dict(self._read_hashes)
 
     def list_files(self) -> FileList:
         """List at most 256 visible regular UTF-8 text files."""
@@ -109,6 +116,7 @@ class WorkspaceInspector:
         relative, candidate = self._resolve_regular_file(path)
         content = self._read_text(candidate)
         self._files_read.add(relative)
+        self._read_hashes[relative] = hashlib.sha256(content.encode("utf-8")).hexdigest()
         return FileContent(path=relative, content=content)
 
     def search_code(self, query: str) -> SearchResult:

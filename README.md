@@ -11,8 +11,10 @@ Candidate Patch 與 Diagnosis。
 > 也可用外部 Patch Run Contract 明確啟動本機 Trusted Repository，並以 SQLite 保存可跨程序
 > 查詢的狀態。Baseline Verification 會在隔離 workspace 中以受限環境執行：失敗才進入
 > planning；Scripted Model 只能透過 bounded list/read/search 工具觀察 workspace，產生 typed、
-> checksummed Plan Artifact。通過、執行錯誤或逾時則直接形成 terminal outcome。Candidate Patch、
-> Approval Gate、修補後 Verification 與 Run Report 仍是尚待完成的 MVP 功能。
+> checksummed Plan Artifact 與 bounded structured replacements。Host 會驗證 replacement 的
+> editable path、read hash 與大小，自行產生 exact diff 和 checksummed Candidate Patch Artifact，
+> 再跨程序停在 Approval Gate；此時 workspace 尚未修改。核准／拒絕、修補後 Verification 與
+> Run Report 仍是尚待完成的 MVP 功能。
 
 完整的 MVP implementation 與 acceptance spec 見
 [GitHub Issue #2](https://github.com/jerryxcy/patch-code-agent/issues/2)。
@@ -71,9 +73,10 @@ uv run patch-code-agent status <run-id>
 
 `run` 只接受 registry 中的 Fixture Repository ID，並將 fixture 複製到
 `~/.patch-code-agent/runs/<run-id>/workspace/`。系統會先以 Patch Run Contract 的 argv 執行
-Baseline Verification；`cart-discount` 的預期失敗會進入 `planned`，並輸出 typed Plan、
-Run Identifier、artifact checksum 與 inspection counters。Baseline 通過時結果為 `Issue Not Reproduced`，
-非測試失敗的 exit code 為 `Error`，60 秒逾時則為 `Budget Exceeded`。來源 fixture 不會被修改。
+Baseline Verification；`cart-discount` 的預期失敗會進入 `pending_approval`，並輸出 typed Plan、
+exact Candidate Patch diff、Run Identifier、artifact checksums 與目前 counters。Candidate 只會保存為
+Run Artifact，尚未套用到 workspace。Baseline 通過時結果為 `Issue Not Reproduced`，非測試失敗的
+exit code 為 `Error`，60 秒逾時則為 `Budget Exceeded`。來源 fixture 永遠不會被修改。
 
 指定本機 Trusted Repository 時，Patch Run Contract 必須放在 repository 外面：
 
@@ -131,6 +134,7 @@ patch-code-agent reject <run-id>
 src/patch_code_agent/
   __main__.py          python -m patch_code_agent 入口
   application.py       Fixture、workspace 與 checkpoint 的應用層 seam
+  candidate.py         structured replacement validation、exact diff 與 replay ledger
   cli.py               Typer CLI 與 Rich 輸出
   fixtures/            Fixture manifest validation 與 registry
   graph.py             LangGraph nodes、edges 與 checkpoint 組裝
