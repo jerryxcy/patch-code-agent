@@ -1,3 +1,11 @@
+"""Validate repository sources and normalize them into Patch Run inputs.
+
+Bundled fixtures and explicitly trusted local repositories have different file representations,
+but graph execution should not care where a source came from. This module defines their shared
+``RepositorySource`` and ``PatchRunContract`` boundary, including bounded Issue text, controlled
+Verification argv, editable paths, containment checks, and the no-symlink policy.
+"""
+
 from __future__ import annotations
 
 import os
@@ -31,6 +39,11 @@ _IGNORED_SOURCE_NAMES = frozenset(
 
 
 def validate_relative_path(value: str) -> str:
+    """Reject absolute, empty, or traversing paths from source contracts.
+
+    Contracts use POSIX separators even when executed on another platform. Rejecting ``.`` and
+    ``..`` segments here keeps later filesystem resolution simple and prevents policy bypasses.
+    """
     path = PurePosixPath(value)
     if path.is_absolute() or not value or any(part in {"", ".", ".."} for part in path.parts):
         raise ValueError("Repository Source paths must be relative and without traversal")
@@ -38,7 +51,12 @@ def validate_relative_path(value: str) -> str:
 
 
 def is_ignored_source_path(relative_path: Path) -> bool:
-    """Return whether a Repository Source path is outside the bounded source view."""
+    """Return whether a path is outside the bounded source view.
+
+    The same predicate is reused while copying workspaces and inspecting files so runtime caches,
+    virtual environments, hidden metadata, and compiled Python files cannot appear through one
+    path after being excluded by another.
+    """
     return any(
         part.startswith(".")
         or part in _IGNORED_SOURCE_NAMES
@@ -48,6 +66,7 @@ def is_ignored_source_path(relative_path: Path) -> bool:
 
 
 def _validate_issue(value: str) -> str:
+    """Require Issue text to contain something beyond whitespace."""
     if not value.strip():
         raise ValueError("Patch Run Contract Issue must not be empty")
     return value
@@ -86,7 +105,25 @@ type EditablePaths = Annotated[
 
 
 class PatchRunContract(BaseModel):
-    """Validated Issue, Verification, and edit policy for one Repository Source."""
+    """Validated Issue, Verification, and edit policy for one Repository Source.
+
+    Pydantic enforces size limits and rejects unknown fields before any workspace or subprocess is
+    created. Frozen instances keep the contract stable throughout a Patch Run.
+
+    Attributes:
+        issue: Non-empty problem statement, limited to 32,768 characters.
+        verification: Non-empty argv tuple executed directly without shell parsing.
+        editable_paths: Non-empty tuple of bounded, relative, non-traversing source paths.
+
+    Example:
+        >>> contract = PatchRunContract(
+        ...     issue="Fix the incorrect cart discount",
+        ...     verification=("pytest", "-q", "test_cart.py"),
+        ...     editable_paths=("cart.py",),
+        ... )
+        >>> contract.verification
+        ('pytest', '-q', 'test_cart.py')
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -96,14 +133,52 @@ class PatchRunContract(BaseModel):
 
 
 class TrustedRepositoryContract(PatchRunContract):
-    """File representation of a Trusted Repository's Patch Run Contract."""
+    """File representation of a Trusted Repository's Patch Run Contract.
+
+    Attributes:
+        source_id: Lowercase kebab-case identifier supplied by the external TOML contract.
+        issue: Inherited problem statement describing the requested repair.
+        verification: Inherited controlled argv executed with host authority after explicit opt-in.
+        editable_paths: Inherited allowlist of repository-relative paths.
+
+    Example:
+        >>> contract = TrustedRepositoryContract(
+        ...     source_id="trusted-cart",
+        ...     issue="Fix total calculation",
+        ...     verification=("pytest",),
+        ...     editable_paths=("cart.py",),
+        ... )
+        >>> contract.source_id
+        'trusted-cart'
+    """
 
     source_id: RepositorySourceId
 
 
 @dataclass(frozen=True, slots=True)
 class RepositorySource:
-    """Immutable repository content prepared for Patch Run execution."""
+    """Immutable repository content prepared for Patch Run execution.
+
+    Attributes:
+        kind: Source adapter category, either ``fixture`` or ``trusted``.
+        source_id: Stable contract/registry identifier displayed by the CLI.
+        root: Resolved directory whose visible contents will seed the Run Workspace.
+        contract: Source-neutral Issue, Verification argv, and edit policy.
+
+    Example:
+        >>> source = RepositorySource(
+        ...     kind="fixture",
+        ...     source_id="cart-discount",
+        ...     root=Path("examples/tiny_repo").resolve(),
+        ...     contract=PatchRunContract(
+        ...         issue="Fix the discount",
+        ...         verification=("pytest",),
+        ...         editable_paths=("cart.py",),
+        ...     ),
+        ... )
+        >>> source.kind
+        'fixture'
+    """
 
     kind: RepositorySourceKind
     source_id: RepositorySourceId
@@ -112,6 +187,12 @@ class RepositorySource:
 
 
 def load_trusted_repository(repository: Path, contract_path: Path) -> RepositorySource:
+    """Load an explicitly trusted local repository and its external TOML contract.
+
+    Keeping the contract outside the repository prevents repository content from silently
+    changing its own Issue, Verification command, or edit policy. This validates structure and
+    containment only; execution still has host authority and therefore requires CLI opt-in.
+    """
     reject_source_symlinks(repository)
     if contract_path.is_symlink():
         raise ValueError(f"Patch Run Contract must not be a symbolic link: {contract_path}")
@@ -135,6 +216,11 @@ def load_trusted_repository(repository: Path, contract_path: Path) -> Repository
 
 
 def reject_source_symlinks(root: Path) -> None:
+    """Reject symlinks so copied source content cannot escape its declared root.
+
+    The walk does not follow directory links, but every discovered entry is checked explicitly so
+    both file and directory symlinks fail before workspace creation.
+    """
     if root.is_symlink():
         raise ValueError(f"Repository Source must not be a symbolic link: {root}")
     if not root.is_dir():
@@ -150,6 +236,11 @@ def reject_source_symlinks(root: Path) -> None:
 
 
 def resolve_source_file(root: Path, relative_path: str, kind: str) -> Path:
+    """Resolve a contract path while enforcing containment and source-view policy.
+
+    Validation first applies the ignored-path rule, then resolves the candidate and checks it is a
+    real file beneath ``root``. The caller-provided ``kind`` only improves domain error messages.
+    """
     normalized_path = Path(*PurePosixPath(relative_path).parts)
     if is_ignored_source_path(normalized_path):
         raise ValueError(f"Repository Source {kind} is ignored: {relative_path}")

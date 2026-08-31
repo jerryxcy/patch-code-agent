@@ -1,3 +1,10 @@
+"""Expose Patch Run creation and read-only status through a Typer CLI.
+
+Commands translate terminal/domain failures into stable exit code 2 messages and always close the
+application writer after use. ``status`` intentionally takes the separate read-only path, while
+``run-local`` requires an explicit trust acknowledgement before repository code can execute.
+"""
+
 from pathlib import Path
 from typing import Annotated, assert_never, cast
 from uuid import uuid4
@@ -19,7 +26,12 @@ def create_cli(
     fixture_roots: tuple[Path, ...] | None = None,
     verification_timeout_seconds: float = 60.0,
 ) -> typer.Typer:
-    """Create the CLI with all application dependencies at one seam."""
+    """Create the CLI with all application dependencies at one seam.
+
+    Optional arguments are dependency-injection hooks used by acceptance tests: they replace the
+    model, data root, fixture roots, or timeout while still exercising the public Typer interface,
+    real filesystem, SQLite, and subprocess implementations.
+    """
     cli = typer.Typer(no_args_is_help=True, help="Run the PatchCodeAgent coding-agent harness.")
     console = Console()
     selected_model = model_gateway if model_gateway is not None else ScriptedModel()
@@ -29,6 +41,11 @@ def create_cli(
     application: PatchCodeAgent | None = None
 
     def get_application() -> PatchCodeAgent:
+        """Create the stateful application lazily for commands that need writes.
+
+        A single CLI invocation reuses one application, but ``close_application`` resets the local
+        reference so its SQLite connection cannot leak into another command execution.
+        """
         nonlocal application
         if application is None:
             application = PatchCodeAgent(
@@ -40,12 +57,14 @@ def create_cli(
         return cast(PatchCodeAgent, application)
 
     def close_application() -> None:
+        """Flush SQLite resources after a command finishes or raises."""
         nonlocal application
         if application is not None:
             application.close()
             application = None
 
     def source_label(source_kind: RepositorySourceKind) -> str:
+        """Render the closed Repository Source kind set for humans."""
         match source_kind:
             case "fixture":
                 return "Fixture Repository"
@@ -54,6 +73,7 @@ def create_cli(
         assert_never(source_kind)
 
     def outcome_label(status: str) -> str | None:
+        """Translate terminal internal states into stable CLI outcome labels."""
         return {
             "issue_not_reproduced": "Issue Not Reproduced",
             "budget_exceeded": "Budget Exceeded",
@@ -61,6 +81,12 @@ def create_cli(
         }.get(status)
 
     def print_run_result(result: RunState) -> None:
+        """Render fields that exist on either planning or terminal graph branches.
+
+        A failing baseline has a Plan and inspected files; terminal baseline outcomes have neither.
+        Optional lookups keep one renderer valid for both state shapes while identity, baseline,
+        model-request count, and raw status remain visible on every successful invocation.
+        """
         if plan_steps := result.get("plan"):
             plan = "\n".join(f"{index}. {step}" for index, step in enumerate(plan_steps, 1))
             console.print(Panel.fit(plan, title="PatchCodeAgent plan", border_style="green"))
