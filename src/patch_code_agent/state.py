@@ -43,8 +43,9 @@ class RunState(TypedDict, total=False):
         model_requests: Durable count of model calls made so far; initialized before baseline.
         workspace_path: Absolute path to this Run's isolated mutable workspace.
         baseline_verification: Bounded serialized ``BaselineVerificationSummary``.
-        inspected_files: Stable, bounded Python path list discovered after a failing baseline.
-        plan: Ordered planning steps; absent on baseline terminal branches.
+        plan_artifact: Path and checksum of the immutable runtime-validated Plan.
+        tool_executions: Host-counted bounded inspection operations.
+        files_read: Stable paths successfully read through the bounded tool interface.
         attempt: Zero-based repair-attempt counter used by later workflow milestones.
         approved: Whether the current candidate patch has passed the Approval Gate.
         status: Current lifecycle phase or terminal outcome used for routing and CLI status.
@@ -77,8 +78,9 @@ class RunState(TypedDict, total=False):
     model_requests: int
     workspace_path: str
     baseline_verification: dict[str, object]
-    inspected_files: list[str]
-    plan: list[str]
+    plan_artifact: dict[str, object]
+    tool_executions: int
+    files_read: list[str]
     attempt: int
     approved: bool
     status: RunStatus
