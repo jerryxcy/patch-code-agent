@@ -23,6 +23,7 @@ from patch_code_agent.diagnosis import DiagnosisArtifactReference, Diagnostician
 from patch_code_agent.model_output import InvalidModelOutputError, ModelInvocationError
 from patch_code_agent.patching import PatchApplier
 from patch_code_agent.planning import PlanArtifactReference, Planner
+from patch_code_agent.reporting import RunAuditStore
 from patch_code_agent.state import RunState, RunStatus
 from patch_code_agent.verification import (
     BaselineVerificationOutcome,
@@ -93,6 +94,19 @@ def _measure_active_time(
         state.get("active_duration_seconds", 0.0) + elapsed
     )
     return _enforce_resource_budgets(state, update)
+
+
+def _audit_transition(
+    state: RunState,
+    action: Callable[[RunState], RunState],
+    audit_store: RunAuditStore,
+    transition: Callable[[RunState, RunState], str],
+) -> RunState:
+    """Append one deduplicated event after a graph action durably completes."""
+    update = action(state)
+    projected: RunState = {**state, **update}
+    audit_store.append_event(projected, transition(state, update))
+    return update
 
 
 def _invalid_model_output(state: RunState, error: InvalidModelOutputError) -> RunState:
@@ -199,8 +213,22 @@ def run_baseline_verification(state: RunState, verifier: BaselineVerifier) -> Ru
         )
     update: RunState = {
         "baseline_verification": summary.model_dump(mode="json"),
+        "verification_duration_max": summary.duration_seconds,
         "status": _BASELINE_STATUS[summary.outcome],
     }
+    if summary.outcome == "passed":
+        update["report"] = {
+            "success": False,
+            "phase": "issue_not_reproduced",
+            "note": "Baseline Verification passed; the Issue was not reproduced.",
+        }
+    elif summary.outcome == "error":
+        update["error_kind"] = summary.error_kind or "verification_error"
+        update["report"] = {
+            "success": False,
+            "phase": "error",
+            "note": "Baseline Verification ended with an infrastructure Error.",
+        }
     if summary.outcome == "timeout":
         update.update(
             {
@@ -455,6 +483,10 @@ def run_repair_verification(
     update: RunState = {
         "attempt": attempt,
         "verification": summary.model_dump(mode="json"),
+        "verification_duration_max": max(
+            state.get("verification_duration_max", 0.0),
+            summary.duration_seconds,
+        ),
     }
     if summary.outcome == "passed":
         try:
@@ -567,6 +599,12 @@ def route_after_diagnosis(state: RunState) -> str:
     return "candidate"
 
 
+def finalize_report(state: RunState, audit_store: RunAuditStore) -> RunState:
+    """Persist the immutable terminal Run Report and retain only its reference in state."""
+    reference = audit_store.finalize(state)
+    return {"report_artifact": reference.model_dump(mode="json")}
+
+
 def build_graph(
     *,
     baseline_verifier: BaselineVerifier,
@@ -575,6 +613,7 @@ def build_graph(
     diagnostician: Diagnostician,
     patch_applier: PatchApplier,
     repair_verifier: RepairVerifier,
+    audit_store: RunAuditStore,
     checkpointer: BaseCheckpointSaver | None = None,
     clock: Callable[[], float] = monotonic,
 ) -> CompiledStateGraph:
@@ -587,96 +626,117 @@ def build_graph(
     selected_checkpointer = checkpointer if checkpointer is not None else InMemorySaver()
     builder = StateGraph(RunState)
 
-    def measured(
+    def registered(
         action: Callable[[RunState], RunState],
         key: Callable[[RunState], str],
     ) -> Callable[[RunState], RunState]:
-        return lambda state: _measure_active_time(state, action, clock, key(state))
+        measured_action = lambda state: _measure_active_time(state, action, clock, key(state))
+        return lambda state: _audit_transition(
+            state,
+            measured_action,
+            audit_store,
+            lambda _state, _update: key(state),
+        )
 
     def fixed_key(name: str) -> Callable[[RunState], str]:
         return lambda _state: name
 
-    builder.add_node("validate_input", measured(validate_input, fixed_key("validate")))
+    builder.add_node("validate_input", registered(validate_input, fixed_key("validate")))
     builder.add_node(
         "baseline_verification",
-        measured(
+        registered(
             lambda state: run_baseline_verification(state, baseline_verifier),
             fixed_key("baseline"),
         ),
     )
     builder.add_node(
         "create_plan",
-        measured(lambda state: create_plan(state, planner), fixed_key("plan")),
+        registered(lambda state: create_plan(state, planner), fixed_key("plan")),
     )
     builder.add_node(
         "create_candidate",
-        measured(
+        registered(
             lambda state: create_candidate(state, candidate_builder),
             lambda state: f"candidate:{state.get('attempt', 0) + 1}",
         ),
     )
-    builder.add_node("approval_gate", await_approval)
+    builder.add_node(
+        "approval_gate",
+        lambda state: _audit_transition(
+            state,
+            await_approval,
+            audit_store,
+            lambda current, update: (
+                f"approval:{current.get('attempt', 0) + 1}:{update['approval_decision']}"
+            ),
+        ),
+    )
     builder.add_node(
         "reject_candidate",
-        measured(reject_candidate, fixed_key("reject")),
+        registered(reject_candidate, fixed_key("reject")),
     )
     builder.add_node(
         "apply_candidate",
-        measured(
+        registered(
             lambda state: apply_candidate(state, patch_applier),
             lambda state: f"apply:{state.get('attempt', 0) + 1}",
         ),
     )
     builder.add_node(
         "repair_verification",
-        measured(
+        registered(
             lambda state: run_repair_verification(state, repair_verifier, patch_applier),
             lambda state: f"verification:{state.get('attempt', 0) + 1}",
         ),
     )
     builder.add_node(
         "create_diagnosis",
-        measured(
+        registered(
             lambda state: create_diagnosis(state, diagnostician),
             lambda state: f"diagnosis:{state.get('attempt', 0)}",
         ),
+    )
+    builder.add_node(
+        "finalize_report",
+        lambda state: finalize_report(state, audit_store),
     )
     builder.add_edge(START, "validate_input")
     builder.add_edge("validate_input", "baseline_verification")
     builder.add_conditional_edges(
         "baseline_verification",
         route_after_baseline,
-        {"create_plan": "create_plan", "end": END},
+        {"create_plan": "create_plan", "end": "finalize_report"},
     )
     builder.add_conditional_edges(
         "create_plan",
         route_after_plan,
-        {"candidate": "create_candidate", "end": END},
+        {"candidate": "create_candidate", "end": "finalize_report"},
     )
     builder.add_conditional_edges(
         "create_candidate",
         route_after_candidate,
-        {"approval": "approval_gate", "end": END},
+        {"approval": "approval_gate", "end": "finalize_report"},
     )
     builder.add_conditional_edges(
         "approval_gate",
         route_after_approval,
         {"reject": "reject_candidate", "approve": "apply_candidate"},
     )
-    builder.add_edge("reject_candidate", END)
+    builder.add_edge("reject_candidate", "finalize_report")
     builder.add_conditional_edges(
         "apply_candidate",
         route_after_apply,
-        {"verify": "repair_verification", "end": END},
+        {"verify": "repair_verification", "end": "finalize_report"},
     )
     builder.add_conditional_edges(
         "repair_verification",
         route_after_repair_verification,
-        {"diagnose": "create_diagnosis", "end": END},
+        {"diagnose": "create_diagnosis", "end": "finalize_report"},
     )
     builder.add_conditional_edges(
         "create_diagnosis",
         route_after_diagnosis,
-        {"candidate": "create_candidate", "end": END},
+        {"candidate": "create_candidate", "end": "finalize_report"},
     )
+    builder.add_edge("finalize_report", END)
     return builder.compile(checkpointer=selected_checkpointer)

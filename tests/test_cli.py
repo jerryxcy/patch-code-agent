@@ -9,10 +9,12 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
+from patch_code_agent.application import PatchRunStatusReader
 from patch_code_agent.cli import create_cli
 from patch_code_agent.inspection import WorkspaceInspector
 from patch_code_agent.model import ScriptedInspectionCall, ScriptedModel
 from patch_code_agent.patching import PatchApplier
+from patch_code_agent.reporting import RunEvent, RunReport
 from patch_code_agent.verification import BaselineVerifier
 
 
@@ -297,6 +299,69 @@ def _run_identifier(output: str) -> str:
     return match.group(1)
 
 
+def _assert_terminal_report(
+    data_root: Path,
+    output: str,
+    expected_outcome: str,
+) -> RunReport:
+    run_identifier = _run_identifier(output)
+    run_root = data_root / run_identifier
+    report_path = run_root / "report.json"
+    report_bytes = report_path.read_bytes()
+    report = RunReport.model_validate_json(report_bytes)
+    events = tuple(
+        RunEvent.model_validate_json(line)
+        for line in (run_root / "events.jsonl").read_text().splitlines()
+    )
+    status = PatchRunStatusReader(data_root).get(run_identifier)
+
+    assert report.schema_version == "1"
+    assert report.outcome == expected_outcome
+    assert report.run_id == run_identifier
+    assert report.issue
+    assert report.terminal_reason
+    assert report.attempts == status.attempts
+    assert report.model_requests == status.model_requests
+    assert report.tool_executions == status.tool_executions
+    assert report.files_read == status.files_read
+    assert report.files_changed == status.files_changed
+    assert report.budgets == status.budgets
+    assert report.started_at <= report.finished_at
+    assert len({event.event_id for event in events}) == len(events)
+    assert all(event.run_id == run_identifier for event in events)
+    assert events[-1].transition == f"finalized:{expected_outcome}"
+    assert events[-1].status == report.outcome == status.phase
+    assert [event.attempt for event in events] == sorted(event.attempt for event in events)
+    assert [event.model_requests for event in events] == sorted(
+        event.model_requests for event in events
+    )
+    assert [event.tool_executions for event in events] == sorted(
+        event.tool_executions for event in events
+    )
+    assert status.report_artifact is not None
+    assert status.report_artifact.sha256 == hashlib.sha256(report_bytes).hexdigest()
+    assert "Run Report: report.json" in output
+    references = list(
+        (report.artifacts.events,)
+        + report.artifacts.diagnoses
+        + report.artifacts.candidates
+        + report.artifacts.diffs
+        + report.artifacts.logs
+    )
+    if report.artifacts.plan is not None:
+        references.append(report.artifacts.plan)
+    if report.artifacts.cumulative_diff is not None:
+        references.append(report.artifacts.cumulative_diff)
+    if report.verification.baseline is not None:
+        references.append(report.verification.baseline.summary)
+    references.extend(record.summary for record in report.verification.attempts)
+    for reference in references:
+        assert hashlib.sha256((run_root / reference.path).read_bytes()).hexdigest() == (
+            reference.sha256
+        )
+    return report
+
+
 def _invoke_cli_process(
     tmp_path: Path,
     *arguments: str,
@@ -506,7 +571,7 @@ def test_user_starts_registered_patch_run_in_isolated_workspace(tmp_path: Path) 
     assert "Model Requests: 2" in result.output
     assert model.plan_requests == 1
     assert model.candidate_requests == 1
-    assert model.model_id_accesses == 2
+    assert model.model_id_accesses == 3
     assert "Run Identifier:" in result.output
     assert "status: pending_approval" in result.output
     baseline = json.loads((data_root / run_identifier / "baseline" / "result.json").read_text())
@@ -646,6 +711,9 @@ def test_tool_execution_budget_exceeded_names_limit_and_usage(tmp_path: Path) ->
     run_root = data_root / _run_identifier(result.output)
     assert not (run_root / "plan.json").exists()
     assert not (run_root / "attempts").exists()
+    report = _assert_terminal_report(data_root, result.output, "budget_exceeded")
+    assert report.artifacts.plan is None
+    assert report.verification.baseline is not None
 
 
 def test_model_infrastructure_failure_is_not_a_failed_repair_attempt(tmp_path: Path) -> None:
@@ -663,6 +731,7 @@ def test_model_infrastructure_failure_is_not_a_failed_repair_attempt(tmp_path: P
     assert "Tool Executions: 1" in result.output
     assert "Repair Attempts: 0" in result.output
     assert "Attempts Exhausted" not in result.output
+    _assert_terminal_report(data_root, result.output, "error")
 
 
 def test_plan_storage_failure_is_a_stable_error(
@@ -982,6 +1051,9 @@ def test_user_rejects_a_pending_candidate_from_a_separate_cli_process(
     assert "Repair Attempts: 0" in status_result.output
     assert f"Candidate Checksum: {candidate_checksum}" in status_result.output
     assert (run_root / "attempts" / "1" / "candidate.json").read_bytes() == candidate_bytes
+    report = _assert_terminal_report(data_root, reject_result.output, "rejected")
+    assert len(report.artifacts.candidates) == 1
+    assert report.attempts == 0
 
 
 def test_run_reject_and_status_work_across_real_os_processes(tmp_path: Path) -> None:
@@ -1180,6 +1252,12 @@ def test_user_approves_and_verifies_a_candidate_from_a_separate_cli_process(
     assert "Cumulative Diff: cumulative.diff" in approve_result.output
     assert "subtotal = sum(prices)" in (run_root / "workspace" / "cart.py").read_text()
     assert (fixture_repository / "cart.py").read_bytes() == original_source
+    report = _assert_terminal_report(data_root, approve_result.output, "succeeded")
+    assert report.artifacts.plan is not None
+    assert len(report.artifacts.candidates) == 1
+    assert report.artifacts.cumulative_diff is not None
+    assert report.verification.baseline is not None
+    assert [record.outcome for record in report.verification.attempts] == ["passed"]
     verification = json.loads((run_root / "attempts" / "1" / "verification.json").read_text())
     assert verification["outcome"] == "passed"
     assert verification["exit_code"] == 0
@@ -1402,6 +1480,7 @@ def test_approve_reports_workspace_changed_without_running_verification(tmp_path
     assert "Error Kind: workspace_changed" in approve_result.output
     assert "Repair Attempts: 0" in approve_result.output
     assert not (run_root / "attempts" / "1" / "verification.json").exists()
+    _assert_terminal_report(data_root, approve_result.output, "workspace_changed")
 
 
 def test_apply_does_not_follow_a_parent_symlink_swapped_after_validation(
@@ -1650,6 +1729,14 @@ def test_three_failing_attempts_are_exhausted_without_a_fourth_candidate(
     assert (run_root / "attempts" / "1" / "diagnosis.json").is_file()
     assert (run_root / "attempts" / "2" / "diagnosis.json").is_file()
     assert (run_root / "attempts" / "3" / "diagnosis.json").is_file()
+    report = _assert_terminal_report(data_root, approvals[2].output, "attempts_exhausted")
+    assert len(report.artifacts.candidates) == 3
+    assert len(report.artifacts.diagnoses) == 3
+    assert [record.outcome for record in report.verification.attempts] == [
+        "failed",
+        "failed",
+        "failed",
+    ]
 
 
 def test_rejecting_a_follow_up_candidate_does_not_add_a_repair_attempt(
@@ -1891,6 +1978,7 @@ editable_paths = ["cart.py"]
     assert status.exit_code == 0, status.output
     assert "Phase: issue_not_reproduced" in status.output
     assert "Model Requests: 0" in status.output
+    _assert_terminal_report(data_root, result.output, "issue_not_reproduced")
 
 
 def test_baseline_exit_code_two_becomes_verification_error(tmp_path: Path) -> None:
@@ -1932,6 +2020,8 @@ editable_paths = ["cart.py"]
     status = CliRunner().invoke(status_cli, ["status", run_identifier])
     assert status.exit_code == 0, status.output
     assert "Phase: error" in status.output
+    report = _assert_terminal_report(data_root, result.output, "error")
+    assert report.error_kind == "verification_exit_code"
 
 
 def test_baseline_verification_infrastructure_failure_is_a_stable_error(

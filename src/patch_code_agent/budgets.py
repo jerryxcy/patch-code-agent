@@ -87,6 +87,7 @@ class ResourceBudgets(BaseModel):
         verification_used = max(
             _duration_seconds(baseline),
             _duration_seconds(repair),
+            float(state.get("verification_duration_max", 0.0)),
         )
         return cls(
             repair_attempts=CountBudget(limit=3, used=int(state.get("attempt", 0))),

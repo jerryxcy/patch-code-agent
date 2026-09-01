@@ -46,6 +46,7 @@ from patch_code_agent.planning import (
     Planner,
     load_plan_artifact,
 )
+from patch_code_agent.reporting import RunAuditStore, RunReportReference
 from patch_code_agent.sources import (
     RepositorySource,
     RepositorySourceKind,
@@ -89,6 +90,7 @@ class PatchRunStatus:
         budget_limit: Configured limit of the exceeded budget.
         budget_used: Observed usage at failure.
         budgets: Fixed limits and current durable usage for every Resource Budget.
+        report_artifact: Immutable terminal Run Report reference, when finalized.
 
     Example:
         >>> status = PatchRunStatus(
@@ -116,6 +118,7 @@ class PatchRunStatus:
         ...     budget_limit=None,
         ...     budget_used=None,
         ...     budgets=ResourceBudgets.from_state({}),
+        ...     report_artifact=None,
         ... )
         >>> status.phase
         'planned'
@@ -145,6 +148,7 @@ class PatchRunStatus:
     budget_limit: int | float | None
     budget_used: int | float | None
     budgets: ResourceBudgets
+    report_artifact: RunReportReference | None
 
 
 class PatchRunStatusReader:
@@ -251,6 +255,11 @@ class PatchRunStatusReader:
             budget_limit=state.get("budget_limit"),
             budget_used=state.get("budget_used"),
             budgets=ResourceBudgets.from_state(state),
+            report_artifact=(
+                RunReportReference.model_validate(state["report_artifact"])
+                if "report_artifact" in state
+                else None
+            ),
         )
 
 
@@ -273,6 +282,7 @@ class PatchCodeAgent:
     ) -> None:
         """Configure lazy application dependencies around one durable data root."""
         self._model_gateway = model_gateway
+        self._model_id = model_gateway.model_id
         self._clock = clock
         self._data_root = data_root.resolve()
         self._fixture_roots = (
@@ -292,6 +302,7 @@ class PatchCodeAgent:
             self._data_root,
             timeout_seconds=verification_timeout_seconds,
         )
+        self._audit_store = RunAuditStore(self._data_root)
         self._checkpoint_connection: sqlite3.Connection | None = None
         self._graph: CompiledStateGraph | None = None
 
@@ -370,6 +381,7 @@ class PatchCodeAgent:
                 "source_kind": source.kind,
                 "source_id": source.source_id,
                 "source_revision": workspace.source_revision,
+                "model_id": self._model_id,
                 "issue": source.contract.issue,
                 "verification_argv": list(source.contract.verification),
                 "editable_paths": list(source.contract.editable_paths),
@@ -426,6 +438,7 @@ class PatchCodeAgent:
                 diagnostician=self._diagnostician,
                 patch_applier=self._patch_applier,
                 repair_verifier=self._repair_verifier,
+                audit_store=self._audit_store,
                 checkpointer=checkpointer,
                 clock=self._clock,
             )

@@ -15,9 +15,9 @@ Approval Gate。另一個 CLI process 可在 per-run exclusive lock 下核准或
 post-apply Verification。通過時形成 durable Succeeded outcome 與 cumulative diff；拒絕時 workspace
 與 Repair Attempt 均不改變。Verification failure 會保存 typed Diagnosis，保留已核准修改並產生
 相對目前 workspace 的下一份 Candidate；第三次失敗形成 Attempts Exhausted。完整 Resource
-Budget enforcement、Run Events 與 terminal report 仍待實作。驗收進度以 GitHub Issue #2 為準。
-完整 Resource Budget enforcement、typed-output correction retry 與 provider retry 分別由後續
-MVP tickets 實作；本階段只保存 planning 已實際使用的 counters。
+Budget enforcement 會在 host 邊界停止額外工作；每個 transition 保存 replay-safe Run Event，
+所有 terminal outcomes 都形成 versioned Run Report。驗收進度以 GitHub Issue #2 為準。
+外部 provider adapter 與 transient retry 由後續 MVP ticket 實作。
 
 ---
 
