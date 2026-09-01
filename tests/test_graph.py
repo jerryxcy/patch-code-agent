@@ -4,11 +4,12 @@ from pathlib import Path
 import pytest
 from langgraph.types import Command
 
-from patch_code_agent.candidate import CandidatePatchBuilder
+from patch_code_agent.candidate import CandidatePatchBuilder, CandidatePatchReference
 from patch_code_agent.graph import build_graph
 from patch_code_agent.model import ScriptedModel
+from patch_code_agent.patching import PatchApplier
 from patch_code_agent.planning import Planner
-from patch_code_agent.verification import BaselineVerifier
+from patch_code_agent.verification import BaselineVerifier, RepairVerifier
 
 
 class CountingModel:
@@ -37,6 +38,8 @@ def test_graph_pauses_after_persisting_a_candidate_patch(tmp_path):
         baseline_verifier=BaselineVerifier(data_root),
         planner=Planner(data_root, ScriptedModel()),
         candidate_builder=CandidatePatchBuilder(data_root, ScriptedModel()),
+        patch_applier=PatchApplier(data_root),
+        repair_verifier=RepairVerifier(data_root),
     ).invoke(
         {
             "run_id": "test-run",
@@ -98,6 +101,8 @@ def test_graph_replay_does_not_create_a_second_plan(tmp_path: Path) -> None:
         baseline_verifier=BaselineVerifier(data_root),
         planner=Planner(data_root, model),
         candidate_builder=CandidatePatchBuilder(data_root, model),
+        patch_applier=PatchApplier(data_root),
+        repair_verifier=RepairVerifier(data_root),
     )
     initial_state = {
         "run_id": "test-run",
@@ -122,7 +127,7 @@ def test_graph_replay_does_not_create_a_second_plan(tmp_path: Path) -> None:
     assert first["model_requests"] == replayed["model_requests"] == 2
 
 
-def test_graph_fails_closed_for_approval_before_apply_is_implemented(tmp_path: Path) -> None:
+def test_graph_applies_and_verifies_an_approved_candidate_once(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     (workspace / "cart.py").write_text("discount = 0.1\n")
@@ -132,13 +137,25 @@ def test_graph_fails_closed_for_approval_before_apply_is_implemented(tmp_path: P
         baseline_verifier=BaselineVerifier(data_root),
         planner=Planner(data_root, ScriptedModel()),
         candidate_builder=CandidatePatchBuilder(data_root, ScriptedModel()),
+        patch_applier=PatchApplier(data_root),
+        repair_verifier=RepairVerifier(data_root),
     )
     config = {"configurable": {"thread_id": "test-run"}}
-    graph.invoke(
+    verification_program = """
+from pathlib import Path
+
+counter = Path("verification-count")
+count = int(counter.read_text()) + 1 if counter.exists() else 1
+counter.write_text(str(count))
+raise SystemExit(
+    0 if "# Scripted Candidate Patch" in Path("cart.py").read_text() else 1
+)
+"""
+    pending = graph.invoke(
         {
             "run_id": "test-run",
             "issue": "Fix the discount",
-            "verification_argv": [sys.executable, "-c", "raise SystemExit(1)"],
+            "verification_argv": [sys.executable, "-c", verification_program],
             "editable_paths": ["cart.py"],
             "model_requests": 0,
             "tool_executions": 0,
@@ -149,8 +166,73 @@ def test_graph_fails_closed_for_approval_before_apply_is_implemented(tmp_path: P
         config=config,
     )
 
-    with pytest.raises(ValueError, match="Approval is not implemented"):
-        graph.invoke(Command(resume="approve"), config=config)
+    approved = graph.invoke(Command(resume="approve"), config=config)
+    replayed = graph.invoke(Command(resume="approve"), config=config)
+
+    assert pending["status"] == "pending_approval"
+    assert approved["status"] == "succeeded"
+    assert approved["attempt"] == 1
+    assert replayed["status"] == "succeeded"
+    assert replayed["attempt"] == 1
+    assert (workspace / "cart.py").read_text().count("# Scripted Candidate Patch") == 1
+    assert (workspace / "verification-count").read_text() == "2"
+
+
+def test_graph_replay_revalidates_workspace_after_a_completed_apply_ledger(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    source = workspace / "cart.py"
+    source.write_text("discount = 0.1\n")
+    data_root = tmp_path / "runs"
+    (data_root / "test-run").mkdir(parents=True)
+    applier = PatchApplier(data_root)
+    verification_program = """
+from pathlib import Path
+
+counter = Path("verification-count")
+count = int(counter.read_text()) + 1 if counter.exists() else 1
+counter.write_text(str(count))
+raise SystemExit(1)
+"""
+    graph = build_graph(
+        baseline_verifier=BaselineVerifier(data_root),
+        planner=Planner(data_root, ScriptedModel()),
+        candidate_builder=CandidatePatchBuilder(data_root, ScriptedModel()),
+        patch_applier=applier,
+        repair_verifier=RepairVerifier(data_root),
+    )
+    config = {"configurable": {"thread_id": "test-run"}}
+    pending = graph.invoke(
+        {
+            "run_id": "test-run",
+            "issue": "Fix the discount",
+            "verification_argv": [sys.executable, "-c", verification_program],
+            "editable_paths": ["cart.py"],
+            "model_requests": 0,
+            "tool_executions": 0,
+            "files_read": [],
+            "workspace_path": str(workspace),
+            "status": "created",
+        },
+        config=config,
+    )
+    reference = CandidatePatchReference.model_validate(pending["candidate_artifact"])
+    applied = applier.apply_once(
+        run_id="test-run",
+        workspace=workspace,
+        reference=reference,
+    )
+    source.write_text(source.read_text() + "# external edit\n")
+
+    replayed = graph.invoke(Command(resume="approve"), config=config)
+
+    assert applied.outcome == "applied"
+    assert replayed["status"] == "workspace_changed"
+    assert replayed["attempt"] == 0
+    assert (workspace / "verification-count").read_text() == "1"
+    assert not (data_root / "test-run" / "attempts" / "1" / "verification.json").exists()
 
 
 def test_plan_replay_rejects_a_replaced_artifact(tmp_path: Path) -> None:

@@ -7,6 +7,7 @@ separate read-only path so a status command cannot accidentally advance the grap
 """
 
 import sqlite3
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -31,6 +32,7 @@ from patch_code_agent.fixtures import (
 from patch_code_agent.graph import build_graph
 from patch_code_agent.locking import RunMutationLock
 from patch_code_agent.model import ModelGateway, Plan
+from patch_code_agent.patching import CumulativeDiffReference, PatchApplier
 from patch_code_agent.planning import (
     PlanArtifactReference,
     Planner,
@@ -42,7 +44,11 @@ from patch_code_agent.sources import (
     load_trusted_repository,
 )
 from patch_code_agent.state import RunState
-from patch_code_agent.verification import BaselineVerifier
+from patch_code_agent.verification import (
+    BaselineVerifier,
+    RepairVerificationSummary,
+    RepairVerifier,
+)
 from patch_code_agent.workspace import RunWorkspaceStore
 
 
@@ -65,6 +71,10 @@ class PatchRunStatus:
         candidate_diff: Exact host-computed unified diff awaiting Approval.
         candidate_artifact: Durable paths/checksums for Candidate JSON and diff.
         attempts: Approved and verified Repair Attempts consumed so far.
+        files_changed: Stable paths changed by approved Candidate Patches.
+        verification: Latest post-apply Verification summary, when present.
+        cumulative_diff: Durable checksum reference for the aggregate repair.
+        error_kind: Stable terminal error category, when present.
 
     Example:
         >>> status = PatchRunStatus(
@@ -82,6 +92,10 @@ class PatchRunStatus:
         ...     candidate_diff=None,
         ...     candidate_artifact=None,
         ...     attempts=0,
+        ...     files_changed=(),
+        ...     verification=None,
+        ...     cumulative_diff=None,
+        ...     error_kind=None,
         ... )
         >>> status.phase
         'planned'
@@ -101,6 +115,10 @@ class PatchRunStatus:
     candidate_diff: str | None
     candidate_artifact: CandidatePatchReference | None
     attempts: int
+    files_changed: tuple[str, ...]
+    verification: RepairVerificationSummary | None
+    cumulative_diff: CumulativeDiffReference | None
+    error_kind: str | None
 
 
 class PatchRunStatusReader:
@@ -179,6 +197,18 @@ class PatchRunStatusReader:
             candidate_diff=(candidate_result.diff if candidate_result is not None else None),
             candidate_artifact=candidate_reference,
             attempts=state.get("attempt", 0),
+            files_changed=tuple(state.get("files_changed", [])),
+            verification=(
+                RepairVerificationSummary.model_validate(state["verification"])
+                if "verification" in state
+                else None
+            ),
+            cumulative_diff=(
+                CumulativeDiffReference.model_validate(state["cumulative_diff"])
+                if "cumulative_diff" in state
+                else None
+            ),
+            error_kind=state.get("error_kind"),
         )
 
 
@@ -201,7 +231,9 @@ class PatchCodeAgent:
         """Configure lazy application dependencies around one durable data root."""
         self._model_gateway = model_gateway
         self._data_root = data_root.resolve()
-        self._fixture_roots = fixture_roots if fixture_roots is not None else bundled_fixture_roots()
+        self._fixture_roots = (
+            fixture_roots if fixture_roots is not None else bundled_fixture_roots()
+        )
         self._fixtures: FixtureRegistry | None = None
         self._workspaces = RunWorkspaceStore(self._data_root)
         self._baseline_verifier = BaselineVerifier(
@@ -210,6 +242,11 @@ class PatchCodeAgent:
         )
         self._planner = Planner(self._data_root, model_gateway)
         self._candidate_builder = CandidatePatchBuilder(self._data_root, model_gateway)
+        self._patch_applier = PatchApplier(self._data_root)
+        self._repair_verifier = RepairVerifier(
+            self._data_root,
+            timeout_seconds=verification_timeout_seconds,
+        )
         self._checkpoint_connection: sqlite3.Connection | None = None
         self._graph: CompiledStateGraph | None = None
 
@@ -244,11 +281,31 @@ class PatchCodeAgent:
             status = PatchRunStatusReader(self._data_root).get(run_id)
             if status.phase != "pending_approval":
                 raise ValueError(
-                    "Patch Run is not awaiting Approval "
-                    f"(current phase: {status.phase})"
+                    f"Patch Run is not awaiting Approval (current phase: {status.phase})"
                 )
             result = self._run_graph().invoke(
                 Command(resume="reject"),
+                config={"configurable": {"thread_id": run_id}},
+            )
+            return cast(RunState, result)
+
+    def approve_patch_run(
+        self,
+        *,
+        run_id: str,
+        confirm: Callable[[PatchRunStatus], bool],
+    ) -> RunState | None:
+        """Display and confirm one exact Candidate while holding the per-run mutation lock."""
+        with RunMutationLock(self._data_root, run_id):
+            status = PatchRunStatusReader(self._data_root).get(run_id)
+            if status.phase != "pending_approval":
+                raise ValueError(
+                    f"Patch Run is not awaiting Approval (current phase: {status.phase})"
+                )
+            if not confirm(status):
+                return None
+            result = self._run_graph().invoke(
+                Command(resume="approve"),
                 config={"configurable": {"thread_id": run_id}},
             )
             return cast(RunState, result)
@@ -275,6 +332,7 @@ class PatchCodeAgent:
                 "model_requests": 0,
                 "tool_executions": 0,
                 "files_read": [],
+                "files_changed": [],
                 "workspace_path": str(workspace.path),
                 "status": "created",
             },
@@ -318,6 +376,8 @@ class PatchCodeAgent:
                 baseline_verifier=self._baseline_verifier,
                 planner=self._planner,
                 candidate_builder=self._candidate_builder,
+                patch_applier=self._patch_applier,
+                repair_verifier=self._repair_verifier,
                 checkpointer=checkpointer,
             )
         return self._graph

@@ -13,9 +13,10 @@ import typer
 from rich.console import Console
 from rich.panel import Panel
 
-from patch_code_agent.application import PatchCodeAgent, PatchRunStatusReader
+from patch_code_agent.application import PatchCodeAgent, PatchRunStatus, PatchRunStatusReader
 from patch_code_agent.candidate import CandidatePatchReference, load_candidate_patch
 from patch_code_agent.model import ModelGateway, Plan, ScriptedModel
+from patch_code_agent.patching import CumulativeDiffReference
 from patch_code_agent.planning import PlanArtifactReference, load_plan_artifact
 from patch_code_agent.sources import RepositorySourceKind
 from patch_code_agent.state import RunState
@@ -100,9 +101,31 @@ def create_cli(
             "budget_exceeded": "Budget Exceeded",
             "error": "Error",
             "rejected": "Rejected",
+            "workspace_changed": "Workspace Changed",
+            "succeeded": "Succeeded",
         }.get(status)
 
-    def print_run_result(result: RunState) -> None:
+    def print_repair_details(
+        *,
+        verification_outcome: object | None,
+        verification_artifact: object | None,
+        cumulative_diff: CumulativeDiffReference | None,
+        error_kind: object | None,
+    ) -> None:
+        """Render the shared post-Approval details for command results and durable status."""
+        if verification_outcome is not None and verification_artifact is not None:
+            console.print(f"[dim]Verification:[/] {verification_outcome}")
+            console.print(f"[dim]Verification Artifact:[/] {verification_artifact}")
+        if cumulative_diff is not None:
+            console.print(f"[dim]Cumulative Diff:[/] {cumulative_diff.path}")
+            console.print(
+                f"[dim]Cumulative Diff Checksum:[/] {cumulative_diff.sha256}",
+                soft_wrap=True,
+            )
+        if error_kind is not None:
+            console.print(f"[dim]Error Kind:[/] {error_kind}")
+
+    def print_run_result(result: RunState, *, display_candidate: bool = True) -> None:
         """Render fields that exist on either planning or terminal graph branches.
 
         A failing baseline has a Plan Artifact; terminal baseline outcomes do not. Optional lookups
@@ -112,11 +135,13 @@ def create_cli(
         if raw_reference := result.get("plan_artifact"):
             reference = PlanArtifactReference.model_validate(raw_reference)
             artifact = load_plan_artifact(selected_data_root, result["run_id"], reference)
-            plan_text = "\n".join(f"{label}: {value}" for label, value in _plan_lines(artifact.plan))
+            plan_text = "\n".join(
+                f"{label}: {value}" for label, value in _plan_lines(artifact.plan)
+            )
             console.print(Panel.fit(plan_text, title="PatchCodeAgent plan", border_style="green"))
             console.print(f"[dim]Plan Artifact:[/] {reference.path}")
             console.print(f"[dim]Plan Checksum:[/] {reference.sha256}", soft_wrap=True)
-        if raw_candidate_reference := result.get("candidate_artifact"):
+        if display_candidate and (raw_candidate_reference := result.get("candidate_artifact")):
             candidate_reference = CandidatePatchReference.model_validate(raw_candidate_reference)
             candidate = load_candidate_patch(
                 selected_data_root,
@@ -125,9 +150,7 @@ def create_cli(
             )
             print_candidate_patch(candidate_reference, candidate.diff)
         console.print(f"[dim]Run Identifier:[/] {result['run_id']}")
-        console.print(
-            f"[dim]{source_label(result['source_kind'])}:[/] {result['source_id']}"
-        )
+        console.print(f"[dim]{source_label(result['source_kind'])}:[/] {result['source_id']}")
         console.print(f"[dim]Source Revision:[/] {result['source_revision']}", soft_wrap=True)
         baseline = result["baseline_verification"]
         console.print(f"[dim]Baseline Verification:[/] {baseline['outcome']}")
@@ -137,12 +160,23 @@ def create_cli(
         console.print(f"[dim]Tool Executions:[/] {result.get('tool_executions', 0)}")
         console.print(f"[dim]Files Read:[/] {len(result.get('files_read', []))}")
         console.print(f"[dim]Repair Attempts:[/] {result.get('attempt', 0)}")
+        console.print(f"[dim]Files Changed:[/] {len(result.get('files_changed', []))}")
+        verification = result.get("verification")
+        print_repair_details(
+            verification_outcome=(verification.get("outcome") if verification else None),
+            verification_artifact=(verification.get("artifact_path") if verification else None),
+            cumulative_diff=(
+                CumulativeDiffReference.model_validate(raw_cumulative_diff)
+                if (raw_cumulative_diff := result.get("cumulative_diff"))
+                else None
+            ),
+            error_kind=result.get("error_kind"),
+        )
         console.print(f"[dim]status:[/] {result['status']}")
 
     @cli.callback()
     def main() -> None:
         """PatchCodeAgent command-line interface."""
-
 
     @cli.command()
     def fixtures() -> None:
@@ -157,7 +191,6 @@ def create_cli(
         for repository in repositories:
             console.print(f"[bold]{repository.manifest.fixture_id}[/]: {repository.issue_title}")
 
-
     @cli.command()
     def status(
         run_id: Annotated[str, typer.Argument(help="Run Identifier to inspect.")],
@@ -169,9 +202,7 @@ def create_cli(
             console.print(f"[red]{error}[/]")
             raise typer.Exit(code=2) from error
         console.print(f"[dim]Run Identifier:[/] {patch_run.run_id}")
-        console.print(
-            f"[dim]{source_label(patch_run.source_kind)}:[/] {patch_run.source_id}"
-        )
+        console.print(f"[dim]{source_label(patch_run.source_kind)}:[/] {patch_run.source_id}")
         console.print(
             f"[dim]Source Revision:[/] {patch_run.source_revision}",
             soft_wrap=True,
@@ -183,6 +214,17 @@ def create_cli(
         console.print(f"[dim]Tool Executions:[/] {patch_run.tool_executions}")
         console.print(f"[dim]Files Read:[/] {len(patch_run.files_read)}")
         console.print(f"[dim]Repair Attempts:[/] {patch_run.attempts}")
+        console.print(f"[dim]Files Changed:[/] {len(patch_run.files_changed)}")
+        print_repair_details(
+            verification_outcome=(
+                patch_run.verification.outcome if patch_run.verification is not None else None
+            ),
+            verification_artifact=(
+                patch_run.verification.artifact_path if patch_run.verification is not None else None
+            ),
+            cumulative_diff=patch_run.cumulative_diff,
+            error_kind=patch_run.error_kind,
+        )
         if patch_run.plan is not None and patch_run.plan_artifact is not None:
             console.print(f"[dim]Plan Artifact:[/] {patch_run.plan_artifact.path}")
             console.print(
@@ -197,7 +239,6 @@ def create_cli(
             and patch_run.candidate_artifact is not None
         ):
             print_candidate_patch(patch_run.candidate_artifact, patch_run.candidate_diff)
-
 
     @cli.command()
     def run(
@@ -218,7 +259,6 @@ def create_cli(
 
         print_run_result(result)
 
-
     @cli.command()
     def reject(
         run_id: Annotated[
@@ -236,6 +276,41 @@ def create_cli(
             close_application()
         print_run_result(result)
 
+    @cli.command()
+    def approve(
+        run_id: Annotated[
+            str,
+            typer.Argument(help="Run Identifier whose pending Candidate Patch should be approved."),
+        ],
+        yes: Annotated[
+            bool,
+            typer.Option("--yes", help="Approve without the interactive confirmation prompt."),
+        ] = False,
+    ) -> None:
+        """Approve one exact Candidate Patch, apply it, and execute Verification."""
+
+        def confirm_candidate(patch_run: PatchRunStatus) -> bool:
+            if patch_run.candidate_artifact is None or patch_run.candidate_diff is None:
+                raise ValueError("Pending Patch Run has no Candidate Patch Artifact")
+            print_candidate_patch(patch_run.candidate_artifact, patch_run.candidate_diff)
+            if yes:
+                return True
+            return typer.confirm("Approve this exact Candidate Patch?", default=False)
+
+        try:
+            result = get_application().approve_patch_run(
+                run_id=run_id,
+                confirm=confirm_candidate,
+            )
+        except (ValueError, RuntimeError) as error:
+            console.print(f"[red]{error}[/]")
+            raise typer.Exit(code=2) from error
+        finally:
+            close_application()
+        if result is None:
+            console.print("[yellow]Approval cancelled; Patch Run remains pending.[/]")
+            return
+        print_run_result(result, display_candidate=False)
 
     @cli.command(name="run-local")
     def run_local(

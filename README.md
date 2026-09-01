@@ -14,8 +14,10 @@ Candidate Patch 與 Diagnosis。
 > checksummed Plan Artifact 與 bounded structured replacements。Host 會驗證 replacement 的
 > editable path、read hash 與大小，自行產生 exact diff 和 checksummed Candidate Patch Artifact，
 > 再跨程序停在 Approval Gate；此時 workspace 尚未修改。另一個 CLI process 可以取得 per-run
-> exclusive lock 後拒絕 Candidate，交付 durable Rejected outcome 且不消耗 Repair Attempt。
-> 核准、修補後 Verification 與 Run Report 仍是尚待完成的 MVP 功能。
+> exclusive lock 後核准或拒絕 Candidate。核准時會再次顯示 exact diff 與 checksum，以 replay-safe
+> before/after hash 規則套用修改，執行 post-apply Verification，並在成功時保存 cumulative diff；
+> 拒絕則不修改 workspace、也不消耗 Repair Attempt。Diagnosis、多次 Repair Attempts 與完整
+> Run Report 仍是後續 MVP 功能。
 
 完整的 MVP implementation 與 acceptance spec 見
 [GitHub Issue #2](https://github.com/jerryxcy/patch-code-agent/issues/2)。
@@ -76,7 +78,10 @@ uv run patch-code-agent status <run-id>
 `~/.patch-code-agent/runs/<run-id>/workspace/`。系統會先以 Patch Run Contract 的 argv 執行
 Baseline Verification；`cart-discount` 的預期失敗會進入 `pending_approval`，並輸出 typed Plan、
 exact Candidate Patch diff、Run Identifier、artifact checksums 與目前 counters。Candidate 只會保存為
-Run Artifact，尚未套用到 workspace。Baseline 通過時結果為 `Issue Not Reproduced`，非測試失敗的
+Run Artifact，尚未套用到 workspace。使用 `approve` 可再次檢視並核准該 Candidate；互動提示預設
+為 No，自動化必須明確加上 `--yes`。套用前仍會驗證 artifact checksum、workspace preimage 與
+per-run lock，成功通過 Verification 後 outcome 為 `Succeeded`。Baseline 通過時結果為
+`Issue Not Reproduced`，非測試失敗的
 exit code 為 `Error`，60 秒逾時則為 `Budget Exceeded`。來源 fixture 永遠不會被修改。
 
 指定本機 Trusted Repository 時，Patch Run Contract 必須放在 repository 外面：
@@ -105,14 +110,9 @@ patch-code-agent fixtures
 patch-code-agent run cart-discount
 patch-code-agent run-local <repository> --contract <contract.toml> --trust-repository
 patch-code-agent status <run-id>
-patch-code-agent reject <run-id>
-```
-
-目標 MVP 還會加入：
-
-```text
 patch-code-agent approve <run-id>
 patch-code-agent approve <run-id> --yes
+patch-code-agent reject <run-id>
 ```
 
 ---
@@ -141,10 +141,11 @@ src/patch_code_agent/
   graph.py             LangGraph nodes、edges 與 checkpoint 組裝
   inspection.py        bounded list、read、search 與 workspace 安全規則
   locking.py           mutating CLI commands 的 per-run exclusive lock
+  patching.py          replay-safe replacement apply、preimage 分類與 cumulative diff
   planning.py          typed Plan validation、artifact checksum 與 replay ledger
   sources.py           Repository Source、Patch Run Contract 與 trusted-local validation
   state.py             Patch Run graph state
-  verification.py      Baseline subprocess、結果分類與完整輸出 artifact
+  verification.py      Baseline／Repair Verification、結果分類與 replay-safe logs
   workspace.py         隔離 Run Workspace 的建立規則
 
 tests/
