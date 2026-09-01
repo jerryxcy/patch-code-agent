@@ -20,6 +20,7 @@ RunStatus = Literal[
     "inspected",
     "planned",
     "pending_approval",
+    "rejected",
     "editing",
     "testing",
     "passed",
@@ -52,6 +53,7 @@ class RunState(TypedDict, total=False):
         files_read: Stable paths successfully read through the bounded tool interface.
         attempt: Zero-based repair-attempt counter used by later workflow milestones.
         approved: Whether the current candidate patch has passed the Approval Gate.
+        approval_decision: Durable decision returned when the Approval Gate resumes.
         status: Current lifecycle phase or terminal outcome used for routing and CLI status.
         report: Bounded structured progress/report data; complete evidence remains in artifacts.
 
@@ -89,5 +91,6 @@ class RunState(TypedDict, total=False):
     files_read: list[str]
     attempt: int
     approved: bool
+    approval_decision: Literal["approve", "reject"]
     status: RunStatus
     report: dict[str, object]

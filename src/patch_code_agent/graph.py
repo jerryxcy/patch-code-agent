@@ -3,7 +3,8 @@
 Nodes return bounded state updates and LangGraph persists those updates through the supplied
 checkpointer. Repository execution remains behind ``BaselineVerifier`` rather than being exposed
 to the model. Candidate Patch persistence completes before ``interrupt`` pauses at the Approval
-Gate, so a later process can inspect the exact immutable proposal without changing the workspace.
+Gate, so a later process can inspect or reject the exact immutable proposal without changing the
+workspace.
 """
 
 from pathlib import Path
@@ -142,7 +143,22 @@ def await_approval(state: RunState) -> RunState:
             "candidate_artifact": state["candidate_artifact"],
         }
     )
-    return {"approved": decision == "approve"}
+    if decision != "reject":
+        raise ValueError("Approval is not implemented; refusing to advance the Patch Run")
+    return {"approval_decision": "reject"}
+
+
+def reject_candidate(state: RunState) -> RunState:
+    """Finish a rejected Patch Run without applying or consuming a Repair Attempt."""
+    return {
+        "approved": False,
+        "status": "rejected",
+        "report": {
+            "success": False,
+            "phase": "rejected",
+            "note": "The immutable Candidate Patch was rejected without modifying the workspace.",
+        },
+    }
 
 
 def build_graph(
@@ -171,6 +187,7 @@ def build_graph(
         lambda state: create_candidate(state, candidate_builder),
     )
     builder.add_node("approval_gate", await_approval)
+    builder.add_node("reject_candidate", reject_candidate)
     builder.add_edge(START, "validate_input")
     builder.add_edge("validate_input", "baseline_verification")
     builder.add_conditional_edges(
@@ -180,5 +197,6 @@ def build_graph(
     )
     builder.add_edge("create_plan", "create_candidate")
     builder.add_edge("create_candidate", "approval_gate")
-    builder.add_edge("approval_gate", END)
+    builder.add_edge("approval_gate", "reject_candidate")
+    builder.add_edge("reject_candidate", END)
     return builder.compile(checkpointer=selected_checkpointer)

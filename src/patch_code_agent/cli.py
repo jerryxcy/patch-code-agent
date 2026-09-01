@@ -99,6 +99,7 @@ def create_cli(
             "issue_not_reproduced": "Issue Not Reproduced",
             "budget_exceeded": "Budget Exceeded",
             "error": "Error",
+            "rejected": "Rejected",
         }.get(status)
 
     def print_run_result(result: RunState) -> None:
@@ -176,6 +177,8 @@ def create_cli(
             soft_wrap=True,
         )
         console.print(f"[dim]Phase:[/] {patch_run.phase}")
+        if outcome := outcome_label(patch_run.phase):
+            console.print(f"[dim]Outcome:[/] {outcome}")
         console.print(f"[dim]Model Requests:[/] {patch_run.model_requests}")
         console.print(f"[dim]Tool Executions:[/] {patch_run.tool_executions}")
         console.print(f"[dim]Files Read:[/] {len(patch_run.files_read)}")
@@ -213,6 +216,24 @@ def create_cli(
         finally:
             close_application()
 
+        print_run_result(result)
+
+
+    @cli.command()
+    def reject(
+        run_id: Annotated[
+            str,
+            typer.Argument(help="Run Identifier whose pending Candidate Patch should be rejected."),
+        ],
+    ) -> None:
+        """Reject a pending Candidate Patch without modifying its Run Workspace."""
+        try:
+            result = get_application().reject_patch_run(run_id=run_id)
+        except ValueError as error:
+            console.print(f"[red]{error}[/]")
+            raise typer.Exit(code=2) from error
+        finally:
+            close_application()
         print_run_result(result)
 
 

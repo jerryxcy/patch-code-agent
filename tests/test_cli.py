@@ -1,6 +1,8 @@
 import hashlib
 import json
+import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -101,6 +103,20 @@ def _run_identifier(output: str) -> str:
     match = re.search(r"Run Identifier: ([0-9a-f-]{36})", output)
     assert match is not None
     return match.group(1)
+
+
+def _invoke_cli_process(tmp_path: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+    environment = os.environ.copy()
+    environment["HOME"] = str(tmp_path / "process-home")
+    return subprocess.run(
+        [sys.executable, "-m", "patch_code_agent", *arguments],
+        cwd=Path(__file__).parents[1],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
 
 
 def _run_trusted_inspection(
@@ -495,6 +511,212 @@ def test_candidate_diff_marks_a_missing_trailing_newline_exactly(tmp_path: Path)
     assert result.exit_code == 0, result.output
     assert "-VALUE = 1\n\\ No newline at end of file\n" in diff
     assert "+VALUE = 1# proposed change\n" in diff
+
+
+def test_user_rejects_a_pending_candidate_from_a_separate_cli_process(
+    tmp_path: Path,
+) -> None:
+    fixture_repository = Path(__file__).parents[1] / "examples" / "tiny_repo"
+    original_source = (fixture_repository / "cart.py").read_bytes()
+    data_root = tmp_path / "runs"
+    run_result = CliRunner().invoke(
+        create_cli(model_gateway=ScriptedModel(), data_root=data_root),
+        ["run", "cart-discount"],
+    )
+    run_identifier = _run_identifier(run_result.output)
+    run_root = data_root / run_identifier
+    workspace_source = run_root / "workspace" / "cart.py"
+    candidate_bytes = (run_root / "attempts" / "1" / "candidate.json").read_bytes()
+    candidate_checksum = hashlib.sha256(candidate_bytes).hexdigest()
+
+    reject_result = CliRunner().invoke(
+        create_cli(model_gateway=ScriptedModel(), data_root=data_root),
+        ["reject", run_identifier],
+    )
+
+    assert reject_result.exit_code == 0, reject_result.output
+    assert "Outcome: Rejected" in reject_result.output
+    assert "Repair Attempts: 0" in reject_result.output
+    assert f"Candidate Checksum: {candidate_checksum}" in reject_result.output
+    assert workspace_source.read_bytes() == original_source
+    assert (fixture_repository / "cart.py").read_bytes() == original_source
+
+    status_result = CliRunner().invoke(
+        create_cli(model_gateway=ScriptedModel(), data_root=data_root),
+        ["status", run_identifier],
+    )
+
+    assert status_result.exit_code == 0, status_result.output
+    assert "Phase: rejected" in status_result.output
+    assert "Outcome: Rejected" in status_result.output
+    assert "Repair Attempts: 0" in status_result.output
+    assert f"Candidate Checksum: {candidate_checksum}" in status_result.output
+    assert (run_root / "attempts" / "1" / "candidate.json").read_bytes() == candidate_bytes
+
+
+def test_run_reject_and_status_work_across_real_os_processes(tmp_path: Path) -> None:
+    run_result = _invoke_cli_process(tmp_path, "run", "cart-discount")
+    run_identifier = _run_identifier(run_result.stdout)
+
+    reject_result = _invoke_cli_process(tmp_path, "reject", run_identifier)
+    status_result = _invoke_cli_process(tmp_path, "status", run_identifier)
+
+    assert run_result.returncode == 0, run_result.stderr
+    assert "status: pending_approval" in run_result.stdout
+    assert reject_result.returncode == 0, reject_result.stderr
+    assert "Outcome: Rejected" in reject_result.stdout
+    assert status_result.returncode == 0, status_result.stderr
+    assert "Phase: rejected" in status_result.stdout
+    assert "Outcome: Rejected" in status_result.stdout
+
+
+def test_repeated_reject_does_not_advance_the_graph_again(tmp_path: Path) -> None:
+    data_root = tmp_path / "runs"
+    run_result = CliRunner().invoke(
+        create_cli(model_gateway=ScriptedModel(), data_root=data_root),
+        ["run", "cart-discount"],
+    )
+    run_identifier = _run_identifier(run_result.output)
+    first_reject = CliRunner().invoke(
+        create_cli(model_gateway=ScriptedModel(), data_root=data_root),
+        ["reject", run_identifier],
+    )
+    database_before = (data_root / "checkpoints.sqlite").read_bytes()
+
+    repeated_reject = CliRunner().invoke(
+        create_cli(model_gateway=ScriptedModel(), data_root=data_root),
+        ["reject", run_identifier],
+    )
+
+    assert first_reject.exit_code == 0, first_reject.output
+    assert repeated_reject.exit_code == 2
+    assert "not awaiting Approval (current phase: rejected)" in repeated_reject.output
+    assert (data_root / "checkpoints.sqlite").read_bytes() == database_before
+
+
+def test_reject_refuses_a_non_pending_patch_run(tmp_path: Path) -> None:
+    repository = tmp_path / "passing-repository"
+    repository.mkdir()
+    (repository / "cart.py").write_text("VALUE = 1\n", encoding="utf-8")
+    contract = tmp_path / "passing-contract.toml"
+    contract.write_text(
+        f'''source_id = "passing-repository"
+issue = "No reproducible failure"
+verification = {json.dumps([sys.executable, "-c", "raise SystemExit(0)"])}
+editable_paths = ["cart.py"]
+''',
+        encoding="utf-8",
+    )
+    data_root = tmp_path / "runs"
+    run_result = CliRunner().invoke(
+        create_cli(model_gateway=ScriptedModel(), data_root=data_root),
+        [
+            "run-local",
+            str(repository),
+            "--contract",
+            str(contract),
+            "--trust-repository",
+        ],
+    )
+    run_identifier = _run_identifier(run_result.output)
+
+    reject_result = CliRunner().invoke(
+        create_cli(model_gateway=ScriptedModel(), data_root=data_root),
+        ["reject", run_identifier],
+    )
+
+    assert reject_result.exit_code == 2
+    assert "not awaiting Approval (current phase: issue_not_reproduced)" in reject_result.output
+
+
+def test_reject_reports_busy_without_advancing_the_pending_run(tmp_path: Path) -> None:
+    data_root = tmp_path / "runs"
+    run_result = CliRunner().invoke(
+        create_cli(model_gateway=ScriptedModel(), data_root=data_root),
+        ["run", "cart-discount"],
+    )
+    run_identifier = _run_identifier(run_result.output)
+    candidate_path = data_root / run_identifier / "attempts" / "1" / "candidate.json"
+    candidate_before = candidate_path.read_bytes()
+
+    lock_holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; from pathlib import Path; "
+                "from patch_code_agent.locking import RunMutationLock; "
+                "lock = RunMutationLock(Path(sys.argv[1]), sys.argv[2]); "
+                "lock.__enter__(); print('locked', flush=True); "
+                "sys.stdin.readline(); lock.__exit__(None, None, None)"
+            ),
+            str(data_root),
+            run_identifier,
+        ],
+        cwd=Path(__file__).parents[1],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert lock_holder.stdout is not None
+        assert lock_holder.stdout.readline().strip() == "locked"
+        reject_result = CliRunner().invoke(
+            create_cli(model_gateway=ScriptedModel(), data_root=data_root),
+            ["reject", run_identifier],
+        )
+    finally:
+        if lock_holder.stdin is not None:
+            lock_holder.stdin.write("release\n")
+            lock_holder.stdin.flush()
+        lock_holder.wait(timeout=10)
+
+    assert reject_result.exit_code == 2
+    assert f"Patch Run is busy: {run_identifier}" in reject_result.output
+    assert candidate_path.read_bytes() == candidate_before
+    status_result = CliRunner().invoke(
+        create_cli(model_gateway=ScriptedModel(), data_root=data_root),
+        ["status", run_identifier],
+    )
+    assert status_result.exit_code == 0, status_result.output
+    assert "Phase: pending_approval" in status_result.output
+
+
+def test_reject_never_creates_a_lock_outside_the_data_root(tmp_path: Path) -> None:
+    outside_directory = tmp_path / "outside"
+    outside_directory.mkdir()
+    data_root = tmp_path / "runs"
+    data_root.mkdir()
+
+    result = CliRunner().invoke(
+        create_cli(model_gateway=ScriptedModel(), data_root=data_root),
+        ["reject", str(outside_directory)],
+    )
+
+    assert result.exit_code == 2
+    assert "Invalid Run Identifier" in result.output
+    assert not (outside_directory / ".mutation.lock").exists()
+
+
+def test_reject_never_follows_a_symlinked_lock_file(tmp_path: Path) -> None:
+    data_root = tmp_path / "runs"
+    run_result = CliRunner().invoke(
+        create_cli(model_gateway=ScriptedModel(), data_root=data_root),
+        ["run", "cart-discount"],
+    )
+    run_identifier = _run_identifier(run_result.output)
+    outside_lock = tmp_path / "outside-lock"
+    outside_lock.write_text("unchanged\n", encoding="utf-8")
+    (data_root / run_identifier / ".mutation.lock").symlink_to(outside_lock)
+
+    reject_result = CliRunner().invoke(
+        create_cli(model_gateway=ScriptedModel(), data_root=data_root),
+        ["reject", run_identifier],
+    )
+
+    assert reject_result.exit_code == 2
+    assert f"Unsafe Patch Run lock file: {run_identifier}" in reject_result.output
+    assert outside_lock.read_text(encoding="utf-8") == "unchanged\n"
 
 
 def test_model_cannot_read_an_absolute_workspace_path(tmp_path: Path) -> None:
