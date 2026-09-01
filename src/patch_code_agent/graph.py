@@ -143,16 +143,9 @@ def await_approval(state: RunState) -> RunState:
             "candidate_artifact": state["candidate_artifact"],
         }
     )
-    if decision not in {"approve", "reject"}:
-        raise ValueError(f"Unknown Approval decision: {decision}")
-    return {"approval_decision": decision}
-
-
-def route_after_approval(state: RunState) -> str:
-    """Route the host-supplied decision without letting the model control phases."""
-    if state["approval_decision"] == "reject":
-        return "reject"
-    return "approve"
+    if decision != "reject":
+        raise ValueError("Approval is not implemented; refusing to advance the Patch Run")
+    return {"approval_decision": "reject"}
 
 
 def reject_candidate(state: RunState) -> RunState:
@@ -204,10 +197,6 @@ def build_graph(
     )
     builder.add_edge("create_plan", "create_candidate")
     builder.add_edge("create_candidate", "approval_gate")
-    builder.add_conditional_edges(
-        "approval_gate",
-        route_after_approval,
-        {"reject": "reject_candidate", "approve": END},
-    )
+    builder.add_edge("approval_gate", "reject_candidate")
     builder.add_edge("reject_candidate", END)
     return builder.compile(checkpointer=selected_checkpointer)

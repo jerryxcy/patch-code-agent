@@ -1,6 +1,8 @@
 import hashlib
 import json
+import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -8,7 +10,6 @@ import pytest
 from typer.testing import CliRunner
 
 from patch_code_agent.cli import create_cli
-from patch_code_agent.locking import RunMutationLock
 from patch_code_agent.model import ScriptedInspectionCall, ScriptedModel
 
 
@@ -102,6 +103,20 @@ def _run_identifier(output: str) -> str:
     match = re.search(r"Run Identifier: ([0-9a-f-]{36})", output)
     assert match is not None
     return match.group(1)
+
+
+def _invoke_cli_process(tmp_path: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+    environment = os.environ.copy()
+    environment["HOME"] = str(tmp_path / "process-home")
+    return subprocess.run(
+        [sys.executable, "-m", "patch_code_agent", *arguments],
+        cwd=Path(__file__).parents[1],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
 
 
 def _run_trusted_inspection(
@@ -539,6 +554,22 @@ def test_user_rejects_a_pending_candidate_from_a_separate_cli_process(
     assert (run_root / "attempts" / "1" / "candidate.json").read_bytes() == candidate_bytes
 
 
+def test_run_reject_and_status_work_across_real_os_processes(tmp_path: Path) -> None:
+    run_result = _invoke_cli_process(tmp_path, "run", "cart-discount")
+    run_identifier = _run_identifier(run_result.stdout)
+
+    reject_result = _invoke_cli_process(tmp_path, "reject", run_identifier)
+    status_result = _invoke_cli_process(tmp_path, "status", run_identifier)
+
+    assert run_result.returncode == 0, run_result.stderr
+    assert "status: pending_approval" in run_result.stdout
+    assert reject_result.returncode == 0, reject_result.stderr
+    assert "Outcome: Rejected" in reject_result.stdout
+    assert status_result.returncode == 0, status_result.stderr
+    assert "Phase: rejected" in status_result.stdout
+    assert "Outcome: Rejected" in status_result.stdout
+
+
 def test_repeated_reject_does_not_advance_the_graph_again(tmp_path: Path) -> None:
     data_root = tmp_path / "runs"
     run_result = CliRunner().invoke(
@@ -608,11 +639,37 @@ def test_reject_reports_busy_without_advancing_the_pending_run(tmp_path: Path) -
     candidate_path = data_root / run_identifier / "attempts" / "1" / "candidate.json"
     candidate_before = candidate_path.read_bytes()
 
-    with RunMutationLock(data_root, run_identifier):
+    lock_holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; from pathlib import Path; "
+                "from patch_code_agent.locking import RunMutationLock; "
+                "lock = RunMutationLock(Path(sys.argv[1]), sys.argv[2]); "
+                "lock.__enter__(); print('locked', flush=True); "
+                "sys.stdin.readline(); lock.__exit__(None, None, None)"
+            ),
+            str(data_root),
+            run_identifier,
+        ],
+        cwd=Path(__file__).parents[1],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert lock_holder.stdout is not None
+        assert lock_holder.stdout.readline().strip() == "locked"
         reject_result = CliRunner().invoke(
             create_cli(model_gateway=ScriptedModel(), data_root=data_root),
             ["reject", run_identifier],
         )
+    finally:
+        if lock_holder.stdin is not None:
+            lock_holder.stdin.write("release\n")
+            lock_holder.stdin.flush()
+        lock_holder.wait(timeout=10)
 
     assert reject_result.exit_code == 2
     assert f"Patch Run is busy: {run_identifier}" in reject_result.output
@@ -623,6 +680,43 @@ def test_reject_reports_busy_without_advancing_the_pending_run(tmp_path: Path) -
     )
     assert status_result.exit_code == 0, status_result.output
     assert "Phase: pending_approval" in status_result.output
+
+
+def test_reject_never_creates_a_lock_outside_the_data_root(tmp_path: Path) -> None:
+    outside_directory = tmp_path / "outside"
+    outside_directory.mkdir()
+    data_root = tmp_path / "runs"
+    data_root.mkdir()
+
+    result = CliRunner().invoke(
+        create_cli(model_gateway=ScriptedModel(), data_root=data_root),
+        ["reject", str(outside_directory)],
+    )
+
+    assert result.exit_code == 2
+    assert "Invalid Run Identifier" in result.output
+    assert not (outside_directory / ".mutation.lock").exists()
+
+
+def test_reject_never_follows_a_symlinked_lock_file(tmp_path: Path) -> None:
+    data_root = tmp_path / "runs"
+    run_result = CliRunner().invoke(
+        create_cli(model_gateway=ScriptedModel(), data_root=data_root),
+        ["run", "cart-discount"],
+    )
+    run_identifier = _run_identifier(run_result.output)
+    outside_lock = tmp_path / "outside-lock"
+    outside_lock.write_text("unchanged\n", encoding="utf-8")
+    (data_root / run_identifier / ".mutation.lock").symlink_to(outside_lock)
+
+    reject_result = CliRunner().invoke(
+        create_cli(model_gateway=ScriptedModel(), data_root=data_root),
+        ["reject", run_identifier],
+    )
+
+    assert reject_result.exit_code == 2
+    assert f"Unsafe Patch Run lock file: {run_identifier}" in reject_result.output
+    assert outside_lock.read_text(encoding="utf-8") == "unchanged\n"
 
 
 def test_model_cannot_read_an_absolute_workspace_path(tmp_path: Path) -> None:

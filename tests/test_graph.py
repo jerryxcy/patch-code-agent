@@ -2,6 +2,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from langgraph.types import Command
 
 from patch_code_agent.candidate import CandidatePatchBuilder
 from patch_code_agent.graph import build_graph
@@ -119,6 +120,37 @@ def test_graph_replay_does_not_create_a_second_plan(tmp_path: Path) -> None:
     assert first["plan_artifact"] == replayed["plan_artifact"]
     assert first["candidate_artifact"] == replayed["candidate_artifact"]
     assert first["model_requests"] == replayed["model_requests"] == 2
+
+
+def test_graph_fails_closed_for_approval_before_apply_is_implemented(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "cart.py").write_text("discount = 0.1\n")
+    data_root = tmp_path / "runs"
+    (data_root / "test-run").mkdir(parents=True)
+    graph = build_graph(
+        baseline_verifier=BaselineVerifier(data_root),
+        planner=Planner(data_root, ScriptedModel()),
+        candidate_builder=CandidatePatchBuilder(data_root, ScriptedModel()),
+    )
+    config = {"configurable": {"thread_id": "test-run"}}
+    graph.invoke(
+        {
+            "run_id": "test-run",
+            "issue": "Fix the discount",
+            "verification_argv": [sys.executable, "-c", "raise SystemExit(1)"],
+            "editable_paths": ["cart.py"],
+            "model_requests": 0,
+            "tool_executions": 0,
+            "files_read": [],
+            "workspace_path": str(workspace),
+            "status": "created",
+        },
+        config=config,
+    )
+
+    with pytest.raises(ValueError, match="Approval is not implemented"):
+        graph.invoke(Command(resume="approve"), config=config)
 
 
 def test_plan_replay_rejects_a_replaced_artifact(tmp_path: Path) -> None:
