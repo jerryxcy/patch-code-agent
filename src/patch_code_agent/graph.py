@@ -128,7 +128,7 @@ def _invalid_model_output(state: RunState, error: InvalidModelOutputError) -> Ru
 def _model_failure(state: RunState, error: ModelInvocationError) -> RunState:
     """Classify provider/transport failure separately from failed repair Verification."""
     inconclusive = bool(getattr(error.cause, "inconclusive", False))
-    return {
+    update: RunState = {
         "model_requests": state.get("model_requests", 0) + error.model_requests,
         "tool_executions": state.get("tool_executions", 0) + error.tool_executions,
         "files_read": sorted(set(state.get("files_read", [])) | set(error.files_read)),
@@ -144,6 +144,10 @@ def _model_failure(state: RunState, error: ModelInvocationError) -> RunState:
             ),
         },
     }
+    status_code = getattr(error.cause, "status_code", None)
+    if inconclusive and isinstance(status_code, int):
+        update["provider_status_code"] = status_code
+    return update
 
 
 def _resource_budget_exceeded(

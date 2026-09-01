@@ -121,6 +121,10 @@ Run Report 或 Verification environment。未設定 key，或遇到 quota、429�
 `Live Smoke Inconclusive`，不會讓 required test suite 失敗。Live Smoke 仍會顯示 exact Candidate；
 省略 `--yes` 時必須由使用者互動核准。每個實際 provider request（包含 retry）的 credential-free
 transcript 會保存在該 run 的 `model-transcripts/*.jsonl`，方便檢查 tool calls 與 typed output。
+預設模型是 issue 指定的 `gemini-3.7-flash`；若該模型回報 high demand，可用
+`--model gemini-3.6-flash` 診斷完整整合流程。替代模型不會改變 synthetic-only policy，且 Run
+Report 會記錄實際 model ID。CLI 只顯示 credential-free HTTP classification，不輸出 provider
+原始錯誤訊息。
 
 目前可用的 CLI：
 
@@ -128,7 +132,7 @@ transcript 會保存在該 run 的 `model-transcripts/*.jsonl`，方便檢查 to
 patch-code-agent fixtures
 patch-code-agent run cart-discount
 patch-code-agent run-local <repository> --contract <contract.toml> --trust-repository
-patch-code-agent live-smoke cart-discount [--yes]
+patch-code-agent live-smoke cart-discount [--yes] [--model gemini-3.7-flash]
 patch-code-agent status <run-id>
 patch-code-agent approve <run-id>
 patch-code-agent approve <run-id> --yes

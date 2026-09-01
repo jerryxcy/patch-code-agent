@@ -67,6 +67,7 @@ class RunState(TypedDict, total=False):
         files_changed: Stable paths changed by approved Candidate Patches.
         cumulative_diff: Path/checksum reference for the aggregate workspace repair.
         error_kind: Stable machine-readable terminal error category, when applicable.
+        provider_status_code: Credential-free HTTP status for an unavailable model provider.
         budget_name: Specific Resource Budget that caused Budget Exceeded.
         budget_limit: Configured limit for the exceeded Resource Budget.
         budget_used: Observed usage when the limit was exceeded.
@@ -119,6 +120,7 @@ class RunState(TypedDict, total=False):
     files_changed: list[str]
     cumulative_diff: dict[str, object]
     error_kind: str
+    provider_status_code: int
     budget_name: str
     budget_limit: int | float
     budget_used: int | float

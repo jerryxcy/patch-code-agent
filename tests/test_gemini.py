@@ -131,6 +131,8 @@ def test_gemini_adapter_uses_bounded_tools_for_all_typed_outputs(tmp_path: Path)
     assert Diagnosis.model_validate(diagnosis_result.output).next_strategy
     assert inspector.tool_executions == 2
     assert inspector.files_read == ("cart.py",)
+    assert "do not call list_files" in transport.prompts[2]
+    assert "do not read tests, issue files, or fixture manifests" in transport.prompts[2]
     assert transport.conversations[1][0] is model_content
     assert transport.conversations[1][1] == {
         "role": "user",
@@ -146,6 +148,10 @@ def test_gemini_adapter_uses_bounded_tools_for_all_typed_outputs(tmp_path: Path)
             }
         ],
     }
+    candidate_read_result = transport.conversations[3][1]["parts"][0][
+        "function_response"
+    ]["response"]["result"]
+    assert candidate_read_result["sha256"] == expected_hash
 
 
 def test_google_transport_preserves_sdk_tool_content_and_builds_typed_config() -> None:
@@ -181,6 +187,16 @@ def test_google_transport_preserves_sdk_tool_content_and_builds_typed_config() -
     assert models.request["model"] == "gemini-3.7-flash"
     assert models.request["config"]["automatic_function_calling"] == {"disable": True}
     assert models.request["config"]["response_json_schema"] == Plan.model_json_schema()
+    assert "temperature" not in models.request["config"]
+
+
+def test_gemini_gateway_records_selected_supported_model() -> None:
+    gateway = GeminiModelGateway(QueueTransport(), model_id="gemini-3.6-flash")
+
+    assert gateway.model_id == "gemini-3.6-flash"
+
+    with pytest.raises(ValueError, match="Unsupported Gemini model"):
+        GeminiModelGateway(QueueTransport(), model_id="gemini-private")
 
 
 def test_gemini_adapter_retries_transient_failures_twice_and_counts_requests() -> None:
@@ -252,6 +268,7 @@ def test_gemini_adapter_marks_provider_exhaustion_inconclusive() -> None:
         )
 
     assert captured.value.model_requests == 3
+    assert captured.value.status_code == 429
 
 
 def test_gemini_adapter_keeps_provider_failure_inconclusive_at_budget_edge() -> None:

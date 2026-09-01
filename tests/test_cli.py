@@ -87,7 +87,11 @@ class UnavailableLiveModel:
     allowed_fixture_roots = (Path(__file__).parents[1] / "examples" / "tiny_repo",)
 
     def create_plan(self, request, tools):
-        raise GeminiInconclusiveError("simulated quota exhaustion", model_requests=1)
+        raise GeminiInconclusiveError(
+            "simulated provider outage",
+            model_requests=1,
+            status_code=503,
+        )
 
     def create_candidate(self, request, tools):
         raise AssertionError("Candidate must not run after provider exhaustion")
@@ -451,7 +455,7 @@ def test_live_smoke_without_api_key_is_inconclusive_and_offline(
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     factory_called = False
 
-    def factory(_api_key: str, _data_root: Path):
+    def factory(_api_key: str, _data_root: Path, _model: str):
         nonlocal factory_called
         factory_called = True
         return ScriptedModel()
@@ -486,7 +490,7 @@ def test_live_smoke_rejects_injected_fixture_registry_before_model_request(
         create_cli(
             data_root=tmp_path / "runs",
             fixture_roots=(private_fixture,),
-            live_model_factory=lambda _key, _data_root: model,
+            live_model_factory=lambda _key, _data_root, _model: model,
         ),
         ["live-smoke", "private-fixture", "--yes"],
     )
@@ -506,14 +510,21 @@ def test_live_smoke_uses_registered_fixture_without_persisting_api_key(
     fixture_source = Path(__file__).parents[1] / "examples" / "tiny_repo" / "cart.py"
     original_source = fixture_source.read_bytes()
 
-    def factory(observed_key: str, observed_data_root: Path):
+    def factory(observed_key: str, observed_data_root: Path, observed_model: str):
         assert observed_key == api_key
         assert observed_data_root == data_root
+        assert observed_model == "gemini-3.6-flash"
         return ScriptedModel()
 
     result = CliRunner().invoke(
         create_cli(data_root=data_root, live_model_factory=factory),
-        ["live-smoke", "cart-discount", "--yes"],
+        [
+            "live-smoke",
+            "cart-discount",
+            "--yes",
+            "--model",
+            "gemini-3.6-flash",
+        ],
     )
 
     assert result.exit_code == 0, result.output
@@ -536,16 +547,39 @@ def test_live_smoke_provider_unavailable_is_inconclusive_not_cli_failure(
     result = CliRunner().invoke(
         create_cli(
             data_root=data_root,
-            live_model_factory=lambda _key, _data_root: UnavailableLiveModel(),
+            live_model_factory=lambda _key, _data_root, _model: UnavailableLiveModel(),
         ),
         ["live-smoke", "cart-discount", "--yes"],
     )
 
     assert result.exit_code == 0, result.output
     assert "Live Smoke Inconclusive: Gemini unavailable" in result.output
+    assert "HTTP 503 Service Unavailable" in result.output
     report = _assert_terminal_report(data_root, result.output, "error")
     assert report.error_kind == "provider_unavailable"
     assert report.model_requests == 1
+
+
+def test_live_smoke_rejects_unsupported_model_before_client_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GEMINI_API_KEY", "test-only-key")
+    factory_called = False
+
+    def factory(_key: str, _data_root: Path, _model: str):
+        nonlocal factory_called
+        factory_called = True
+        return ScriptedModel()
+
+    result = CliRunner().invoke(
+        create_cli(data_root=tmp_path / "runs", live_model_factory=factory),
+        ["live-smoke", "--model", "gemini-private"],
+    )
+
+    assert result.exit_code == 2
+    assert "Unsupported Gemini model: gemini-private" in result.output
+    assert factory_called is False
 
 
 def test_user_gets_clear_error_for_invalid_fixture_manifest(tmp_path: Path) -> None:

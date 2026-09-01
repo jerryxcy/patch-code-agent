@@ -21,7 +21,7 @@ from patch_code_agent.budgets import ResourceBudgets
 from patch_code_agent.candidate import CandidatePatchReference, load_candidate_patch
 from patch_code_agent.diagnosis import DiagnosisArtifactReference, load_diagnosis_artifact
 from patch_code_agent.fixtures import bundled_fixture_roots
-from patch_code_agent.gemini import GeminiModelGateway
+from patch_code_agent.gemini import SUPPORTED_GEMINI_MODEL_IDS, GeminiModelGateway
 from patch_code_agent.model import Diagnosis, ModelGateway, Plan, ScriptedModel
 from patch_code_agent.patching import CumulativeDiffReference
 from patch_code_agent.planning import PlanArtifactReference, load_plan_artifact
@@ -46,7 +46,9 @@ def create_cli(
     fixture_roots: tuple[Path, ...] | None = None,
     verification_timeout_seconds: float = 60.0,
     clock: Callable[[], float] = monotonic,
-    live_model_factory: Callable[[str, Path], ModelGateway] = GeminiModelGateway.from_api_key,
+    live_model_factory: Callable[[str, Path, str], ModelGateway] = (
+        GeminiModelGateway.from_api_key
+    ),
 ) -> typer.Typer:
     """Create the CLI with all application dependencies at one seam.
 
@@ -354,16 +356,27 @@ def create_cli(
             bool,
             typer.Option("--yes", help="Approve every displayed Live Smoke Candidate."),
         ] = False,
+        model: Annotated[
+            str,
+            typer.Option(
+                "--model",
+                help="Gemini model used by this synthetic Live Smoke Run.",
+            ),
+        ] = "gemini-3.7-flash",
     ) -> None:
         """Run the opt-in Gemini workflow against a registered synthetic Fixture only."""
         api_key = os.getenv("GEMINI_API_KEY", "")
+        if model not in SUPPORTED_GEMINI_MODEL_IDS:
+            supported = ", ".join(SUPPORTED_GEMINI_MODEL_IDS)
+            console.print(f"[red]Unsupported Gemini model: {model}; choose one of: {supported}[/]")
+            raise typer.Exit(code=2)
         if not api_key:
             console.print(
                 "[yellow]Live Smoke Inconclusive: GEMINI_API_KEY is not configured.[/]"
             )
             return
         try:
-            gateway = live_model_factory(api_key, selected_data_root)
+            gateway = live_model_factory(api_key, selected_data_root, model)
             live_application = PatchCodeAgent(
                 model_gateway=gateway,
                 data_root=selected_data_root,
@@ -409,7 +422,9 @@ def create_cli(
             live_application.close()
         print_run_result(result)
         if result.get("error_kind") == "provider_unavailable":
-            console.print("[yellow]Live Smoke Inconclusive: Gemini unavailable.[/]")
+            status_code = result.get("provider_status_code")
+            status = _provider_status_label(status_code)
+            console.print(f"[yellow]Live Smoke Inconclusive: Gemini unavailable{status}.[/]")
         elif result["status"] == "succeeded":
             console.print("[green]Live Smoke Succeeded.[/]")
 
@@ -519,6 +534,21 @@ def create_cli(
         print_run_result(result)
 
     return cli
+
+
+def _provider_status_label(status_code: object) -> str:
+    """Format a credential-free provider classification for local CLI diagnostics."""
+    labels = {
+        429: "Resource Exhausted",
+        500: "Internal Server Error",
+        502: "Bad Gateway",
+        503: "Service Unavailable",
+        504: "Gateway Timeout",
+    }
+    if not isinstance(status_code, int):
+        return ""
+    label = labels.get(status_code, "Provider Error")
+    return f" (HTTP {status_code} {label})"
 
 
 app = create_cli()

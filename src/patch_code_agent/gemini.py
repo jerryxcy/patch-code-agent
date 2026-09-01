@@ -4,6 +4,7 @@ import json
 from base64 import b64encode
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
+from hashlib import sha256
 from pathlib import Path
 from time import sleep
 from typing import Protocol
@@ -23,7 +24,8 @@ from patch_code_agent.model import (
     PlanningRequest,
 )
 
-_MODEL_ID = "gemini-3.7-flash"
+_DEFAULT_MODEL_ID = "gemini-3.7-flash"
+SUPPORTED_GEMINI_MODEL_IDS = ("gemini-3.7-flash", "gemini-3.6-flash")
 _TRANSIENT_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
 
 
@@ -41,9 +43,16 @@ class GeminiInconclusiveError(RuntimeError):
 
     inconclusive = True
 
-    def __init__(self, message: str, *, model_requests: int) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        model_requests: int,
+        status_code: int | None = None,
+    ) -> None:
         super().__init__(message)
         self.model_requests = model_requests
+        self.status_code = status_code
 
 
 class GeminiTranscriptPersistenceError(RuntimeError):
@@ -88,7 +97,8 @@ class GeminiTransport(Protocol):
 class GoogleGenAITransport:
     """Credential-owning ``google-genai`` transport loaded only for Live Smoke Runs."""
 
-    def __init__(self, api_key: str, *, model_id: str = _MODEL_ID) -> None:
+    def __init__(self, api_key: str, *, model_id: str = _DEFAULT_MODEL_ID) -> None:
+        _validate_model_id(model_id)
         try:
             from google import genai
         except ImportError as error:
@@ -118,7 +128,6 @@ class GoogleGenAITransport:
                     "automatic_function_calling": {"disable": True},
                     "response_mime_type": "application/json",
                     "response_json_schema": schema.model_json_schema(),
-                    "temperature": 0,
                 },
             )
         except Exception as error:
@@ -213,7 +222,6 @@ class GeminiModelGateway:
     """Bounded tool-calling Model Gateway used only with registered synthetic Fixtures."""
 
     synthetic_only = True
-    model_id = _MODEL_ID
 
     def __init__(
         self,
@@ -221,20 +229,29 @@ class GeminiModelGateway:
         *,
         backoff: Callable[[float], None] = sleep,
         transcript_writer: GeminiTranscriptWriter | None = None,
+        model_id: str = _DEFAULT_MODEL_ID,
     ) -> None:
+        _validate_model_id(model_id)
         self._transport = transport
         self._backoff = backoff
         self._transcript_writer = transcript_writer
+        self.model_id = model_id
         self.allowed_fixture_roots = tuple(root.resolve() for root in bundled_fixture_roots())
 
     @classmethod
-    def from_api_key(cls, api_key: str, data_root: Path) -> "GeminiModelGateway":
+    def from_api_key(
+        cls,
+        api_key: str,
+        data_root: Path,
+        model_id: str = _DEFAULT_MODEL_ID,
+    ) -> "GeminiModelGateway":
         """Create the credential-owning client only after explicit Live Smoke opt-in."""
         if not api_key.strip():
             raise ValueError("GEMINI_API_KEY is empty")
         return cls(
-            GoogleGenAITransport(api_key),
+            GoogleGenAITransport(api_key, model_id=model_id),
             transcript_writer=GeminiTranscriptWriter(data_root),
+            model_id=model_id,
         )
 
     def create_plan(self, request: PlanningRequest, tools: InspectionTools) -> object:
@@ -254,8 +271,12 @@ class GeminiModelGateway:
 
     def create_candidate(self, request: CandidateRequest, tools: InspectionTools) -> object:
         prompt = (
-            "Create complete text replacements for the smallest repair. Read every file before "
-            "replacing it and use the observed SHA-256. Do not create, delete, or rename files."
+            "Create complete text replacements for the smallest repair. During this phase, do "
+            "not call list_files and do not read tests, issue files, or fixture manifests; the "
+            "Issue, Plan, and editable paths are already provided below. Read only each editable "
+            "file you will replace, at most once. Copy the authoritative sha256 returned by "
+            "read_file exactly; do not calculate, alter, or invent it. Then immediately return "
+            "the Candidate Patch. Do not create, delete, or rename files."
             f"\nIssue: {request.issue}\nPlan: {request.plan.model_dump_json()}"
             f"\nEditable paths: {json.dumps(request.editable_paths)}\nAttempt: {request.attempt}"
             f"\nDiagnosis: {request.diagnosis.model_dump_json() if request.diagnosis else 'none'}"
@@ -402,16 +423,21 @@ class GeminiModelGateway:
                 )
                 if not error.transient:
                     raise GeminiInconclusiveError(
-                        str(error), model_requests=consumed
+                        str(error),
+                        model_requests=consumed,
+                        status_code=error.status_code,
                     ) from error
                 if consumed >= 3:
                     raise GeminiInconclusiveError(
-                        str(error), model_requests=consumed
+                        str(error),
+                        model_requests=consumed,
+                        status_code=error.status_code,
                     ) from error
                 if consumed >= allowance:
                     raise GeminiInconclusiveError(
                         str(error),
                         model_requests=consumed,
+                        status_code=error.status_code,
                     ) from error
                 self._backoff(float(2 ** (consumed - 1)))
         raise AssertionError("Retry loop must return or raise")
@@ -451,11 +477,21 @@ def _execute_tool(call: GeminiFunctionCall, tools: InspectionTools) -> object:
         case "list_files":
             return asdict(tools.list_files())
         case "read_file":
-            return asdict(tools.read_file(str(call.arguments.get("path", ""))))
+            observed = tools.read_file(str(call.arguments.get("path", "")))
+            return {
+                **asdict(observed),
+                "sha256": sha256(observed.content.encode("utf-8")).hexdigest(),
+            }
         case "search_code":
             return asdict(tools.search_code(str(call.arguments.get("query", ""))))
         case _:
             raise ValueError(f"Gemini requested unknown inspection tool: {call.name}")
+
+
+def _validate_model_id(model_id: str) -> None:
+    if model_id not in SUPPORTED_GEMINI_MODEL_IDS:
+        supported = ", ".join(SUPPORTED_GEMINI_MODEL_IDS)
+        raise ValueError(f"Unsupported Gemini model: {model_id}; choose one of: {supported}")
 
 
 def _correction(errors: tuple[str, ...]) -> str:
