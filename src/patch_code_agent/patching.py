@@ -55,6 +55,16 @@ class PatchApplier:
     def __init__(self, data_root: Path) -> None:
         self._data_root = data_root.resolve()
 
+    def candidate_paths(
+        self,
+        *,
+        run_id: str,
+        reference: CandidatePatchReference,
+    ) -> tuple[str, ...]:
+        """Return the validated replacement paths for pre-apply budget enforcement."""
+        artifact = load_candidate_patch(self._data_root, run_id, reference).artifact
+        return tuple(replacement.path for replacement in artifact.candidate.replacements)
+
     def apply_once(
         self,
         *,

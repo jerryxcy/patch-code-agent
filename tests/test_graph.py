@@ -45,7 +45,9 @@ class CrashingDiagnosisModel(CountingModel):
 
 
 def test_graph_pauses_after_persisting_a_candidate_patch(tmp_path):
-    source = tmp_path / "cart.py"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    source = workspace / "cart.py"
     source.write_text("def total(items):\n    return sum(items)\n")
     data_root = tmp_path / "runs"
     (data_root / "test-run").mkdir(parents=True)
@@ -64,7 +66,7 @@ def test_graph_pauses_after_persisting_a_candidate_patch(tmp_path):
             "verification_argv": [sys.executable, "-c", "raise SystemExit(1)"],
             "editable_paths": ["cart.py"],
             "model_requests": 0,
-            "workspace_path": str(tmp_path),
+            "workspace_path": str(workspace),
             "status": "created",
         },
         config={"configurable": {"thread_id": "test-run"}},
@@ -143,6 +145,8 @@ def test_graph_replay_does_not_create_a_second_plan(tmp_path: Path) -> None:
     assert first["plan_artifact"] == replayed["plan_artifact"]
     assert first["candidate_artifact"] == replayed["candidate_artifact"]
     assert first["model_requests"] == replayed["model_requests"] == 2
+    assert first["active_duration_seconds"] == replayed["active_duration_seconds"]
+    assert first["active_measurements"] == replayed["active_measurements"]
 
 
 def test_diagnosis_replay_does_not_create_a_second_model_request(tmp_path: Path) -> None:

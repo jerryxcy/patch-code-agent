@@ -10,6 +10,7 @@ import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from time import monotonic
 from typing import cast
 
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
@@ -17,6 +18,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command
 
+from patch_code_agent.budgets import ResourceBudgets
 from patch_code_agent.candidate import (
     CandidatePatchArtifact,
     CandidatePatchBuilder,
@@ -83,6 +85,10 @@ class PatchRunStatus:
         verification: Latest post-apply Verification summary, when present.
         cumulative_diff: Durable checksum reference for the aggregate repair.
         error_kind: Stable terminal error category, when present.
+        budget_name: Exceeded Resource Budget name, when present.
+        budget_limit: Configured limit of the exceeded budget.
+        budget_used: Observed usage at failure.
+        budgets: Fixed limits and current durable usage for every Resource Budget.
 
     Example:
         >>> status = PatchRunStatus(
@@ -106,6 +112,10 @@ class PatchRunStatus:
         ...     verification=None,
         ...     cumulative_diff=None,
         ...     error_kind=None,
+        ...     budget_name=None,
+        ...     budget_limit=None,
+        ...     budget_used=None,
+        ...     budgets=ResourceBudgets.from_state({}),
         ... )
         >>> status.phase
         'planned'
@@ -131,6 +141,10 @@ class PatchRunStatus:
     verification: RepairVerificationSummary | None
     cumulative_diff: CumulativeDiffReference | None
     error_kind: str | None
+    budget_name: str | None
+    budget_limit: int | float | None
+    budget_used: int | float | None
+    budgets: ResourceBudgets
 
 
 class PatchRunStatusReader:
@@ -233,6 +247,10 @@ class PatchRunStatusReader:
                 else None
             ),
             error_kind=state.get("error_kind"),
+            budget_name=state.get("budget_name"),
+            budget_limit=state.get("budget_limit"),
+            budget_used=state.get("budget_used"),
+            budgets=ResourceBudgets.from_state(state),
         )
 
 
@@ -251,9 +269,11 @@ class PatchCodeAgent:
         data_root: Path,
         fixture_roots: tuple[Path, ...] | None = None,
         verification_timeout_seconds: float = 60.0,
+        clock: Callable[[], float] = monotonic,
     ) -> None:
         """Configure lazy application dependencies around one durable data root."""
         self._model_gateway = model_gateway
+        self._clock = clock
         self._data_root = data_root.resolve()
         self._fixture_roots = (
             fixture_roots if fixture_roots is not None else bundled_fixture_roots()
@@ -358,6 +378,8 @@ class PatchCodeAgent:
                 "tool_executions": 0,
                 "files_read": [],
                 "files_changed": [],
+                "active_duration_seconds": 0.0,
+                "active_measurements": {},
                 "workspace_path": str(workspace.path),
                 "status": "created",
             },
@@ -405,5 +427,6 @@ class PatchCodeAgent:
                 patch_applier=self._patch_applier,
                 repair_verifier=self._repair_verifier,
                 checkpointer=checkpointer,
+                clock=self._clock,
             )
         return self._graph

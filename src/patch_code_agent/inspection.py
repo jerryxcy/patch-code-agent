@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Protocol
 
+from patch_code_agent.budgets import ResourceBudgetExceededError
 from patch_code_agent.sources import is_ignored_source_path, validate_relative_path
 
 _MAX_FILE_BYTES = 100 * 1024
@@ -80,8 +81,16 @@ class InspectionTools(Protocol):
 class WorkspaceInspector:
     """Host implementation of bounded list, read, and search operations."""
 
-    def __init__(self, workspace: Path) -> None:
+    def __init__(
+        self,
+        workspace: Path,
+        *,
+        prior_tool_executions: int = 0,
+        previously_read: tuple[str, ...] = (),
+    ) -> None:
         self._workspace = workspace.resolve()
+        self._prior_tool_executions = prior_tool_executions
+        self._previously_read = set(previously_read)
         self._tool_executions = 0
         self._files_read: set[str] = set()
         self._read_hashes: dict[str, str] = {}
@@ -103,7 +112,7 @@ class WorkspaceInspector:
 
     def list_files(self) -> FileList:
         """List at most 256 visible regular UTF-8 text files."""
-        self._tool_executions += 1
+        self._claim_tool_execution()
         paths = self._visible_text_paths()
         return FileList(
             paths=tuple(paths[:_MAX_LISTED_FILES]),
@@ -112,24 +121,29 @@ class WorkspaceInspector:
 
     def read_file(self, path: str) -> FileContent:
         """Validate and read one path without following any symlink segment."""
-        self._tool_executions += 1
+        self._claim_tool_execution()
         relative, candidate = self._resolve_regular_file(path)
+        self._claim_file_read(relative)
         content = self._read_text(candidate)
-        self._files_read.add(relative)
         self._read_hashes[relative] = hashlib.sha256(content.encode("utf-8")).hexdigest()
         return FileContent(path=relative, content=content)
 
     def search_code(self, query: str) -> SearchResult:
         """Return a deterministic byte-bounded literal search across visible text."""
-        self._tool_executions += 1
+        self._claim_tool_execution()
         if not query or len(query) > _MAX_SEARCH_QUERY_CHARACTERS:
             raise ValueError("Search query must contain 1 to 256 characters")
 
         output = bytearray()
         truncated = False
-        for relative in self._visible_text_paths():
+        for relative in self._visible_regular_paths():
             _, candidate = self._resolve_regular_file(relative)
-            for line_number, line in enumerate(self._read_text(candidate).splitlines(), 1):
+            self._claim_file_read(relative)
+            try:
+                content = self._read_text(candidate)
+            except ValueError:
+                continue
+            for line_number, line in enumerate(content.splitlines(), 1):
                 if query not in line:
                     continue
                 encoded = f"{relative}:{line_number}:{line}\n".encode()
@@ -141,17 +155,48 @@ class WorkspaceInspector:
                 output.extend(encoded)
         return SearchResult(output.decode("utf-8"), truncated)
 
+    def _claim_tool_execution(self) -> None:
+        if self._prior_tool_executions + self._tool_executions >= 20:
+            raise ResourceBudgetExceededError(
+                budget_name="tool_executions",
+                budget_limit=20,
+                budget_used=20,
+                tool_executions=self._tool_executions,
+                files_read=self.files_read,
+            )
+        self._tool_executions += 1
+
+    def _claim_file_read(self, relative: str) -> None:
+        if relative in self._previously_read or relative in self._files_read:
+            return
+        if len(self._previously_read | self._files_read) >= 12:
+            raise ResourceBudgetExceededError(
+                budget_name="files_read",
+                budget_limit=12,
+                budget_used=12,
+                tool_executions=self._tool_executions,
+                files_read=self.files_read,
+            )
+        self._files_read.add(relative)
+
     def _visible_text_paths(self) -> list[str]:
+        paths: list[str] = []
+        for relative in self._visible_regular_paths():
+            candidate = self._workspace.joinpath(*PurePosixPath(relative).parts)
+            try:
+                self._read_text(candidate)
+            except ValueError:
+                continue
+            paths.append(relative)
+        return paths
+
+    def _visible_regular_paths(self) -> list[str]:
         paths: list[str] = []
         for candidate in self._workspace.rglob("*"):
             relative_path = candidate.relative_to(self._workspace)
             if is_ignored_source_path(relative_path) or self._has_symlink_segment(relative_path):
                 continue
             if not candidate.is_file() or candidate.stat().st_size > _MAX_FILE_BYTES:
-                continue
-            try:
-                self._read_text(candidate)
-            except ValueError:
                 continue
             paths.append(relative_path.as_posix())
         return sorted(paths)

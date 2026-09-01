@@ -1,13 +1,20 @@
 """Create one validated, checksummed Plan artifact through bounded inspection."""
 
 import hashlib
+from dataclasses import replace
 from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from patch_code_agent.budgets import ResourceBudgetExceededError
 from patch_code_agent.inspection import WorkspaceInspector
 from patch_code_agent.model import ModelGateway, Plan, PlanningRequest
+from patch_code_agent.model_output import (
+    InvalidModelOutputError,
+    ModelInvocationError,
+    request_typed_output,
+)
 
 
 class PlanArtifact(BaseModel):
@@ -80,6 +87,9 @@ class Planner:
         issue: str,
         verification: list[str],
         expected_reference: PlanArtifactReference | None = None,
+        prior_model_requests: int = 0,
+        prior_tool_executions: int = 0,
+        previously_read: tuple[str, ...] = (),
     ) -> PlanningResult:
         """Create one Plan or load its completed artifact during graph replay."""
         run_root = self._data_root / run_id
@@ -94,16 +104,38 @@ class Planner:
         try:
             marker.touch(exist_ok=False)
         except FileExistsError as error:
-            raise RuntimeError("Plan replay ledger is incomplete; refusing a second model request") from error
+            raise RuntimeError(
+                "Plan replay ledger is incomplete; refusing a second model request"
+            ) from error
 
-        inspector = WorkspaceInspector(workspace)
+        inspector = WorkspaceInspector(
+            workspace,
+            prior_tool_executions=prior_tool_executions,
+            previously_read=previously_read,
+        )
         request = PlanningRequest(issue=issue, verification=tuple(verification))
-        raw_plan = self._model_gateway.create_plan(request, inspector)
-        plan = Plan.model_validate(raw_plan)
+        try:
+            plan, model_requests = request_typed_output(
+                lambda errors: self._model_gateway.create_plan(
+                    replace(request, validation_errors=errors), inspector
+                ),
+                Plan,
+                prior_model_requests=prior_model_requests,
+            )
+        except (
+            InvalidModelOutputError,
+            ModelInvocationError,
+            ResourceBudgetExceededError,
+        ) as error:
+            error.record_inspection(
+                tool_executions=inspector.tool_executions,
+                files_read=inspector.files_read,
+            )
+            raise
         artifact = PlanArtifact(
             plan=plan,
             model_id=self._model_gateway.model_id,
-            model_requests=1,
+            model_requests=model_requests,
             tool_executions=inspector.tool_executions,
             files_read=inspector.files_read,
         )

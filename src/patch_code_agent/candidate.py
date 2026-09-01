@@ -3,15 +3,21 @@
 import difflib
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from patch_code_agent.budgets import ResourceBudgetExceededError
 from patch_code_agent.diagnosis import DiagnosisArtifactReference, load_diagnosis_artifact
 from patch_code_agent.inspection import WorkspaceInspector
 from patch_code_agent.model import CandidatePatch, CandidateRequest, ModelGateway
+from patch_code_agent.model_output import (
+    InvalidModelOutputError,
+    ModelInvocationError,
+    request_typed_output,
+)
 from patch_code_agent.planning import PlanArtifactReference, load_plan_artifact
 
 _MAX_REPLACEMENT_BYTES = 100 * 1024
@@ -103,6 +109,9 @@ class CandidatePatchBuilder:
         attempt: int,
         diagnosis_reference: DiagnosisArtifactReference | None = None,
         expected_reference: CandidatePatchReference | None = None,
+        prior_model_requests: int = 0,
+        prior_tool_executions: int = 0,
+        previously_read: tuple[str, ...] = (),
     ) -> CandidatePatchResult:
         """Create one Candidate Patch or load the completed artifact during graph replay."""
         run_root = self._data_root / run_id
@@ -116,7 +125,11 @@ class CandidatePatchBuilder:
         except FileExistsError:
             return _load_completed_result(paths, expected_reference)
 
-        inspector = WorkspaceInspector(workspace)
+        inspector = WorkspaceInspector(
+            workspace,
+            prior_tool_executions=prior_tool_executions,
+            previously_read=previously_read,
+        )
         plan = load_plan_artifact(self._data_root, run_id, plan_reference).plan
         request = CandidateRequest(
             issue=issue,
@@ -131,8 +144,24 @@ class CandidatePatchBuilder:
                 else None
             ),
         )
-        raw_candidate = self._model_gateway.create_candidate(request, inspector)
-        candidate = CandidatePatch.model_validate(raw_candidate)
+        try:
+            candidate, model_requests = request_typed_output(
+                lambda errors: self._model_gateway.create_candidate(
+                    replace(request, validation_errors=errors), inspector
+                ),
+                CandidatePatch,
+                prior_model_requests=prior_model_requests,
+            )
+        except (
+            InvalidModelOutputError,
+            ModelInvocationError,
+            ResourceBudgetExceededError,
+        ) as error:
+            error.record_inspection(
+                tool_executions=inspector.tool_executions,
+                files_read=inspector.files_read,
+            )
+            raise
         candidate, exact_diff = _validate_and_diff(
             workspace=workspace,
             editable_paths=editable_paths,
@@ -147,7 +176,7 @@ class CandidatePatchBuilder:
             candidate=candidate,
             diff_sha256=diff_checksum,
             model_id=self._model_gateway.model_id,
-            model_requests=1,
+            model_requests=model_requests,
             tool_executions=inspector.tool_executions,
             files_read=inspector.files_read,
         )
