@@ -191,17 +191,23 @@ class CorrectedEveryOutputModel:
 
     def create_plan(self, request, tools):
         if self._needs_correction("plan"):
+            assert not request.validation_errors
             return {}
+        assert request.validation_errors
         return self.delegate.create_plan(request, tools)
 
     def create_candidate(self, request, tools):
         if self._needs_correction("candidate"):
+            assert not request.validation_errors
             return {}
+        assert request.validation_errors
         return self.delegate.create_candidate(request, tools)
 
     def create_diagnosis(self, request, tools):
         if self._needs_correction("diagnosis"):
+            assert not request.validation_errors
             return {}
+        assert request.validation_errors
         return self.delegate.create_diagnosis(request, tools)
 
 
@@ -615,9 +621,9 @@ def test_tool_execution_budget_exceeded_names_limit_and_usage(tmp_path: Path) ->
     assert result.exit_code == 0, result.output
     assert "Outcome: Budget Exceeded" in result.output
     assert "Budget: tool_executions" in result.output
-    assert "Budget Usage: 21/20" in result.output
+    assert "Budget Usage: 20/20" in result.output
     run_root = data_root / _run_identifier(result.output)
-    assert (run_root / "plan.json").is_file()
+    assert not (run_root / "plan.json").exists()
     assert not (run_root / "attempts").exists()
 
 
@@ -638,6 +644,31 @@ def test_model_infrastructure_failure_is_not_a_failed_repair_attempt(tmp_path: P
     assert "Attempts Exhausted" not in result.output
 
 
+def test_plan_storage_failure_is_a_stable_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_write_bytes = Path.write_bytes
+
+    def fail_plan_write(path: Path, data: bytes) -> int:
+        if path.name == "plan.json":
+            raise OSError("simulated artifact storage outage")
+        return original_write_bytes(path, data)
+
+    monkeypatch.setattr(Path, "write_bytes", fail_plan_write)
+
+    result = CliRunner().invoke(
+        create_cli(model_gateway=ScriptedModel(), data_root=tmp_path / "runs"),
+        ["run", "cart-discount"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Outcome: Error" in result.output
+    assert "Error Kind: storage_failure" in result.output
+    assert "Repair Attempts: 0" in result.output
+    assert "Attempts Exhausted" not in result.output
+
+
 def test_distinct_files_read_budget_exceeded_names_limit_and_usage(tmp_path: Path) -> None:
     result, data_root = _run_trusted_inspection(
         tmp_path,
@@ -648,7 +679,7 @@ def test_distinct_files_read_budget_exceeded_names_limit_and_usage(tmp_path: Pat
     assert result.exit_code == 0, result.output
     assert "Outcome: Budget Exceeded" in result.output
     assert "Budget: files_read" in result.output
-    assert "Budget Usage: 13/12" in result.output
+    assert "Budget Usage: 12/12" in result.output
     assert not (data_root / _run_identifier(result.output) / "attempts").exists()
 
 
@@ -675,15 +706,21 @@ editable_paths = {json.dumps(paths)}
     )
     run_identifier = _run_identifier(run_result.output)
 
+    first_approval = CliRunner().invoke(
+        create_cli(model_gateway=model, data_root=data_root),
+        ["approve", run_identifier, "--yes"],
+    )
     approve_result = CliRunner().invoke(
         create_cli(model_gateway=model, data_root=data_root),
         ["approve", run_identifier, "--yes"],
     )
 
+    assert first_approval.exit_code == 0, first_approval.output
+    assert "status: pending_approval" in first_approval.output
     assert approve_result.exit_code == 0, approve_result.output
     assert "Outcome: Budget Exceeded" in approve_result.output
     assert "Budget: files_changed" in approve_result.output
-    assert "Budget Usage: 4/3" in approve_result.output
+    assert "Budget Usage: 3/3" in approve_result.output
     assert "Repair Attempts: 1" in approve_result.output
     workspace = data_root / run_identifier / "workspace"
     assert all("# attempt 1" in (workspace / path).read_text() for path in paths[:3])
@@ -713,7 +750,7 @@ def test_model_request_budget_counts_schema_correction_requests(tmp_path: Path) 
     assert second_approval.exit_code == 0, second_approval.output
     assert "Outcome: Budget Exceeded" in second_approval.output
     assert "Budget: model_requests" in second_approval.output
-    assert "Budget Usage: 10/8" in second_approval.output
+    assert "Budget Usage: 8/8" in second_approval.output
     assert "Repair Attempts: 2" in second_approval.output
     assert "Attempts Exhausted" not in second_approval.output
 
@@ -1834,6 +1871,46 @@ editable_paths = ["cart.py"]
     status = CliRunner().invoke(status_cli, ["status", run_identifier])
     assert status.exit_code == 0, status.output
     assert "Phase: error" in status.output
+
+
+def test_repair_verification_infrastructure_error_is_not_attempts_exhausted(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repair-verification-error"
+    repository.mkdir()
+    source = Path(__file__).parents[1] / "examples" / "tiny_repo" / "cart.py"
+    (repository / "cart.py").write_bytes(source.read_bytes())
+    verification_program = (
+        "from pathlib import Path; "
+        "text = Path('cart.py').read_text(); "
+        "raise SystemExit(1 if 'sum(prices) - discount' in text else 2)"
+    )
+    contract = tmp_path / "repair-verification-error.toml"
+    contract.write_text(
+        f'''source_id = "repair-verification-error"
+issue = "Repair the discount calculation"
+verification = {json.dumps([sys.executable, "-c", verification_program])}
+editable_paths = ["cart.py"]
+''',
+        encoding="utf-8",
+    )
+    data_root = tmp_path / "runs"
+    run_result = CliRunner().invoke(
+        create_cli(model_gateway=ScriptedModel(), data_root=data_root),
+        ["run-local", str(repository), "--contract", str(contract), "--trust-repository"],
+    )
+    run_identifier = _run_identifier(run_result.output)
+
+    approve_result = CliRunner().invoke(
+        create_cli(model_gateway=ScriptedModel(), data_root=data_root),
+        ["approve", run_identifier, "--yes"],
+    )
+
+    assert approve_result.exit_code == 0, approve_result.output
+    assert "Outcome: Error" in approve_result.output
+    assert "Error Kind: verification_exit_code" in approve_result.output
+    assert "Repair Attempts: 1" in approve_result.output
+    assert "Attempts Exhausted" not in approve_result.output
 
 
 def test_baseline_timeout_becomes_budget_exceeded(tmp_path: Path) -> None:

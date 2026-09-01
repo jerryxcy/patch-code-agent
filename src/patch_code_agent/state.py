@@ -70,6 +70,7 @@ class RunState(TypedDict, total=False):
         budget_limit: Configured limit for the exceeded Resource Budget.
         budget_used: Observed usage when the limit was exceeded.
         active_duration_seconds: Host-controlled execution time, excluding Approval wait.
+        active_measurements: Replay-stable elapsed seconds keyed by logical node execution.
         status: Current lifecycle phase or terminal outcome used for routing and CLI status.
         report: Bounded structured progress/report data; complete evidence remains in artifacts.
 
@@ -118,5 +119,6 @@ class RunState(TypedDict, total=False):
     budget_limit: int | float
     budget_used: int | float
     active_duration_seconds: float
+    active_measurements: dict[str, float]
     status: RunStatus
     report: dict[str, object]

@@ -52,6 +52,7 @@ class PlanningRequest:
 
     issue: str
     verification: VerificationArgv
+    validation_errors: tuple[str, ...] = ()
 
 
 class FileReplacement(BaseModel):
@@ -102,6 +103,7 @@ class DiagnosisRequest:
     attempt: int
     verification_output_excerpt: str
     verification_artifact_path: str
+    validation_errors: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,6 +119,7 @@ class CandidateRequest:
     editable_paths: tuple[RelativeSourcePath, ...]
     attempt: int
     diagnosis: Diagnosis | None = None
+    validation_errors: tuple[str, ...] = ()
 
 
 class ModelGateway(Protocol):

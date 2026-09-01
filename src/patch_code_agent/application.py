@@ -378,6 +378,8 @@ class PatchCodeAgent:
                 "tool_executions": 0,
                 "files_read": [],
                 "files_changed": [],
+                "active_duration_seconds": 0.0,
+                "active_measurements": {},
                 "workspace_path": str(workspace.path),
                 "status": "created",
             },

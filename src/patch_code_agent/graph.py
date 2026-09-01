@@ -17,7 +17,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import interrupt
 
-from patch_code_agent.budgets import ResourceBudgets
+from patch_code_agent.budgets import ResourceBudgetExceededError, ResourceBudgets
 from patch_code_agent.candidate import CandidatePatchBuilder, CandidatePatchReference
 from patch_code_agent.diagnosis import DiagnosisArtifactReference, Diagnostician
 from patch_code_agent.model_output import InvalidModelOutputError, ModelInvocationError
@@ -46,6 +46,8 @@ def _enforce_resource_budgets(
     projected_files_changed: list[str] | None = None,
 ) -> RunState:
     """Turn a completed node update into a stable Budget Exceeded result when needed."""
+    if update.get("status") in {"error", "budget_exceeded"}:
+        return update
     projected: dict[str, object] = dict(state)
     projected.update(update)
     if projected_files_changed is not None:
@@ -73,11 +75,20 @@ def _measure_active_time(
     state: RunState,
     action: Callable[[RunState], RunState],
     clock: Callable[[], float],
+    measurement_key: str,
 ) -> RunState:
     """Count host-controlled work while deliberately excluding Approval wait time."""
+    measurements = dict(state.get("active_measurements", {}))
+    if measurement_key in measurements:
+        update = action(state)
+        update["active_measurements"] = measurements
+        update["active_duration_seconds"] = state.get("active_duration_seconds", 0.0)
+        return update
     started_at = clock()
     update = action(state)
     elapsed = max(0.0, clock() - started_at)
+    measurements[measurement_key] = elapsed
+    update["active_measurements"] = measurements
     update["active_duration_seconds"] = (
         state.get("active_duration_seconds", 0.0) + elapsed
     )
@@ -112,6 +123,44 @@ def _model_failure(state: RunState, error: ModelInvocationError) -> RunState:
             "success": False,
             "phase": "error",
             "note": "Model infrastructure failed before valid typed output was returned.",
+        },
+    }
+
+
+def _resource_budget_exceeded(
+    state: RunState,
+    error: ResourceBudgetExceededError,
+) -> RunState:
+    """Persist usage observed before a host boundary refused the next operation."""
+    return {
+        "model_requests": state.get("model_requests", 0) + error.model_requests,
+        "tool_executions": state.get("tool_executions", 0) + error.tool_executions,
+        "files_read": sorted(set(state.get("files_read", [])) | set(error.files_read)),
+        "status": "budget_exceeded",
+        "error_kind": "resource_budget",
+        "budget_name": error.budget_name,
+        "budget_limit": error.budget_limit,
+        "budget_used": error.budget_used,
+        "report": {
+            "success": False,
+            "phase": "budget_exceeded",
+            "note": (
+                f"Resource Budget exhausted: {error.budget_name} used "
+                f"{error.budget_used} of {error.budget_limit}."
+            ),
+        },
+    }
+
+
+def _infrastructure_failure(error_kind: str, note: str) -> RunState:
+    """Produce a stable Error without consuming or masquerading as a Repair Attempt."""
+    return {
+        "status": "error",
+        "error_kind": error_kind,
+        "report": {
+            "success": False,
+            "phase": "error",
+            "note": note,
         },
     }
 
@@ -185,11 +234,21 @@ def create_plan(state: RunState, planner: Planner) -> RunState:
                 if "plan_artifact" in state
                 else None
             ),
+            prior_model_requests=state.get("model_requests", 0),
+            prior_tool_executions=state.get("tool_executions", 0),
+            previously_read=tuple(state.get("files_read", [])),
         )
     except InvalidModelOutputError as error:
         return _invalid_model_output(state, error)
     except ModelInvocationError as error:
         return _model_failure(state, error)
+    except ResourceBudgetExceededError as error:
+        return _resource_budget_exceeded(state, error)
+    except (OSError, RuntimeError):
+        return _infrastructure_failure(
+            "storage_failure",
+            "Plan artifact storage failed before planning completed.",
+        )
     update: RunState = {
         "plan_artifact": result.reference.model_dump(mode="json"),
         "model_requests": result.artifact.model_requests,
@@ -244,11 +303,21 @@ def create_candidate(state: RunState, builder: CandidatePatchBuilder) -> RunStat
                 == f"attempts/{candidate_attempt}/candidate.json"
                 else None
             ),
+            prior_model_requests=state.get("model_requests", 0),
+            prior_tool_executions=state.get("tool_executions", 0),
+            previously_read=tuple(state.get("files_read", [])),
         )
     except InvalidModelOutputError as error:
         return _invalid_model_output(state, error)
     except ModelInvocationError as error:
         return _model_failure(state, error)
+    except ResourceBudgetExceededError as error:
+        return _resource_budget_exceeded(state, error)
+    except (OSError, RuntimeError):
+        return _infrastructure_failure(
+            "storage_failure",
+            "Candidate Patch artifact storage failed before Approval.",
+        )
     update: RunState = {
         "candidate_artifact": result.reference.model_dump(mode="json"),
         "model_requests": state["model_requests"] + result.artifact.model_requests,
@@ -262,13 +331,7 @@ def create_candidate(state: RunState, builder: CandidatePatchBuilder) -> RunStat
             "note": "Candidate Patch is immutable and awaiting an Approval decision.",
         },
     }
-    candidate_paths = [replacement.path for replacement in result.artifact.candidate.replacements]
-    projected_files_changed = sorted(set(state.get("files_changed", [])) | set(candidate_paths))
-    return _enforce_resource_budgets(
-        state,
-        update,
-        projected_files_changed=projected_files_changed,
-    )
+    return _enforce_resource_budgets(state, update)
 
 
 def route_after_candidate(state: RunState) -> str:
@@ -312,11 +375,35 @@ def reject_candidate(state: RunState) -> RunState:
 def apply_candidate(state: RunState, applier: PatchApplier) -> RunState:
     """Revalidate and apply the approved Candidate Patch without trusting model state."""
     reference = CandidatePatchReference.model_validate(state["candidate_artifact"])
-    summary = applier.apply_once(
-        run_id=state["run_id"],
-        workspace=Path(state["workspace_path"]),
-        reference=reference,
-    )
+    try:
+        candidate_paths = set(
+            applier.candidate_paths(run_id=state["run_id"], reference=reference)
+        )
+    except (OSError, RuntimeError, ValueError):
+        return _infrastructure_failure(
+            "storage_failure",
+            "Approved Candidate Patch artifact could not be loaded safely.",
+        )
+    if len(set(state.get("files_changed", [])) | candidate_paths) > 3:
+        return _resource_budget_exceeded(
+            state,
+            ResourceBudgetExceededError(
+                budget_name="files_changed",
+                budget_limit=3,
+                budget_used=len(state.get("files_changed", [])),
+            ),
+        )
+    try:
+        summary = applier.apply_once(
+            run_id=state["run_id"],
+            workspace=Path(state["workspace_path"]),
+            reference=reference,
+        )
+    except (OSError, RuntimeError):
+        return _infrastructure_failure(
+            "patching_failure",
+            "Patch application infrastructure failed before Verification.",
+        )
     update: RunState = {
         "approved": True,
         "apply_summary": summary.model_dump(mode="json"),
@@ -417,11 +504,21 @@ def create_diagnosis(state: RunState, diagnostician: Diagnostician) -> RunState:
                 == f"attempts/{verification.attempt}/diagnosis.json"
                 else None
             ),
+            prior_model_requests=state.get("model_requests", 0),
+            prior_tool_executions=state.get("tool_executions", 0),
+            previously_read=tuple(state.get("files_read", [])),
         )
     except InvalidModelOutputError as error:
         return _invalid_model_output(state, error)
     except ModelInvocationError as error:
         return _model_failure(state, error)
+    except ResourceBudgetExceededError as error:
+        return _resource_budget_exceeded(state, error)
+    except (OSError, RuntimeError):
+        return _infrastructure_failure(
+            "storage_failure",
+            "Diagnosis artifact storage failed before retry planning completed.",
+        )
     update: RunState = {
         "diagnosis_artifact": result.reference.model_dump(mode="json"),
         "model_requests": state["model_requests"] + result.artifact.model_requests,
@@ -470,34 +567,60 @@ def build_graph(
     """
     selected_checkpointer = checkpointer if checkpointer is not None else InMemorySaver()
     builder = StateGraph(RunState)
-    def measured(action: Callable[[RunState], RunState]) -> Callable[[RunState], RunState]:
-        return lambda state: _measure_active_time(state, action, clock)
 
-    builder.add_node("validate_input", measured(validate_input))
+    def measured(
+        action: Callable[[RunState], RunState],
+        key: Callable[[RunState], str],
+    ) -> Callable[[RunState], RunState]:
+        return lambda state: _measure_active_time(state, action, clock, key(state))
+
+    def fixed_key(name: str) -> Callable[[RunState], str]:
+        return lambda _state: name
+
+    builder.add_node("validate_input", measured(validate_input, fixed_key("validate")))
     builder.add_node(
         "baseline_verification",
-        measured(lambda state: run_baseline_verification(state, baseline_verifier)),
+        measured(
+            lambda state: run_baseline_verification(state, baseline_verifier),
+            fixed_key("baseline"),
+        ),
     )
-    builder.add_node("create_plan", measured(lambda state: create_plan(state, planner)))
+    builder.add_node(
+        "create_plan",
+        measured(lambda state: create_plan(state, planner), fixed_key("plan")),
+    )
     builder.add_node(
         "create_candidate",
-        measured(lambda state: create_candidate(state, candidate_builder)),
+        measured(
+            lambda state: create_candidate(state, candidate_builder),
+            lambda state: f"candidate:{state.get('attempt', 0) + 1}",
+        ),
     )
     builder.add_node("approval_gate", await_approval)
-    builder.add_node("reject_candidate", measured(reject_candidate))
+    builder.add_node(
+        "reject_candidate",
+        measured(reject_candidate, fixed_key("reject")),
+    )
     builder.add_node(
         "apply_candidate",
-        measured(lambda state: apply_candidate(state, patch_applier)),
+        measured(
+            lambda state: apply_candidate(state, patch_applier),
+            lambda state: f"apply:{state.get('attempt', 0) + 1}",
+        ),
     )
     builder.add_node(
         "repair_verification",
         measured(
-            lambda state: run_repair_verification(state, repair_verifier, patch_applier)
+            lambda state: run_repair_verification(state, repair_verifier, patch_applier),
+            lambda state: f"verification:{state.get('attempt', 0) + 1}",
         ),
     )
     builder.add_node(
         "create_diagnosis",
-        measured(lambda state: create_diagnosis(state, diagnostician)),
+        measured(
+            lambda state: create_diagnosis(state, diagnostician),
+            lambda state: f"diagnosis:{state.get('attempt', 0)}",
+        ),
     )
     builder.add_edge(START, "validate_input")
     builder.add_edge("validate_input", "baseline_verification")

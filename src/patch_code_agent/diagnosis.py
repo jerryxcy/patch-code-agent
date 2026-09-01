@@ -2,11 +2,13 @@
 
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from patch_code_agent.budgets import ResourceBudgetExceededError
 from patch_code_agent.inspection import WorkspaceInspector
 from patch_code_agent.model import Diagnosis, DiagnosisRequest, ModelGateway
 from patch_code_agent.model_output import (
@@ -68,6 +70,9 @@ class Diagnostician:
         plan_reference: PlanArtifactReference,
         verification: RepairVerificationSummary,
         expected_reference: DiagnosisArtifactReference | None = None,
+        prior_model_requests: int = 0,
+        prior_tool_executions: int = 0,
+        previously_read: tuple[str, ...] = (),
     ) -> DiagnosisResult:
         """Create one Diagnosis or validate and replay its completed ledger."""
         attempt_root = self._data_root / run_id / "attempts" / str(verification.attempt)
@@ -88,7 +93,11 @@ class Diagnostician:
             ) from error
 
         plan = load_plan_artifact(self._data_root, run_id, plan_reference).plan
-        inspector = WorkspaceInspector(workspace)
+        inspector = WorkspaceInspector(
+            workspace,
+            prior_tool_executions=prior_tool_executions,
+            previously_read=previously_read,
+        )
         request = DiagnosisRequest(
             issue=issue,
             plan=plan,
@@ -98,10 +107,17 @@ class Diagnostician:
         )
         try:
             diagnosis, model_requests = request_typed_output(
-                lambda: self._model_gateway.create_diagnosis(request, inspector),
+                lambda errors: self._model_gateway.create_diagnosis(
+                    replace(request, validation_errors=errors), inspector
+                ),
                 Diagnosis,
+                prior_model_requests=prior_model_requests,
             )
-        except (InvalidModelOutputError, ModelInvocationError) as error:
+        except (
+            InvalidModelOutputError,
+            ModelInvocationError,
+            ResourceBudgetExceededError,
+        ) as error:
             error.record_inspection(
                 tool_executions=inspector.tool_executions,
                 files_read=inspector.files_read,

@@ -16,6 +16,38 @@ BudgetName = Literal[
 ]
 
 
+class ResourceBudgetExceededError(RuntimeError):
+    """Stop a model/tool request at the host boundary when no allowance remains."""
+
+    def __init__(
+        self,
+        *,
+        budget_name: BudgetName,
+        budget_limit: float,
+        budget_used: float,
+        model_requests: int = 0,
+        tool_executions: int = 0,
+        files_read: tuple[str, ...] = (),
+    ) -> None:
+        super().__init__(f"Resource Budget exhausted: {budget_name}")
+        self.budget_name = budget_name
+        self.budget_limit = budget_limit
+        self.budget_used = budget_used
+        self.model_requests = model_requests
+        self.tool_executions = tool_executions
+        self.files_read = files_read
+
+    def record_inspection(
+        self,
+        *,
+        tool_executions: int,
+        files_read: tuple[str, ...],
+    ) -> None:
+        """Attach phase-local usage when a model-request allowance is exhausted."""
+        self.tool_executions = tool_executions
+        self.files_read = files_read
+
+
 class CountBudget(BaseModel):
     """Integer limit and current durable usage for a countable resource."""
 

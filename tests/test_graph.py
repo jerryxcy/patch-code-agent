@@ -143,6 +143,8 @@ def test_graph_replay_does_not_create_a_second_plan(tmp_path: Path) -> None:
     assert first["plan_artifact"] == replayed["plan_artifact"]
     assert first["candidate_artifact"] == replayed["candidate_artifact"]
     assert first["model_requests"] == replayed["model_requests"] == 2
+    assert first["active_duration_seconds"] == replayed["active_duration_seconds"]
+    assert first["active_measurements"] == replayed["active_measurements"]
 
 
 def test_diagnosis_replay_does_not_create_a_second_model_request(tmp_path: Path) -> None:
