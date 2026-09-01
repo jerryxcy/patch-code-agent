@@ -18,7 +18,8 @@ Candidate Patch 與 Diagnosis。
 > before/after hash 規則套用修改，執行 post-apply Verification，並在成功時保存 cumulative diff；
 > Verification 失敗時會保留已核准修改、保存 typed Diagnosis，再提出相對目前 workspace 的
 > 增量 Candidate，最多三次 Repair Attempts；拒絕則不修改 workspace、也不消耗 Repair Attempt。
-> 完整 Resource Budgets、Run Events 與 Run Report 仍是後續 MVP 功能。
+> Host 會在 model、inspection、apply 與 Verification 邊界強制完整 Resource Budgets；每個 graph
+> transition 寫入 replay-safe Run Events，所有 terminal outcomes 產生 checksummed Run Report。
 
 完整的 MVP implementation 與 acceptance spec 見
 [GitHub Issue #2](https://github.com/jerryxcy/patch-code-agent/issues/2)。

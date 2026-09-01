@@ -235,6 +235,9 @@ def create_cli(
             console.print(
                 f"[dim]Budget Usage:[/] {result.get('budget_used')}/{result.get('budget_limit')}"
             )
+        if report := result.get("report_artifact"):
+            console.print(f"[dim]Run Report:[/] {report['path']}")
+            console.print(f"[dim]Run Report Checksum:[/] {report['sha256']}", soft_wrap=True)
         console.print(f"[dim]status:[/] {result['status']}")
 
     @cli.callback()
@@ -292,6 +295,12 @@ def create_cli(
         if patch_run.budget_name is not None:
             console.print(f"[dim]Budget:[/] {patch_run.budget_name}")
             console.print(f"[dim]Budget Usage:[/] {patch_run.budget_used}/{patch_run.budget_limit}")
+        if patch_run.report_artifact is not None:
+            console.print(f"[dim]Run Report:[/] {patch_run.report_artifact.path}")
+            console.print(
+                f"[dim]Run Report Checksum:[/] {patch_run.report_artifact.sha256}",
+                soft_wrap=True,
+            )
         if patch_run.plan is not None and patch_run.plan_artifact is not None:
             console.print(f"[dim]Plan Artifact:[/] {patch_run.plan_artifact.path}")
             console.print(

@@ -10,6 +10,7 @@ from patch_code_agent.graph import build_graph
 from patch_code_agent.model import ScriptedModel
 from patch_code_agent.patching import PatchApplier
 from patch_code_agent.planning import Planner
+from patch_code_agent.reporting import RunAuditStore
 from patch_code_agent.verification import (
     BaselineVerifier,
     RepairVerificationSummary,
@@ -59,9 +60,14 @@ def test_graph_pauses_after_persisting_a_candidate_patch(tmp_path):
         diagnostician=Diagnostician(data_root, ScriptedModel()),
         patch_applier=PatchApplier(data_root),
         repair_verifier=RepairVerifier(data_root),
+        audit_store=RunAuditStore(data_root),
     ).invoke(
         {
             "run_id": "test-run",
+            "source_kind": "fixture",
+            "source_id": "test-source",
+            "source_revision": "a" * 64,
+            "model_id": "scripted",
             "issue": "Fix the cart total",
             "verification_argv": [sys.executable, "-c", "raise SystemExit(1)"],
             "editable_paths": ["cart.py"],
@@ -123,9 +129,14 @@ def test_graph_replay_does_not_create_a_second_plan(tmp_path: Path) -> None:
         diagnostician=Diagnostician(data_root, model),
         patch_applier=PatchApplier(data_root),
         repair_verifier=RepairVerifier(data_root),
+        audit_store=RunAuditStore(data_root),
     )
     initial_state = {
         "run_id": "test-run",
+        "source_kind": "fixture",
+        "source_id": "test-source",
+        "source_revision": "a" * 64,
+        "model_id": "counting",
         "issue": "Fix the discount",
         "verification_argv": [sys.executable, "-c", "raise SystemExit(1)"],
         "editable_paths": ["cart.py"],
@@ -138,6 +149,7 @@ def test_graph_replay_does_not_create_a_second_plan(tmp_path: Path) -> None:
     config = {"configurable": {"thread_id": "test-run"}}
 
     first = graph.invoke(initial_state, config=config)
+    events_before_replay = (data_root / "test-run" / "events.jsonl").read_bytes()
     replayed = graph.invoke(initial_state, config=config)
 
     assert model.plan_requests == 1
@@ -147,6 +159,7 @@ def test_graph_replay_does_not_create_a_second_plan(tmp_path: Path) -> None:
     assert first["model_requests"] == replayed["model_requests"] == 2
     assert first["active_duration_seconds"] == replayed["active_duration_seconds"]
     assert first["active_measurements"] == replayed["active_measurements"]
+    assert (data_root / "test-run" / "events.jsonl").read_bytes() == events_before_replay
 
 
 def test_diagnosis_replay_does_not_create_a_second_model_request(tmp_path: Path) -> None:
@@ -253,6 +266,7 @@ def test_graph_applies_and_verifies_an_approved_candidate_once(tmp_path: Path) -
         diagnostician=Diagnostician(data_root, ScriptedModel()),
         patch_applier=PatchApplier(data_root),
         repair_verifier=RepairVerifier(data_root),
+        audit_store=RunAuditStore(data_root),
     )
     config = {"configurable": {"thread_id": "test-run"}}
     verification_program = """
@@ -268,6 +282,10 @@ raise SystemExit(
     pending = graph.invoke(
         {
             "run_id": "test-run",
+            "source_kind": "fixture",
+            "source_id": "test-source",
+            "source_revision": "a" * 64,
+            "model_id": "scripted",
             "issue": "Fix the discount",
             "verification_argv": [sys.executable, "-c", verification_program],
             "editable_paths": ["cart.py"],
@@ -317,11 +335,16 @@ raise SystemExit(1)
         diagnostician=Diagnostician(data_root, ScriptedModel()),
         patch_applier=applier,
         repair_verifier=RepairVerifier(data_root),
+        audit_store=RunAuditStore(data_root),
     )
     config = {"configurable": {"thread_id": "test-run"}}
     pending = graph.invoke(
         {
             "run_id": "test-run",
+            "source_kind": "fixture",
+            "source_id": "test-source",
+            "source_revision": "a" * 64,
+            "model_id": "scripted",
             "issue": "Fix the discount",
             "verification_argv": [sys.executable, "-c", verification_program],
             "editable_paths": ["cart.py"],

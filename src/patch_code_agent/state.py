@@ -45,6 +45,7 @@ class RunState(TypedDict, total=False):
         source_kind: Whether content came from a bundled fixture or explicitly trusted repository.
         source_id: Stable, human-readable Repository Source identifier.
         source_revision: SHA-256 identity of the initial copied workspace tree.
+        model_id: Stable identity of the configured Model Gateway.
         issue: Validated natural-language problem statement from the Patch Run Contract.
         verification_argv: Controlled command arguments executed without a shell.
         editable_paths: Contract paths future patch application is allowed to modify.
@@ -71,8 +72,10 @@ class RunState(TypedDict, total=False):
         budget_used: Observed usage when the limit was exceeded.
         active_duration_seconds: Host-controlled execution time, excluding Approval wait.
         active_measurements: Replay-stable elapsed seconds keyed by logical node execution.
+        verification_duration_max: Longest completed Verification duration across the Run.
         status: Current lifecycle phase or terminal outcome used for routing and CLI status.
         report: Bounded structured progress/report data; complete evidence remains in artifacts.
+        report_artifact: Path/checksum reference to the immutable terminal Run Report.
 
     Example:
         A newly created Run only needs the fields required by the first graph nodes::
@@ -95,6 +98,7 @@ class RunState(TypedDict, total=False):
     source_kind: RepositorySourceKind
     source_id: str
     source_revision: str
+    model_id: str
     issue: str
     verification_argv: list[str]
     editable_paths: list[str]
@@ -120,5 +124,7 @@ class RunState(TypedDict, total=False):
     budget_used: int | float
     active_duration_seconds: float
     active_measurements: dict[str, float]
+    verification_duration_max: float
     status: RunStatus
     report: dict[str, object]
+    report_artifact: dict[str, object]
