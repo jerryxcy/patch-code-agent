@@ -5,11 +5,16 @@ import pytest
 from langgraph.types import Command
 
 from patch_code_agent.candidate import CandidatePatchBuilder, CandidatePatchReference
+from patch_code_agent.diagnosis import Diagnostician
 from patch_code_agent.graph import build_graph
 from patch_code_agent.model import ScriptedModel
 from patch_code_agent.patching import PatchApplier
 from patch_code_agent.planning import Planner
-from patch_code_agent.verification import BaselineVerifier, RepairVerifier
+from patch_code_agent.verification import (
+    BaselineVerifier,
+    RepairVerificationSummary,
+    RepairVerifier,
+)
 
 
 class CountingModel:
@@ -18,6 +23,7 @@ class CountingModel:
     def __init__(self) -> None:
         self.plan_requests = 0
         self.candidate_requests = 0
+        self.diagnosis_requests = 0
 
     def create_plan(self, request, tools):
         self.plan_requests += 1
@@ -26,6 +32,16 @@ class CountingModel:
     def create_candidate(self, request, tools):
         self.candidate_requests += 1
         return ScriptedModel().create_candidate(request, tools)
+
+    def create_diagnosis(self, request, tools):
+        self.diagnosis_requests += 1
+        return ScriptedModel().create_diagnosis(request, tools)
+
+
+class CrashingDiagnosisModel(CountingModel):
+    def create_diagnosis(self, request, tools):
+        self.diagnosis_requests += 1
+        raise RuntimeError("simulated provider interruption")
 
 
 def test_graph_pauses_after_persisting_a_candidate_patch(tmp_path):
@@ -38,6 +54,7 @@ def test_graph_pauses_after_persisting_a_candidate_patch(tmp_path):
         baseline_verifier=BaselineVerifier(data_root),
         planner=Planner(data_root, ScriptedModel()),
         candidate_builder=CandidatePatchBuilder(data_root, ScriptedModel()),
+        diagnostician=Diagnostician(data_root, ScriptedModel()),
         patch_applier=PatchApplier(data_root),
         repair_verifier=RepairVerifier(data_root),
     ).invoke(
@@ -101,6 +118,7 @@ def test_graph_replay_does_not_create_a_second_plan(tmp_path: Path) -> None:
         baseline_verifier=BaselineVerifier(data_root),
         planner=Planner(data_root, model),
         candidate_builder=CandidatePatchBuilder(data_root, model),
+        diagnostician=Diagnostician(data_root, model),
         patch_applier=PatchApplier(data_root),
         repair_verifier=RepairVerifier(data_root),
     )
@@ -127,6 +145,97 @@ def test_graph_replay_does_not_create_a_second_plan(tmp_path: Path) -> None:
     assert first["model_requests"] == replayed["model_requests"] == 2
 
 
+def test_diagnosis_replay_does_not_create_a_second_model_request(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "cart.py").write_text("VALUE = 1\n")
+    data_root = tmp_path / "runs"
+    attempt_root = data_root / "test-run" / "attempts" / "1"
+    attempt_root.mkdir(parents=True)
+    model = CountingModel()
+    plan = Planner(data_root, model).create_once(
+        run_id="test-run",
+        workspace=workspace,
+        issue="Fix the value",
+        verification=["pytest"],
+    )
+    verification = RepairVerificationSummary(
+        attempt=1,
+        outcome="failed",
+        exit_code=1,
+        duration_seconds=0.1,
+        timeout_seconds=60,
+        output_excerpt="1 failed",
+        output_truncated=False,
+        artifact_path="attempts/1/verification.log",
+    )
+    diagnostician = Diagnostician(data_root, model)
+
+    first = diagnostician.create_once(
+        run_id="test-run",
+        workspace=workspace,
+        issue="Fix the value",
+        plan_reference=plan.reference,
+        verification=verification,
+    )
+    replayed = diagnostician.create_once(
+        run_id="test-run",
+        workspace=workspace,
+        issue="Fix the value",
+        plan_reference=plan.reference,
+        verification=verification,
+        expected_reference=first.reference,
+    )
+
+    assert replayed == first
+    assert model.diagnosis_requests == 1
+
+
+def test_incomplete_diagnosis_claim_refuses_a_second_model_request(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "cart.py").write_text("VALUE = 1\n")
+    data_root = tmp_path / "runs"
+    (data_root / "test-run" / "attempts" / "1").mkdir(parents=True)
+    model = CrashingDiagnosisModel()
+    plan = Planner(data_root, model).create_once(
+        run_id="test-run",
+        workspace=workspace,
+        issue="Fix the value",
+        verification=["pytest"],
+    )
+    verification = RepairVerificationSummary(
+        attempt=1,
+        outcome="failed",
+        exit_code=1,
+        duration_seconds=0.1,
+        timeout_seconds=60,
+        output_excerpt="1 failed",
+        output_truncated=False,
+        artifact_path="attempts/1/verification.log",
+    )
+    diagnostician = Diagnostician(data_root, model)
+
+    with pytest.raises(RuntimeError, match="simulated provider interruption"):
+        diagnostician.create_once(
+            run_id="test-run",
+            workspace=workspace,
+            issue="Fix the value",
+            plan_reference=plan.reference,
+            verification=verification,
+        )
+    with pytest.raises(RuntimeError, match="incomplete replay ledger"):
+        diagnostician.create_once(
+            run_id="test-run",
+            workspace=workspace,
+            issue="Fix the value",
+            plan_reference=plan.reference,
+            verification=verification,
+        )
+
+    assert model.diagnosis_requests == 1
+
+
 def test_graph_applies_and_verifies_an_approved_candidate_once(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -137,6 +246,7 @@ def test_graph_applies_and_verifies_an_approved_candidate_once(tmp_path: Path) -
         baseline_verifier=BaselineVerifier(data_root),
         planner=Planner(data_root, ScriptedModel()),
         candidate_builder=CandidatePatchBuilder(data_root, ScriptedModel()),
+        diagnostician=Diagnostician(data_root, ScriptedModel()),
         patch_applier=PatchApplier(data_root),
         repair_verifier=RepairVerifier(data_root),
     )
@@ -200,6 +310,7 @@ raise SystemExit(1)
         baseline_verifier=BaselineVerifier(data_root),
         planner=Planner(data_root, ScriptedModel()),
         candidate_builder=CandidatePatchBuilder(data_root, ScriptedModel()),
+        diagnostician=Diagnostician(data_root, ScriptedModel()),
         patch_applier=applier,
         repair_verifier=RepairVerifier(data_root),
     )

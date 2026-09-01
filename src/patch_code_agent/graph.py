@@ -16,12 +16,14 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import interrupt
 
 from patch_code_agent.candidate import CandidatePatchBuilder, CandidatePatchReference
+from patch_code_agent.diagnosis import DiagnosisArtifactReference, Diagnostician
 from patch_code_agent.patching import PatchApplier
 from patch_code_agent.planning import PlanArtifactReference, Planner
 from patch_code_agent.state import RunState, RunStatus
 from patch_code_agent.verification import (
     BaselineVerificationOutcome,
     BaselineVerifier,
+    RepairVerificationSummary,
     RepairVerifier,
 )
 
@@ -111,6 +113,12 @@ def create_plan(state: RunState, planner: Planner) -> RunState:
 def create_candidate(state: RunState, builder: CandidatePatchBuilder) -> RunState:
     """Persist one validated Candidate Patch before the Approval Gate can interrupt."""
     plan_reference = PlanArtifactReference.model_validate(state["plan_artifact"])
+    candidate_attempt = state.get("attempt", 0) + 1
+    current_candidate_reference = (
+        CandidatePatchReference.model_validate(state["candidate_artifact"])
+        if "candidate_artifact" in state
+        else None
+    )
     result = builder.create_once(
         run_id=state["run_id"],
         workspace=Path(state["workspace_path"]),
@@ -118,10 +126,16 @@ def create_candidate(state: RunState, builder: CandidatePatchBuilder) -> RunStat
         editable_paths=state["editable_paths"],
         protected_paths=state.get("protected_paths", []),
         plan_reference=plan_reference,
-        attempt=state.get("attempt", 0) + 1,
+        attempt=candidate_attempt,
+        diagnosis_reference=(
+            DiagnosisArtifactReference.model_validate(state["diagnosis_artifact"])
+            if "diagnosis_artifact" in state
+            else None
+        ),
         expected_reference=(
-            CandidatePatchReference.model_validate(state["candidate_artifact"])
-            if "candidate_artifact" in state
+            current_candidate_reference
+            if current_candidate_reference is not None
+            and current_candidate_reference.path == f"attempts/{candidate_attempt}/candidate.json"
             else None
         ),
     )
@@ -182,7 +196,7 @@ def apply_candidate(state: RunState, applier: PatchApplier) -> RunState:
     update: RunState = {
         "approved": True,
         "apply_summary": summary.model_dump(mode="json"),
-        "files_changed": list(summary.files_changed),
+        "files_changed": sorted(set(state.get("files_changed", [])) | set(summary.files_changed)),
     }
     if summary.outcome in {"applied", "already_applied"}:
         update["status"] = "testing"
@@ -220,8 +234,9 @@ def run_repair_verification(
         "verification": summary.model_dump(mode="json"),
     }
     if summary.outcome == "passed":
-        cumulative = applier.persist_first_cumulative_diff(
+        cumulative = applier.persist_cumulative_diff(
             run_id=state["run_id"],
+            workspace=Path(state["workspace_path"]),
             reference=CandidatePatchReference.model_validate(state["candidate_artifact"]),
         )
         update.update(
@@ -236,7 +251,7 @@ def run_repair_verification(
             }
         )
     elif summary.outcome == "failed":
-        update["status"] = "verification_failed"
+        update["status"] = "diagnosing"
     elif summary.outcome == "timeout":
         update["status"] = "budget_exceeded"
         update["error_kind"] = "verification_timeout"
@@ -246,11 +261,70 @@ def run_repair_verification(
     return update
 
 
+def route_after_repair_verification(state: RunState) -> str:
+    """Create a Diagnosis only for a failed Repair Attempt with budget remaining."""
+    if state["status"] == "diagnosing":
+        return "diagnose"
+    return "end"
+
+
+def create_diagnosis(state: RunState, diagnostician: Diagnostician) -> RunState:
+    """Persist one typed Diagnosis against the current failing Run Workspace."""
+    verification = RepairVerificationSummary.model_validate(state["verification"])
+    current_diagnosis_reference = (
+        DiagnosisArtifactReference.model_validate(state["diagnosis_artifact"])
+        if "diagnosis_artifact" in state
+        else None
+    )
+    result = diagnostician.create_once(
+        run_id=state["run_id"],
+        workspace=Path(state["workspace_path"]),
+        issue=state["issue"],
+        plan_reference=PlanArtifactReference.model_validate(state["plan_artifact"]),
+        verification=verification,
+        expected_reference=(
+            current_diagnosis_reference
+            if current_diagnosis_reference is not None
+            and current_diagnosis_reference.path
+            == f"attempts/{verification.attempt}/diagnosis.json"
+            else None
+        ),
+    )
+    update: RunState = {
+        "diagnosis_artifact": result.reference.model_dump(mode="json"),
+        "model_requests": state["model_requests"] + result.artifact.model_requests,
+        "tool_executions": state["tool_executions"] + result.artifact.tool_executions,
+        "files_read": sorted(set(state["files_read"]) | set(result.artifact.files_read)),
+    }
+    if verification.attempt >= 3:
+        update.update(
+            {
+                "status": "attempts_exhausted",
+                "report": {
+                    "success": False,
+                    "phase": "attempts_exhausted",
+                    "note": "Three approved Repair Attempts failed Verification.",
+                },
+            }
+        )
+    else:
+        update["status"] = "diagnosed"
+    return update
+
+
+def route_after_diagnosis(state: RunState) -> str:
+    """Stop after the third Diagnosis; otherwise propose the next Candidate Patch."""
+    if state["status"] == "attempts_exhausted":
+        return "end"
+    return "candidate"
+
+
 def build_graph(
     *,
     baseline_verifier: BaselineVerifier,
     planner: Planner,
     candidate_builder: CandidatePatchBuilder,
+    diagnostician: Diagnostician,
     patch_applier: PatchApplier,
     repair_verifier: RepairVerifier,
     checkpointer: BaseCheckpointSaver | None = None,
@@ -280,6 +354,10 @@ def build_graph(
         "repair_verification",
         lambda state: run_repair_verification(state, repair_verifier, patch_applier),
     )
+    builder.add_node(
+        "create_diagnosis",
+        lambda state: create_diagnosis(state, diagnostician),
+    )
     builder.add_edge(START, "validate_input")
     builder.add_edge("validate_input", "baseline_verification")
     builder.add_conditional_edges(
@@ -300,5 +378,14 @@ def build_graph(
         route_after_apply,
         {"verify": "repair_verification", "end": END},
     )
-    builder.add_edge("repair_verification", END)
+    builder.add_conditional_edges(
+        "repair_verification",
+        route_after_repair_verification,
+        {"diagnose": "create_diagnosis", "end": END},
+    )
+    builder.add_conditional_edges(
+        "create_diagnosis",
+        route_after_diagnosis,
+        {"candidate": "create_candidate", "end": END},
+    )
     return builder.compile(checkpointer=selected_checkpointer)

@@ -1137,6 +1137,117 @@ def test_yes_cannot_skip_candidate_checksum_validation(tmp_path: Path) -> None:
     assert not (run_root / "attempts" / "1" / "apply.json").exists()
 
 
+def test_failed_first_attempt_is_diagnosed_and_second_attempt_succeeds(
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / "runs"
+    model = ScriptedModel(repair_failures=1)
+    run_result = CliRunner().invoke(
+        create_cli(model_gateway=model, data_root=data_root),
+        ["run", "cart-discount"],
+    )
+    run_identifier = _run_identifier(run_result.output)
+    run_root = data_root / run_identifier
+    plan_before = (run_root / "plan.json").read_bytes()
+
+    first_approve = CliRunner().invoke(
+        create_cli(model_gateway=model, data_root=data_root),
+        ["approve", run_identifier, "--yes"],
+    )
+
+    assert first_approve.exit_code == 0, first_approve.output
+    assert "status: pending_approval" in first_approve.output
+    assert "Repair Attempts: 1" in first_approve.output
+    assert "Model Requests: 4" in first_approve.output
+    assert "Candidate Artifact: attempts/2/candidate.json" in first_approve.output
+    assert "return subtotal - discount" in (run_root / "workspace" / "cart.py").read_text()
+    diagnosis = json.loads((run_root / "attempts" / "1" / "diagnosis.json").read_text())
+    first_preimages = (run_root / "attempts" / "1" / "preimages.json").read_bytes()
+    assert diagnosis["attempt"] == 1
+    assert diagnosis["diagnosis"]["failure_summary"]
+    assert "1 failed" in diagnosis["verification_output_excerpt"]
+    assert (run_root / "plan.json").read_bytes() == plan_before
+
+    second_approve = CliRunner().invoke(
+        create_cli(model_gateway=model, data_root=data_root),
+        ["approve", run_identifier, "--yes"],
+    )
+
+    assert second_approve.exit_code == 0, second_approve.output
+    assert "Outcome: Succeeded" in second_approve.output
+    assert "Repair Attempts: 2" in second_approve.output
+    assert "Model Requests: 4" in second_approve.output
+    assert "return subtotal * (1 - discount)" in (run_root / "workspace" / "cart.py").read_text()
+    assert (run_root / "plan.json").read_bytes() == plan_before
+    assert (run_root / "attempts" / "1" / "preimages.json").read_bytes() == first_preimages
+    assert (run_root / "attempts" / "2" / "preimages.json").is_file()
+    for attempt in (1, 2):
+        assert (run_root / "attempts" / str(attempt) / "candidate.json").is_file()
+        assert (run_root / "attempts" / str(attempt) / "candidate.diff").is_file()
+        assert (run_root / "attempts" / str(attempt) / "verification.json").is_file()
+    cumulative_diff = (run_root / "cumulative.diff").read_text()
+    assert "return sum(prices) - discount" in cumulative_diff
+    assert "return subtotal * (1 - discount)" in cumulative_diff
+
+
+def test_three_failing_attempts_are_exhausted_without_a_fourth_candidate(
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / "runs"
+    model = ScriptedModel(repair_failures=3)
+    run_result = CliRunner().invoke(
+        create_cli(model_gateway=model, data_root=data_root),
+        ["run", "cart-discount"],
+    )
+    run_identifier = _run_identifier(run_result.output)
+    run_root = data_root / run_identifier
+
+    approvals = [
+        CliRunner().invoke(
+            create_cli(model_gateway=model, data_root=data_root),
+            ["approve", run_identifier, "--yes"],
+        )
+        for _ in range(3)
+    ]
+
+    assert all(result.exit_code == 0 for result in approvals)
+    assert "Candidate Artifact: attempts/2/candidate.json" in approvals[0].output
+    assert "Candidate Artifact: attempts/3/candidate.json" in approvals[1].output
+    assert "Outcome: Attempts Exhausted" in approvals[2].output
+    assert "Repair Attempts: 3" in approvals[2].output
+    assert not (run_root / "attempts" / "4").exists()
+    assert (run_root / "attempts" / "1" / "diagnosis.json").is_file()
+    assert (run_root / "attempts" / "2" / "diagnosis.json").is_file()
+    assert (run_root / "attempts" / "3" / "diagnosis.json").is_file()
+
+
+def test_rejecting_a_follow_up_candidate_does_not_add_a_repair_attempt(
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / "runs"
+    model = ScriptedModel(repair_failures=1)
+    run_result = CliRunner().invoke(
+        create_cli(model_gateway=model, data_root=data_root),
+        ["run", "cart-discount"],
+    )
+    run_identifier = _run_identifier(run_result.output)
+    first_approve = CliRunner().invoke(
+        create_cli(model_gateway=model, data_root=data_root),
+        ["approve", run_identifier, "--yes"],
+    )
+
+    reject_result = CliRunner().invoke(
+        create_cli(model_gateway=model, data_root=data_root),
+        ["reject", run_identifier],
+    )
+
+    assert first_approve.exit_code == 0, first_approve.output
+    assert reject_result.exit_code == 0, reject_result.output
+    assert "Outcome: Rejected" in reject_result.output
+    assert "Repair Attempts: 1" in reject_result.output
+    assert not (data_root / run_identifier / "attempts" / "2" / "verification.json").exists()
+
+
 def test_model_cannot_read_an_absolute_workspace_path(tmp_path: Path) -> None:
     cli = create_cli(
         model_gateway=ScriptedModel(

@@ -1,6 +1,7 @@
 """Replay-safe host application of approved structured file replacements."""
 
 import hashlib
+import json
 import os
 import stat
 from collections.abc import Iterator
@@ -11,7 +12,11 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from patch_code_agent.candidate import CandidatePatchReference, load_candidate_patch
+from patch_code_agent.candidate import (
+    CandidatePatchReference,
+    load_candidate_patch,
+    render_unified_diff,
+)
 from patch_code_agent.inspection import WorkspaceInspector
 from patch_code_agent.sources import validate_relative_path
 
@@ -124,6 +129,10 @@ class PatchApplier:
         else:
             if persisted is not None:
                 return _replay_apply_summary(persisted, states)
+            _persist_initial_preimages(
+                attempt_root,
+                current_contents,
+            )
             changed: list[str] = []
             try:
                 for replacement in replacements:
@@ -168,23 +177,80 @@ class PatchApplier:
             observed=summary,
         )
 
-    def persist_first_cumulative_diff(
+    def persist_cumulative_diff(
         self,
         *,
         run_id: str,
+        workspace: Path,
         reference: CandidatePatchReference,
     ) -> CumulativeDiffReference:
-        """Persist the first successful Candidate diff as the initial cumulative diff."""
+        """Persist the aggregate diff from first approved preimages to current workspace."""
         candidate = load_candidate_patch(self._data_root, run_id, reference)
-        diff_bytes = candidate.diff.encode("utf-8")
+        run_root = self._data_root / run_id
+        preimages: dict[str, str] = {}
+        for attempt in range(1, candidate.artifact.attempt + 1):
+            attempt_preimages = _load_initial_preimages(run_root / "attempts" / str(attempt))
+            for relative_path, content in (attempt_preimages or {}).items():
+                preimages.setdefault(relative_path, content)
+        if not preimages:
+            cumulative = candidate.diff
+        else:
+            parts: list[str] = []
+            for relative_path, before in sorted(preimages.items()):
+                after = WorkspaceInspector(workspace).read_file(relative_path).content
+                parts.append(
+                    render_unified_diff(
+                        path=relative_path,
+                        before=before,
+                        after=after,
+                    )
+                )
+            cumulative = "".join(parts)
+        diff_bytes = cumulative.encode("utf-8")
         checksum = hashlib.sha256(diff_bytes).hexdigest()
-        path = self._data_root / run_id / "cumulative.diff"
+        path = run_root / "cumulative.diff"
         if path.exists():
             if hashlib.sha256(path.read_bytes()).hexdigest() != checksum:
                 raise RuntimeError("Cumulative diff does not match the successful Candidate Patch")
         else:
             path.write_bytes(diff_bytes)
         return CumulativeDiffReference(sha256=checksum)
+
+
+def _persist_initial_preimages(attempt_root: Path, current_contents: dict[str, str]) -> None:
+    """Persist one attempt's immutable before contents prior to any workspace write."""
+    artifact_path = attempt_root / "preimages.json"
+    completion_path = attempt_root / ".preimages-complete"
+    existing = _load_initial_preimages(attempt_root)
+    artifact_bytes = (json.dumps(current_contents, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    checksum = hashlib.sha256(artifact_bytes).hexdigest()
+    if existing is not None:
+        if existing != current_contents:
+            raise RuntimeError("Attempt preimages do not match their immutable artifact")
+        return
+    artifact_path.write_bytes(artifact_bytes)
+    completion_path.write_text(checksum + "\n", encoding="utf-8")
+
+
+def _load_initial_preimages(attempt_root: Path) -> dict[str, str] | None:
+    artifact_path = attempt_root / "preimages.json"
+    completion_path = attempt_root / ".preimages-complete"
+    if not artifact_path.exists() and not completion_path.exists():
+        return None
+    if not artifact_path.is_file() or not completion_path.is_file():
+        raise RuntimeError("Attempt preimages have an incomplete replay ledger")
+    artifact_bytes = artifact_path.read_bytes()
+    if (
+        completion_path.read_text(encoding="utf-8").strip()
+        != hashlib.sha256(artifact_bytes).hexdigest()
+    ):
+        raise RuntimeError("Attempt preimages do not match their completion checksum")
+    loaded = json.loads(artifact_bytes)
+    if not isinstance(loaded, dict) or not all(
+        isinstance(path, str) and isinstance(content, str) for path, content in loaded.items()
+    ):
+        raise RuntimeError("Attempt preimages have an invalid artifact schema")
+    return loaded
 
 
 def _atomic_replace_text(
