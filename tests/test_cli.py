@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -11,6 +12,7 @@ from typer.testing import CliRunner
 
 from patch_code_agent.application import PatchRunStatusReader
 from patch_code_agent.cli import create_cli
+from patch_code_agent.gemini import GeminiInconclusiveError
 from patch_code_agent.inspection import WorkspaceInspector
 from patch_code_agent.model import ScriptedInspectionCall, ScriptedModel
 from patch_code_agent.patching import PatchApplier
@@ -77,6 +79,21 @@ class FailingPlanModel:
 
     def create_diagnosis(self, request, tools):
         raise AssertionError("Diagnosis must not run after model failure")
+
+
+class UnavailableLiveModel:
+    model_id = "gemini-3.7-flash"
+    synthetic_only = True
+    allowed_fixture_roots = (Path(__file__).parents[1] / "examples" / "tiny_repo",)
+
+    def create_plan(self, request, tools):
+        raise GeminiInconclusiveError("simulated quota exhaustion", model_requests=1)
+
+    def create_candidate(self, request, tools):
+        raise AssertionError("Candidate must not run after provider exhaustion")
+
+    def create_diagnosis(self, request, tools):
+        raise AssertionError("Diagnosis must not run after provider exhaustion")
 
 
 class ToolBudgetModel:
@@ -347,6 +364,7 @@ def _assert_terminal_report(
         + report.artifacts.candidates
         + report.artifacts.diffs
         + report.artifacts.logs
+        + report.artifacts.model_transcripts
     )
     if report.artifacts.plan is not None:
         references.append(report.artifacts.plan)
@@ -424,6 +442,110 @@ def test_user_lists_registered_fixture_repositories(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     assert "cart-discount" in result.output
     assert "Incorrect discount calculation" in result.output
+
+
+def test_live_smoke_without_api_key_is_inconclusive_and_offline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    factory_called = False
+
+    def factory(_api_key: str, _data_root: Path):
+        nonlocal factory_called
+        factory_called = True
+        return ScriptedModel()
+
+    result = CliRunner().invoke(
+        create_cli(data_root=tmp_path / "runs", live_model_factory=factory),
+        ["live-smoke"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Live Smoke Inconclusive: GEMINI_API_KEY is not configured" in result.output
+    assert factory_called is False
+    assert not (tmp_path / "runs").exists()
+
+
+def test_live_smoke_rejects_injected_fixture_registry_before_model_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    private_fixture = tmp_path / "private-fixture"
+    bundled_fixture = Path(__file__).parents[1] / "examples" / "tiny_repo"
+    shutil.copytree(bundled_fixture, private_fixture)
+    manifest = private_fixture / "fixture.toml"
+    manifest.write_text(
+        manifest.read_text().replace("cart-discount", "private-fixture"),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("GEMINI_API_KEY", "test-only-key")
+    model = RecordingModel()
+
+    result = CliRunner().invoke(
+        create_cli(
+            data_root=tmp_path / "runs",
+            fixture_roots=(private_fixture,),
+            live_model_factory=lambda _key, _data_root: model,
+        ),
+        ["live-smoke", "private-fixture", "--yes"],
+    )
+
+    assert result.exit_code == 2
+    assert "Unknown Fixture Repository: private-fixture" in result.output
+    assert model.plan_requests == 0
+
+
+def test_live_smoke_uses_registered_fixture_without_persisting_api_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api_key = "test-only-gemini-secret"
+    monkeypatch.setenv("GEMINI_API_KEY", api_key)
+    data_root = tmp_path / "runs"
+    fixture_source = Path(__file__).parents[1] / "examples" / "tiny_repo" / "cart.py"
+    original_source = fixture_source.read_bytes()
+
+    def factory(observed_key: str, observed_data_root: Path):
+        assert observed_key == api_key
+        assert observed_data_root == data_root
+        return ScriptedModel()
+
+    result = CliRunner().invoke(
+        create_cli(data_root=data_root, live_model_factory=factory),
+        ["live-smoke", "cart-discount", "--yes"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Live Smoke Succeeded" in result.output
+    report = _assert_terminal_report(data_root, result.output, "succeeded")
+    assert report.source_kind == "fixture"
+    assert fixture_source.read_bytes() == original_source
+    for path in data_root.rglob("*"):
+        if path.is_file():
+            assert api_key.encode() not in path.read_bytes()
+
+
+def test_live_smoke_provider_unavailable_is_inconclusive_not_cli_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GEMINI_API_KEY", "test-only-key")
+    data_root = tmp_path / "runs"
+
+    result = CliRunner().invoke(
+        create_cli(
+            data_root=data_root,
+            live_model_factory=lambda _key, _data_root: UnavailableLiveModel(),
+        ),
+        ["live-smoke", "cart-discount", "--yes"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Live Smoke Inconclusive: Gemini unavailable" in result.output
+    report = _assert_terminal_report(data_root, result.output, "error")
+    assert report.error_kind == "provider_unavailable"
+    assert report.model_requests == 1
 
 
 def test_user_gets_clear_error_for_invalid_fixture_manifest(tmp_path: Path) -> None:

@@ -127,16 +127,21 @@ def _invalid_model_output(state: RunState, error: InvalidModelOutputError) -> Ru
 
 def _model_failure(state: RunState, error: ModelInvocationError) -> RunState:
     """Classify provider/transport failure separately from failed repair Verification."""
+    inconclusive = bool(getattr(error.cause, "inconclusive", False))
     return {
         "model_requests": state.get("model_requests", 0) + error.model_requests,
         "tool_executions": state.get("tool_executions", 0) + error.tool_executions,
         "files_read": sorted(set(state.get("files_read", [])) | set(error.files_read)),
         "status": "error",
-        "error_kind": "model_failure",
+        "error_kind": "provider_unavailable" if inconclusive else "model_failure",
         "report": {
             "success": False,
             "phase": "error",
-            "note": "Model infrastructure failed before valid typed output was returned.",
+            "note": (
+                "Live Smoke Run was inconclusive because Gemini was unavailable."
+                if inconclusive
+                else "Model infrastructure failed before valid typed output was returned."
+            ),
         },
     }
 

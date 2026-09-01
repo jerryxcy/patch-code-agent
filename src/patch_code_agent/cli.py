@@ -5,6 +5,7 @@ application writer after use. ``status`` intentionally takes the separate read-o
 ``run-local`` requires an explicit trust acknowledgement before repository code can execute.
 """
 
+import os
 from collections.abc import Callable
 from pathlib import Path
 from time import monotonic
@@ -19,6 +20,8 @@ from patch_code_agent.application import PatchCodeAgent, PatchRunStatus, PatchRu
 from patch_code_agent.budgets import ResourceBudgets
 from patch_code_agent.candidate import CandidatePatchReference, load_candidate_patch
 from patch_code_agent.diagnosis import DiagnosisArtifactReference, load_diagnosis_artifact
+from patch_code_agent.fixtures import bundled_fixture_roots
+from patch_code_agent.gemini import GeminiModelGateway
 from patch_code_agent.model import Diagnosis, ModelGateway, Plan, ScriptedModel
 from patch_code_agent.patching import CumulativeDiffReference
 from patch_code_agent.planning import PlanArtifactReference, load_plan_artifact
@@ -43,6 +46,7 @@ def create_cli(
     fixture_roots: tuple[Path, ...] | None = None,
     verification_timeout_seconds: float = 60.0,
     clock: Callable[[], float] = monotonic,
+    live_model_factory: Callable[[str, Path], ModelGateway] = GeminiModelGateway.from_api_key,
 ) -> typer.Typer:
     """Create the CLI with all application dependencies at one seam.
 
@@ -339,6 +343,75 @@ def create_cli(
             close_application()
 
         print_run_result(result)
+
+    @cli.command(name="live-smoke")
+    def live_smoke(
+        fixture_id: Annotated[
+            str,
+            typer.Argument(help="Registered synthetic Fixture Repository identifier."),
+        ] = "cart-discount",
+        yes: Annotated[
+            bool,
+            typer.Option("--yes", help="Approve every displayed Live Smoke Candidate."),
+        ] = False,
+    ) -> None:
+        """Run the opt-in Gemini workflow against a registered synthetic Fixture only."""
+        api_key = os.getenv("GEMINI_API_KEY", "")
+        if not api_key:
+            console.print(
+                "[yellow]Live Smoke Inconclusive: GEMINI_API_KEY is not configured.[/]"
+            )
+            return
+        try:
+            gateway = live_model_factory(api_key, selected_data_root)
+            live_application = PatchCodeAgent(
+                model_gateway=gateway,
+                data_root=selected_data_root,
+                # Live model authority is narrower than the ordinary fixture injection seam:
+                # only fixtures shipped with this package may enter provider requests.
+                fixture_roots=bundled_fixture_roots(),
+                verification_timeout_seconds=verification_timeout_seconds,
+                clock=clock,
+            )
+        except (RuntimeError, ValueError) as error:
+            console.print(f"[red]{error}[/]")
+            raise typer.Exit(code=2) from error
+        run_id = str(uuid4())
+        try:
+            result = live_application.start_patch_run(fixture_id=fixture_id, run_id=run_id)
+            while result["status"] == "pending_approval":
+                def confirm_candidate(patch_run: PatchRunStatus) -> bool:
+                    if patch_run.candidate_artifact is None or patch_run.candidate_diff is None:
+                        raise ValueError("Pending Live Smoke Run has no Candidate Patch Artifact")
+                    print_candidate_patch(
+                        patch_run.candidate_artifact,
+                        patch_run.candidate_diff,
+                    )
+                    return yes or typer.confirm(
+                        "Approve this exact Live Smoke Candidate?",
+                        default=False,
+                    )
+
+                resumed = live_application.approve_patch_run(
+                    run_id=run_id,
+                    confirm=confirm_candidate,
+                )
+                if resumed is None:
+                    console.print(
+                        "[yellow]Live Smoke cancelled; Patch Run remains pending.[/]"
+                    )
+                    return
+                result = resumed
+        except (ValueError, RuntimeError) as error:
+            console.print(f"[red]{error}[/]")
+            raise typer.Exit(code=2) from error
+        finally:
+            live_application.close()
+        print_run_result(result)
+        if result.get("error_kind") == "provider_unavailable":
+            console.print("[yellow]Live Smoke Inconclusive: Gemini unavailable.[/]")
+        elif result["status"] == "succeeded":
+            console.print("[green]Live Smoke Succeeded.[/]")
 
     @cli.command()
     def reject(

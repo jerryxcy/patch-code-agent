@@ -5,6 +5,7 @@ from collections.abc import Callable
 from pydantic import BaseModel, ValidationError
 
 from patch_code_agent.budgets import ResourceBudgetExceededError
+from patch_code_agent.model import ModelGatewayResult
 
 
 class InvalidModelOutputError(RuntimeError):
@@ -50,7 +51,7 @@ class ModelInvocationError(RuntimeError):
 
 
 def request_typed_output[StructuredModel: BaseModel](
-    request: Callable[[tuple[str, ...]], object],
+    request: Callable[[tuple[str, ...], int], object],
     schema: type[StructuredModel],
     *,
     prior_model_requests: int = 0,
@@ -58,28 +59,47 @@ def request_typed_output[StructuredModel: BaseModel](
     """Request at most twice and return the validated value plus actual request count."""
     last_error: ValidationError | None = None
     validation_errors: tuple[str, ...] = ()
-    for model_requests in (1, 2):
-        if prior_model_requests + model_requests > 8:
+    model_requests = 0
+    for _schema_attempt in range(2):
+        remaining = 8 - prior_model_requests - model_requests
+        if remaining <= 0:
             raise ResourceBudgetExceededError(
                 budget_name="model_requests",
                 budget_limit=8,
-                budget_used=prior_model_requests + model_requests - 1,
-                model_requests=model_requests - 1,
+                budget_used=8,
+                model_requests=model_requests,
             )
         try:
-            raw = request(validation_errors)
-        except ResourceBudgetExceededError:
+            raw = request(validation_errors, remaining)
+        except ResourceBudgetExceededError as error:
+            error.model_requests += model_requests
             raise
         except ValueError:
             # Host inspection-policy violations already have stable CLI errors and must not be
             # reclassified as failures of the model provider or transport.
             raise
         except Exception as error:
-            raise ModelInvocationError(error, model_requests=model_requests) from error
+            consumed = int(getattr(error, "model_requests", 1))
+            raise ModelInvocationError(
+                error,
+                model_requests=model_requests + consumed,
+            ) from error
+        if isinstance(raw, ModelGatewayResult):
+            if raw.model_requests > remaining:
+                raise ResourceBudgetExceededError(
+                    budget_name="model_requests",
+                    budget_limit=8,
+                    budget_used=8,
+                    model_requests=model_requests + remaining,
+                )
+            model_requests += raw.model_requests
+            raw = raw.output
+        else:
+            model_requests += 1
         try:
             return schema.model_validate(raw), model_requests
         except ValidationError as error:
             last_error = error
             validation_errors = (str(error)[:4096],)
     assert last_error is not None
-    raise InvalidModelOutputError(last_error, model_requests=2)
+    raise InvalidModelOutputError(last_error, model_requests=model_requests)

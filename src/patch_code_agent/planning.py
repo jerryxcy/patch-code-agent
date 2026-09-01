@@ -113,11 +113,20 @@ class Planner:
             prior_tool_executions=prior_tool_executions,
             previously_read=previously_read,
         )
-        request = PlanningRequest(issue=issue, verification=tuple(verification))
+        request = PlanningRequest(
+            issue=issue,
+            verification=tuple(verification),
+            run_id=run_id,
+        )
         try:
             plan, model_requests = request_typed_output(
-                lambda errors: self._model_gateway.create_plan(
-                    replace(request, validation_errors=errors), inspector
+                lambda errors, remaining: self._model_gateway.create_plan(
+                    replace(
+                        request,
+                        validation_errors=errors,
+                        model_requests_remaining=remaining,
+                    ),
+                    inspector,
                 ),
                 Plan,
                 prior_model_requests=prior_model_requests,

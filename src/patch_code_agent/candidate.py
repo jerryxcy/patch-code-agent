@@ -136,6 +136,7 @@ class CandidatePatchBuilder:
             plan=plan,
             editable_paths=tuple(editable_paths),
             attempt=attempt,
+            run_id=run_id,
             diagnosis=(
                 load_diagnosis_artifact(
                     self._data_root, run_id, diagnosis_reference
@@ -146,8 +147,13 @@ class CandidatePatchBuilder:
         )
         try:
             candidate, model_requests = request_typed_output(
-                lambda errors: self._model_gateway.create_candidate(
-                    replace(request, validation_errors=errors), inspector
+                lambda errors, remaining: self._model_gateway.create_candidate(
+                    replace(
+                        request,
+                        validation_errors=errors,
+                        model_requests_remaining=remaining,
+                    ),
+                    inspector,
                 ),
                 CandidatePatch,
                 prior_model_requests=prior_model_requests,

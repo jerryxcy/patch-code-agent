@@ -57,7 +57,7 @@ flowchart LR
 | **SQLite Checkpoint** | 保存 bounded control state，不保存大型輸出或原始碼 |
 | **Repository Source Adapter** | 將 bundled fixture 或明確信任的本機 repository 正規化為同一份 Patch Run input |
 | **Run Workspace** | 每個 Patch Run 的獨立副本；Repository Source 永不回寫 |
-| **Run Artifacts** | 保存 Plan、Diagnosis、diff、完整 Verification logs 與 Run Report |
+| **Run Artifacts** | 保存 Plan、Diagnosis、model transcripts、diff、完整 Verification logs 與 Run Report |
 
 完整狀態機、工具與信任邊界、Approval/replay safety、Resource Budgets、artifact layout 與
 Run Report schema 見 [docs/design.md](./docs/design.md)。單一決策的理由則記在
@@ -107,12 +107,28 @@ uv run patch-code-agent run-local /path/to/repository \
 path containment 不是 hostile-code sandbox。Trusted Repository 內容不會送進 Gemini free tier。
 Run storage 固定在來源樹外；任何自訂 data root 與 Repository Source 重疊時都會被拒絕。
 
+Gemini Live Smoke 是選用測試，只能對 registry 中的 synthetic Fixture 執行。一般 pytest、Ruff
+與 CLI 流程完全離線，不需要 API key。需要驗證真實模型整合時，先安裝 optional dependency，
+再透過環境變數提供 AI Studio key：
+
+```bash
+uv sync --extra gemini
+uv run patch-code-agent live-smoke cart-discount --yes
+```
+
+`GEMINI_API_KEY` 只交給 Gemini client boundary，不會寫入 checkpoint、Run Events、artifacts、
+Run Report 或 Verification environment。未設定 key，或遇到 quota、429／暫時不可用時，命令會回報
+`Live Smoke Inconclusive`，不會讓 required test suite 失敗。Live Smoke 仍會顯示 exact Candidate；
+省略 `--yes` 時必須由使用者互動核准。每個實際 provider request（包含 retry）的 credential-free
+transcript 會保存在該 run 的 `model-transcripts/*.jsonl`，方便檢查 tool calls 與 typed output。
+
 目前可用的 CLI：
 
 ```text
 patch-code-agent fixtures
 patch-code-agent run cart-discount
 patch-code-agent run-local <repository> --contract <contract.toml> --trust-repository
+patch-code-agent live-smoke cart-discount [--yes]
 patch-code-agent status <run-id>
 patch-code-agent approve <run-id>
 patch-code-agent approve <run-id> --yes
@@ -129,6 +145,7 @@ patch-code-agent reject <run-id>
 | `uv run pytest` | 執行 graph 與 CLI acceptance tests |
 | `uv run ruff check .` | 執行 Python lint |
 | `uv run patch-code-agent run cart-discount` | 建立隔離的 CLI smoke run |
+| `uv run patch-code-agent live-smoke cart-discount --yes` | 以 Gemini 執行 opt-in synthetic Live Smoke |
 | `uv run pytest examples/tiny_repo/test_cart.py` | 執行 fixture baseline；目前預期失敗 |
 
 ---
@@ -143,6 +160,7 @@ src/patch_code_agent/
   cli.py               Typer CLI 與 Rich 輸出
   diagnosis.py         typed Diagnosis、failure evidence 與 replay ledger
   fixtures/            Fixture manifest validation 與 registry
+  gemini.py             Gemini 3.7 Flash transport、tool loop、retry 與 Live Smoke gateway
   graph.py             LangGraph nodes、edges 與 checkpoint 組裝
   inspection.py        bounded list、read、search 與 workspace 安全規則
   locking.py           mutating CLI commands 的 per-run exclusive lock
@@ -155,6 +173,7 @@ src/patch_code_agent/
 
 tests/
   test_cli.py          Registry、workspace、baseline outcomes、artifacts 與 durable status
+  test_gemini.py       Gemini transport contract、tool circulation、retry 與 request budget
   test_graph.py        Graph smoke test
 
 examples/tiny_repo/

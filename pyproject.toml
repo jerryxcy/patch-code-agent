@@ -17,6 +17,11 @@ dependencies = [
 [project.scripts]
 patch-code-agent = "patch_code_agent.cli:app"
 
+[project.optional-dependencies]
+gemini = [
+    "google-genai>=2.21.0",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=8.3",

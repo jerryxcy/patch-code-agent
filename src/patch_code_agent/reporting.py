@@ -84,6 +84,7 @@ class ArtifactInventory(BaseModel):
     candidates: tuple[ArtifactReference, ...]
     diffs: tuple[ArtifactReference, ...]
     logs: tuple[ArtifactReference, ...]
+    model_transcripts: tuple[ArtifactReference, ...] = ()
     cumulative_diff: ArtifactReference | None
 
 
@@ -251,6 +252,11 @@ class RunAuditStore:
                 candidates=self._attempt_references(run_root, "candidate.json"),
                 diffs=self._attempt_references(run_root, "candidate.diff"),
                 logs=logs,
+                model_transcripts=self._directory_references(
+                    run_root,
+                    "model-transcripts",
+                    "*.jsonl",
+                ),
                 cumulative_diff=self._optional_reference(
                     run_root / "cumulative.diff", run_root
                 ),
@@ -323,6 +329,22 @@ class RunAuditStore:
             if reference is not None:
                 references.append(reference)
         return tuple(references)
+
+    def _directory_references(
+        self,
+        run_root: Path,
+        directory: str,
+        pattern: str,
+    ) -> tuple[ArtifactReference, ...]:
+        """Reference matching regular files in stable path order."""
+        root = run_root / directory
+        if not root.is_dir():
+            return ()
+        return tuple(
+            self._reference(path, run_root)
+            for path in sorted(root.glob(pattern))
+            if path.is_file()
+        )
 
     @staticmethod
     def _reference(path: Path, run_root: Path) -> ArtifactReference:
