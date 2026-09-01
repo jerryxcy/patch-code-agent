@@ -9,6 +9,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from patch_code_agent.diagnosis import DiagnosisArtifactReference, load_diagnosis_artifact
 from patch_code_agent.inspection import WorkspaceInspector
 from patch_code_agent.model import CandidatePatch, CandidateRequest, ModelGateway
 from patch_code_agent.planning import PlanArtifactReference, load_plan_artifact
@@ -100,6 +101,7 @@ class CandidatePatchBuilder:
         protected_paths: list[str] | tuple[str, ...] = (),
         plan_reference: PlanArtifactReference,
         attempt: int,
+        diagnosis_reference: DiagnosisArtifactReference | None = None,
         expected_reference: CandidatePatchReference | None = None,
     ) -> CandidatePatchResult:
         """Create one Candidate Patch or load the completed artifact during graph replay."""
@@ -121,6 +123,13 @@ class CandidatePatchBuilder:
             plan=plan,
             editable_paths=tuple(editable_paths),
             attempt=attempt,
+            diagnosis=(
+                load_diagnosis_artifact(
+                    self._data_root, run_id, diagnosis_reference
+                ).artifact.diagnosis
+                if diagnosis_reference is not None
+                else None
+            ),
         )
         raw_candidate = self._model_gateway.create_candidate(request, inspector)
         candidate = CandidatePatch.model_validate(raw_candidate)
@@ -211,22 +220,18 @@ def _validate_and_diff(
         current = WorkspaceInspector(workspace).read_file(replacement.path).content
         current_hash = hashlib.sha256(current.encode("utf-8")).hexdigest()
         if current_hash != replacement.expected_sha256:
-            raise ValueError(
-                f"Run Workspace changed after the model read: {replacement.path}"
-            )
+            raise ValueError(f"Run Workspace changed after the model read: {replacement.path}")
         new_bytes = replacement.new_content.encode("utf-8")
         if not new_bytes:
             raise ValueError(f"Candidate Patch cannot delete file content: {replacement.path}")
         if len(new_bytes) > _MAX_REPLACEMENT_BYTES:
-            raise ValueError(
-                f"Candidate Patch replacement exceeds 100 KiB: {replacement.path}"
-            )
+            raise ValueError(f"Candidate Patch replacement exceeds 100 KiB: {replacement.path}")
         if b"\x00" in new_bytes:
             raise ValueError(f"Candidate Patch replacement must be text: {replacement.path}")
         if replacement.new_content == current:
             raise ValueError(f"Candidate Patch replacement must change content: {replacement.path}")
         diff_parts.append(
-            _unified_diff(
+            render_unified_diff(
                 path=replacement.path,
                 before=current,
                 after=replacement.new_content,
@@ -250,7 +255,7 @@ def _is_test_path(path: str) -> bool:
     )
 
 
-def _unified_diff(*, path: str, before: str, after: str) -> str:
+def render_unified_diff(*, path: str, before: str, after: str) -> str:
     """Return an applicable unified diff, including missing-newline markers."""
     rendered: list[str] = []
     for line in difflib.unified_diff(
@@ -272,7 +277,9 @@ def _load_completed_result(
     expected_reference: CandidatePatchReference | None,
 ) -> CandidatePatchResult:
     if not paths.candidate.is_file() or not paths.diff.is_file() or not paths.completion.is_file():
-        raise RuntimeError("Candidate Patch has an incomplete replay ledger; refusing a new request")
+        raise RuntimeError(
+            "Candidate Patch has an incomplete replay ledger; refusing a new request"
+        )
     artifact_bytes = paths.candidate.read_bytes()
     diff_bytes = paths.diff.read_bytes()
     artifact = CandidatePatchArtifact.model_validate_json(artifact_bytes)

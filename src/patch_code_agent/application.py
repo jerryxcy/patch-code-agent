@@ -23,6 +23,12 @@ from patch_code_agent.candidate import (
     CandidatePatchReference,
     load_candidate_patch,
 )
+from patch_code_agent.diagnosis import (
+    DiagnosisArtifact,
+    DiagnosisArtifactReference,
+    Diagnostician,
+    load_diagnosis_artifact,
+)
 from patch_code_agent.fixtures import (
     FixtureRegistry,
     FixtureRepository,
@@ -70,6 +76,8 @@ class PatchRunStatus:
         candidate: Validated pending Candidate Patch artifact, when present.
         candidate_diff: Exact host-computed unified diff awaiting Approval.
         candidate_artifact: Durable paths/checksums for Candidate JSON and diff.
+        diagnosis: Latest validated failed-attempt Diagnosis artifact, when present.
+        diagnosis_artifact: Durable path/checksum reference for that Diagnosis.
         attempts: Approved and verified Repair Attempts consumed so far.
         files_changed: Stable paths changed by approved Candidate Patches.
         verification: Latest post-apply Verification summary, when present.
@@ -91,6 +99,8 @@ class PatchRunStatus:
         ...     candidate=None,
         ...     candidate_diff=None,
         ...     candidate_artifact=None,
+        ...     diagnosis=None,
+        ...     diagnosis_artifact=None,
         ...     attempts=0,
         ...     files_changed=(),
         ...     verification=None,
@@ -114,6 +124,8 @@ class PatchRunStatus:
     candidate: CandidatePatchArtifact | None
     candidate_diff: str | None
     candidate_artifact: CandidatePatchReference | None
+    diagnosis: DiagnosisArtifact | None
+    diagnosis_artifact: DiagnosisArtifactReference | None
     attempts: int
     files_changed: tuple[str, ...]
     verification: RepairVerificationSummary | None
@@ -182,6 +194,16 @@ class PatchRunStatusReader:
             if candidate_reference is not None
             else None
         )
+        diagnosis_reference = (
+            DiagnosisArtifactReference.model_validate(state["diagnosis_artifact"])
+            if "diagnosis_artifact" in state
+            else None
+        )
+        diagnosis_result = (
+            load_diagnosis_artifact(self._database_path.parent, run_id, diagnosis_reference)
+            if diagnosis_reference is not None
+            else None
+        )
         return PatchRunStatus(
             run_id=state["run_id"],
             source_kind=state["source_kind"],
@@ -196,6 +218,8 @@ class PatchRunStatusReader:
             candidate=(candidate_result.artifact if candidate_result is not None else None),
             candidate_diff=(candidate_result.diff if candidate_result is not None else None),
             candidate_artifact=candidate_reference,
+            diagnosis=(diagnosis_result.artifact if diagnosis_result is not None else None),
+            diagnosis_artifact=diagnosis_reference,
             attempts=state.get("attempt", 0),
             files_changed=tuple(state.get("files_changed", [])),
             verification=(
@@ -242,6 +266,7 @@ class PatchCodeAgent:
         )
         self._planner = Planner(self._data_root, model_gateway)
         self._candidate_builder = CandidatePatchBuilder(self._data_root, model_gateway)
+        self._diagnostician = Diagnostician(self._data_root, model_gateway)
         self._patch_applier = PatchApplier(self._data_root)
         self._repair_verifier = RepairVerifier(
             self._data_root,
@@ -376,6 +401,7 @@ class PatchCodeAgent:
                 baseline_verifier=self._baseline_verifier,
                 planner=self._planner,
                 candidate_builder=self._candidate_builder,
+                diagnostician=self._diagnostician,
                 patch_applier=self._patch_applier,
                 repair_verifier=self._repair_verifier,
                 checkpointer=checkpointer,

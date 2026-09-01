@@ -13,8 +13,9 @@ exact diff、保存 immutable Candidate Patch Artifact，再以 LangGraph interr
 Approval Gate。另一個 CLI process 可在 per-run exclusive lock 下核准或拒絕 Candidate；核准路徑
 會重驗 checksum 與 workspace preimage，以 before/after hashes replay-safe 套用，再執行並保存
 post-apply Verification。通過時形成 durable Succeeded outcome 與 cumulative diff；拒絕時 workspace
-與 Repair Attempt 均不改變。Diagnosis、多次 Repair Attempts 與完整 terminal report 仍待實作。
-驗收進度以 GitHub Issue #2 為準。
+與 Repair Attempt 均不改變。Verification failure 會保存 typed Diagnosis，保留已核准修改並產生
+相對目前 workspace 的下一份 Candidate；第三次失敗形成 Attempts Exhausted。完整 Resource
+Budget enforcement、Run Events 與 terminal report 仍待實作。驗收進度以 GitHub Issue #2 為準。
 完整 Resource Budget enforcement、typed-output correction retry 與 provider retry 分別由後續
 MVP tickets 實作；本階段只保存 planning 已實際使用的 counters。
 
@@ -131,6 +132,7 @@ Filesystem layout：
       output.log
     attempts/
       1/
+        preimages.json
         candidate.json
         candidate.diff
         verification.json

@@ -15,7 +15,8 @@ from rich.panel import Panel
 
 from patch_code_agent.application import PatchCodeAgent, PatchRunStatus, PatchRunStatusReader
 from patch_code_agent.candidate import CandidatePatchReference, load_candidate_patch
-from patch_code_agent.model import ModelGateway, Plan, ScriptedModel
+from patch_code_agent.diagnosis import DiagnosisArtifactReference, load_diagnosis_artifact
+from patch_code_agent.model import Diagnosis, ModelGateway, Plan, ScriptedModel
 from patch_code_agent.patching import CumulativeDiffReference
 from patch_code_agent.planning import PlanArtifactReference, load_plan_artifact
 from patch_code_agent.sources import RepositorySourceKind
@@ -94,6 +95,15 @@ def create_cli(
         console.print(f"[dim]Candidate Diff:[/] {reference.diff_path}")
         console.print(f"[dim]Diff Checksum:[/] {reference.diff_sha256}", soft_wrap=True)
 
+    def print_diagnosis(
+        reference: DiagnosisArtifactReference,
+        diagnosis: Diagnosis,
+    ) -> None:
+        """Render the one canonical CLI view of a failed-attempt Diagnosis."""
+        console.print(f"[dim]Diagnosis Artifact:[/] {reference.path}")
+        console.print(f"[dim]Failure:[/] {diagnosis.failure_summary}")
+        console.print(f"[dim]Next Repair:[/] {diagnosis.next_strategy}")
+
     def outcome_label(status: str) -> str | None:
         """Translate terminal internal states into stable CLI outcome labels."""
         return {
@@ -102,6 +112,7 @@ def create_cli(
             "error": "Error",
             "rejected": "Rejected",
             "workspace_changed": "Workspace Changed",
+            "attempts_exhausted": "Attempts Exhausted",
             "succeeded": "Succeeded",
         }.get(status)
 
@@ -149,6 +160,14 @@ def create_cli(
                 candidate_reference,
             )
             print_candidate_patch(candidate_reference, candidate.diff)
+        if raw_diagnosis_reference := result.get("diagnosis_artifact"):
+            diagnosis_reference = DiagnosisArtifactReference.model_validate(raw_diagnosis_reference)
+            diagnosis = load_diagnosis_artifact(
+                selected_data_root,
+                result["run_id"],
+                diagnosis_reference,
+            ).artifact.diagnosis
+            print_diagnosis(diagnosis_reference, diagnosis)
         console.print(f"[dim]Run Identifier:[/] {result['run_id']}")
         console.print(f"[dim]{source_label(result['source_kind'])}:[/] {result['source_id']}")
         console.print(f"[dim]Source Revision:[/] {result['source_revision']}", soft_wrap=True)
@@ -233,6 +252,11 @@ def create_cli(
             )
             for label, value in _plan_lines(patch_run.plan):
                 console.print(f"[dim]{label}:[/] {value}")
+        if patch_run.diagnosis is not None and patch_run.diagnosis_artifact is not None:
+            print_diagnosis(
+                patch_run.diagnosis_artifact,
+                patch_run.diagnosis.diagnosis,
+            )
         if (
             patch_run.candidate is not None
             and patch_run.candidate_diff is not None
@@ -310,7 +334,10 @@ def create_cli(
         if result is None:
             console.print("[yellow]Approval cancelled; Patch Run remains pending.[/]")
             return
-        print_run_result(result, display_candidate=False)
+        print_run_result(
+            result,
+            display_candidate=result["status"] == "pending_approval",
+        )
 
     @cli.command(name="run-local")
     def run_local(

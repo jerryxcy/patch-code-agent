@@ -16,8 +16,9 @@ Candidate Patch 與 Diagnosis。
 > 再跨程序停在 Approval Gate；此時 workspace 尚未修改。另一個 CLI process 可以取得 per-run
 > exclusive lock 後核准或拒絕 Candidate。核准時會再次顯示 exact diff 與 checksum，以 replay-safe
 > before/after hash 規則套用修改，執行 post-apply Verification，並在成功時保存 cumulative diff；
-> 拒絕則不修改 workspace、也不消耗 Repair Attempt。Diagnosis、多次 Repair Attempts 與完整
-> Run Report 仍是後續 MVP 功能。
+> Verification 失敗時會保留已核准修改、保存 typed Diagnosis，再提出相對目前 workspace 的
+> 增量 Candidate，最多三次 Repair Attempts；拒絕則不修改 workspace、也不消耗 Repair Attempt。
+> 完整 Resource Budgets、Run Events 與 Run Report 仍是後續 MVP 功能。
 
 完整的 MVP implementation 與 acceptance spec 見
 [GitHub Issue #2](https://github.com/jerryxcy/patch-code-agent/issues/2)。
@@ -83,6 +84,8 @@ Run Artifact，尚未套用到 workspace。使用 `approve` 可再次檢視並�
 per-run lock，成功通過 Verification 後 outcome 為 `Succeeded`。Baseline 通過時結果為
 `Issue Not Reproduced`，非測試失敗的
 exit code 為 `Error`，60 秒逾時則為 `Budget Exceeded`。來源 fixture 永遠不會被修改。
+若 post-apply Verification 以 exit code 1 失敗，系統會保存完整 log 與 bounded excerpt、建立
+Diagnosis 與下一份 Candidate，重新停在 Approval Gate；第三次仍失敗則為 `Attempts Exhausted`。
 
 指定本機 Trusted Repository 時，Patch Run Contract 必須放在 repository 外面：
 
@@ -137,6 +140,7 @@ src/patch_code_agent/
   application.py       Fixture、workspace 與 checkpoint 的應用層 seam
   candidate.py         structured replacement validation、exact diff 與 replay ledger
   cli.py               Typer CLI 與 Rich 輸出
+  diagnosis.py         typed Diagnosis、failure evidence 與 replay ledger
   fixtures/            Fixture manifest validation 與 registry
   graph.py             LangGraph nodes、edges 與 checkpoint 組裝
   inspection.py        bounded list、read、search 與 workspace 安全規則

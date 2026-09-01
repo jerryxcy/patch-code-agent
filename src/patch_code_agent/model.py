@@ -10,6 +10,7 @@ from patch_code_agent.inspection import InspectionTools
 from patch_code_agent.sources import RelativeSourcePath, VerificationArgv
 
 PlanText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=4096)]
+DiagnosisText = PlanText
 ContentHash = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 
 
@@ -76,6 +77,33 @@ class CandidatePatch(BaseModel):
     replacements: tuple[FileReplacement, ...] = Field(min_length=1, max_length=3)
 
 
+class Diagnosis(BaseModel):
+    """Runtime-validated explanation of one failed Repair Attempt.
+
+    Attributes:
+        failure_summary: Concise explanation of what Verification still reports.
+        evidence: Specific bounded evidence taken from Verification or workspace inspection.
+        next_strategy: Incremental change the next Candidate Patch should make.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    failure_summary: DiagnosisText
+    evidence: DiagnosisText
+    next_strategy: DiagnosisText
+
+
+@dataclass(frozen=True, slots=True)
+class DiagnosisRequest:
+    """Bounded failure context supplied for a Diagnosis model request."""
+
+    issue: str
+    plan: Plan
+    attempt: int
+    verification_output_excerpt: str
+    verification_artifact_path: str
+
+
 @dataclass(frozen=True, slots=True)
 class CandidateRequest:
     """Context supplied for one Candidate Patch request.
@@ -88,6 +116,7 @@ class CandidateRequest:
     plan: Plan
     editable_paths: tuple[RelativeSourcePath, ...]
     attempt: int
+    diagnosis: Diagnosis | None = None
 
 
 class ModelGateway(Protocol):
@@ -102,6 +131,9 @@ class ModelGateway(Protocol):
 
     def create_candidate(self, request: CandidateRequest, tools: InspectionTools) -> object:
         """Use bounded inspection and return untrusted structured replacements."""
+
+    def create_diagnosis(self, request: DiagnosisRequest, tools: InspectionTools) -> object:
+        """Use bounded failure evidence and return an untrusted structured Diagnosis."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,6 +161,7 @@ class ScriptedModel:
         model_id: Stable adapter identifier recorded with the Plan.
         inspection_calls: Optional explicit script for security scenarios. ``None`` selects the
             normal list/read/search workflow.
+        repair_failures: Number of deterministic failing Repair Attempts before success.
 
     Example:
         >>> ScriptedModel().model_id
@@ -137,6 +170,7 @@ class ScriptedModel:
 
     model_id: str = "scripted"
     inspection_calls: tuple[ScriptedInspectionCall, ...] | None = None
+    repair_failures: int = 0
 
     def create_plan(self, request: PlanningRequest, tools: InspectionTools) -> object:
         """Perform a stable inspection script and return a schema-shaped Plan."""
@@ -175,12 +209,25 @@ class ScriptedModel:
         observed = tools.read_file(path)
         old_content = observed.content
         incorrect_line = "    return sum(prices) - discount\n"
-        corrected_lines = (
-            "    subtotal = sum(prices)\n"
-            "    return subtotal * (1 - discount)\n"
-        )
-        if incorrect_line in old_content:
+        corrected_lines = "    subtotal = sum(prices)\n    return subtotal * (1 - discount)\n"
+        corrected_return = "    return subtotal * (1 - discount)\n"
+        failed_line = "    return subtotal - discount\n"
+        if request.attempt <= self.repair_failures:
+            if incorrect_line in old_content:
+                new_content = old_content.replace(
+                    incorrect_line,
+                    "    subtotal = sum(prices)\n" + failed_line,
+                    1,
+                )
+            else:
+                separator = "" if old_content.endswith("\n") else "\n"
+                new_content = (
+                    f"{old_content}{separator}# Scripted failing attempt {request.attempt}\n"
+                )
+        elif incorrect_line in old_content:
             new_content = old_content.replace(incorrect_line, corrected_lines, 1)
+        elif failed_line in old_content:
+            new_content = old_content.replace(failed_line, corrected_return, 1)
         else:
             separator = "" if old_content.endswith("\n") else "\n"
             new_content = f"{old_content}{separator}# Scripted Candidate Patch\n"
@@ -192,4 +239,15 @@ class ScriptedModel:
                     "new_content": new_content,
                 }
             ]
+        }
+
+    def create_diagnosis(self, request: DiagnosisRequest, tools: InspectionTools) -> object:
+        """Inspect the current failing state and explain the next incremental repair."""
+        listed = tools.list_files()
+        editable = next((path for path in listed.paths if path.endswith(".py")), "cart.py")
+        observed = tools.read_file(editable)
+        return {
+            "failure_summary": f"Repair Attempt {request.attempt} still fails Verification.",
+            "evidence": request.verification_output_excerpt or observed.content[:256],
+            "next_strategy": "Correct the remaining calculation in the current workspace state.",
         }

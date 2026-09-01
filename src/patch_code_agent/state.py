@@ -23,6 +23,9 @@ RunStatus = Literal[
     "rejected",
     "workspace_changed",
     "verification_failed",
+    "diagnosing",
+    "diagnosed",
+    "attempts_exhausted",
     "succeeded",
     "editing",
     "testing",
@@ -59,6 +62,7 @@ class RunState(TypedDict, total=False):
         approval_decision: Durable decision returned when the Approval Gate resumes.
         apply_summary: Replay-safe before/after classification for the approved Candidate Patch.
         verification: Bounded post-apply Verification summary for the current Repair Attempt.
+        diagnosis_artifact: Path/checksum reference for the latest failed-attempt Diagnosis.
         files_changed: Stable paths changed by approved Candidate Patches.
         cumulative_diff: Path/checksum reference for the aggregate workspace repair.
         error_kind: Stable machine-readable terminal error category, when applicable.
@@ -102,6 +106,7 @@ class RunState(TypedDict, total=False):
     approval_decision: Literal["approve", "reject"]
     apply_summary: dict[str, object]
     verification: dict[str, object]
+    diagnosis_artifact: dict[str, object]
     files_changed: list[str]
     cumulative_diff: dict[str, object]
     error_kind: str
