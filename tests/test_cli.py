@@ -13,6 +13,7 @@ from patch_code_agent.cli import create_cli
 from patch_code_agent.inspection import WorkspaceInspector
 from patch_code_agent.model import ScriptedInspectionCall, ScriptedModel
 from patch_code_agent.patching import PatchApplier
+from patch_code_agent.verification import BaselineVerifier
 
 
 class RecordingModel:
@@ -1931,6 +1932,27 @@ editable_paths = ["cart.py"]
     status = CliRunner().invoke(status_cli, ["status", run_identifier])
     assert status.exit_code == 0, status.output
     assert "Phase: error" in status.output
+
+
+def test_baseline_verification_infrastructure_failure_is_a_stable_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_verification(*args, **kwargs):
+        raise OSError("simulated Verification artifact outage")
+
+    monkeypatch.setattr(BaselineVerifier, "verify", fail_verification)
+
+    result = CliRunner().invoke(
+        create_cli(model_gateway=ScriptedModel(), data_root=tmp_path / "runs"),
+        ["run", "cart-discount"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Outcome: Error" in result.output
+    assert "Error Kind: verification_failure" in result.output
+    assert "Model Requests: 0" in result.output
+    assert "Repair Attempts: 0" in result.output
 
 
 def test_repair_verification_infrastructure_error_is_not_attempts_exhausted(

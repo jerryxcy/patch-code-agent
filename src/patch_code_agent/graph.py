@@ -186,11 +186,17 @@ def run_baseline_verification(state: RunState, verifier: BaselineVerifier) -> Ru
     The full process output stays in Run Artifacts. Only the verifier's bounded Pydantic summary
     enters state, and the outcome is converted into the domain-level status used for routing.
     """
-    summary = verifier.verify(
-        run_id=state["run_id"],
-        workspace=Path(state["workspace_path"]),
-        argv=state["verification_argv"],
-    )
+    try:
+        summary = verifier.verify(
+            run_id=state["run_id"],
+            workspace=Path(state["workspace_path"]),
+            argv=state["verification_argv"],
+        )
+    except (OSError, RuntimeError):
+        return _infrastructure_failure(
+            "verification_failure",
+            "Baseline Verification infrastructure failed before a result was persisted.",
+        )
     update: RunState = {
         "baseline_verification": summary.model_dump(mode="json"),
         "status": _BASELINE_STATUS[summary.outcome],

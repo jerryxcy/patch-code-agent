@@ -207,8 +207,10 @@ def create_cli(
         console.print(f"[dim]Run Identifier:[/] {result['run_id']}")
         console.print(f"[dim]{source_label(result['source_kind'])}:[/] {result['source_id']}")
         console.print(f"[dim]Source Revision:[/] {result['source_revision']}", soft_wrap=True)
-        baseline = result["baseline_verification"]
-        console.print(f"[dim]Baseline Verification:[/] {baseline['outcome']}")
+        if baseline := result.get("baseline_verification"):
+            console.print(f"[dim]Baseline Verification:[/] {baseline['outcome']}")
+        else:
+            console.print("[dim]Baseline Verification:[/] unavailable")
         if outcome := outcome_label(result["status"]):
             console.print(f"[dim]Outcome:[/] {outcome}")
         console.print(f"[dim]Model Requests:[/] {result['model_requests']}")

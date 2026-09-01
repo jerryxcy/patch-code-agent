@@ -136,10 +136,14 @@ class WorkspaceInspector:
 
         output = bytearray()
         truncated = False
-        for relative in self._visible_text_paths():
+        for relative in self._visible_regular_paths():
             _, candidate = self._resolve_regular_file(relative)
             self._claim_file_read(relative)
-            for line_number, line in enumerate(self._read_text(candidate).splitlines(), 1):
+            try:
+                content = self._read_text(candidate)
+            except ValueError:
+                continue
+            for line_number, line in enumerate(content.splitlines(), 1):
                 if query not in line:
                     continue
                 encoded = f"{relative}:{line_number}:{line}\n".encode()
@@ -177,15 +181,22 @@ class WorkspaceInspector:
 
     def _visible_text_paths(self) -> list[str]:
         paths: list[str] = []
+        for relative in self._visible_regular_paths():
+            candidate = self._workspace.joinpath(*PurePosixPath(relative).parts)
+            try:
+                self._read_text(candidate)
+            except ValueError:
+                continue
+            paths.append(relative)
+        return paths
+
+    def _visible_regular_paths(self) -> list[str]:
+        paths: list[str] = []
         for candidate in self._workspace.rglob("*"):
             relative_path = candidate.relative_to(self._workspace)
             if is_ignored_source_path(relative_path) or self._has_symlink_segment(relative_path):
                 continue
             if not candidate.is_file() or candidate.stat().st_size > _MAX_FILE_BYTES:
-                continue
-            try:
-                self._read_text(candidate)
-            except ValueError:
                 continue
             paths.append(relative_path.as_posix())
         return sorted(paths)
