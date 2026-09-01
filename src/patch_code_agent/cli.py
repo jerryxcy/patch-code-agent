@@ -5,7 +5,9 @@ application writer after use. ``status`` intentionally takes the separate read-o
 ``run-local`` requires an explicit trust acknowledgement before repository code can execute.
 """
 
+from collections.abc import Callable
 from pathlib import Path
+from time import monotonic
 from typing import Annotated, assert_never, cast
 from uuid import uuid4
 
@@ -14,6 +16,7 @@ from rich.console import Console
 from rich.panel import Panel
 
 from patch_code_agent.application import PatchCodeAgent, PatchRunStatus, PatchRunStatusReader
+from patch_code_agent.budgets import ResourceBudgets
 from patch_code_agent.candidate import CandidatePatchReference, load_candidate_patch
 from patch_code_agent.diagnosis import DiagnosisArtifactReference, load_diagnosis_artifact
 from patch_code_agent.model import Diagnosis, ModelGateway, Plan, ScriptedModel
@@ -39,6 +42,7 @@ def create_cli(
     data_root: Path | None = None,
     fixture_roots: tuple[Path, ...] | None = None,
     verification_timeout_seconds: float = 60.0,
+    clock: Callable[[], float] = monotonic,
 ) -> typer.Typer:
     """Create the CLI with all application dependencies at one seam.
 
@@ -67,6 +71,7 @@ def create_cli(
                 data_root=selected_data_root,
                 fixture_roots=fixture_roots,
                 verification_timeout_seconds=verification_timeout_seconds,
+                clock=clock,
             )
         return cast(PatchCodeAgent, application)
 
@@ -136,6 +141,37 @@ def create_cli(
         if error_kind is not None:
             console.print(f"[dim]Error Kind:[/] {error_kind}")
 
+    def print_budgets(budgets: ResourceBudgets) -> None:
+        """Render every Resource Budget as durable used/limit values."""
+        console.print(
+            f"[dim]Repair Attempts Budget:[/] "
+            f"{budgets.repair_attempts.used}/{budgets.repair_attempts.limit}"
+        )
+        console.print(
+            f"[dim]Distinct Files Read Budget:[/] "
+            f"{budgets.files_read.used}/{budgets.files_read.limit}"
+        )
+        console.print(
+            f"[dim]Files Changed Budget:[/] "
+            f"{budgets.files_changed.used}/{budgets.files_changed.limit}"
+        )
+        console.print(
+            f"[dim]Tool Executions Budget:[/] "
+            f"{budgets.tool_executions.used}/{budgets.tool_executions.limit}"
+        )
+        console.print(
+            f"[dim]Model Requests Budget:[/] "
+            f"{budgets.model_requests.used}/{budgets.model_requests.limit}"
+        )
+        console.print(
+            f"[dim]Verification Seconds Budget:[/] "
+            f"{budgets.verification_seconds.used:.3f}/{budgets.verification_seconds.limit:.1f}"
+        )
+        console.print(
+            f"[dim]Active Seconds Budget:[/] "
+            f"{budgets.active_seconds.used:.3f}/{budgets.active_seconds.limit:.1f}"
+        )
+
     def print_run_result(result: RunState, *, display_candidate: bool = True) -> None:
         """Render fields that exist on either planning or terminal graph branches.
 
@@ -180,6 +216,7 @@ def create_cli(
         console.print(f"[dim]Files Read:[/] {len(result.get('files_read', []))}")
         console.print(f"[dim]Repair Attempts:[/] {result.get('attempt', 0)}")
         console.print(f"[dim]Files Changed:[/] {len(result.get('files_changed', []))}")
+        print_budgets(ResourceBudgets.from_state(result))
         verification = result.get("verification")
         print_repair_details(
             verification_outcome=(verification.get("outcome") if verification else None),
@@ -191,6 +228,11 @@ def create_cli(
             ),
             error_kind=result.get("error_kind"),
         )
+        if budget_name := result.get("budget_name"):
+            console.print(f"[dim]Budget:[/] {budget_name}")
+            console.print(
+                f"[dim]Budget Usage:[/] {result.get('budget_used')}/{result.get('budget_limit')}"
+            )
         console.print(f"[dim]status:[/] {result['status']}")
 
     @cli.callback()
@@ -234,6 +276,7 @@ def create_cli(
         console.print(f"[dim]Files Read:[/] {len(patch_run.files_read)}")
         console.print(f"[dim]Repair Attempts:[/] {patch_run.attempts}")
         console.print(f"[dim]Files Changed:[/] {len(patch_run.files_changed)}")
+        print_budgets(patch_run.budgets)
         print_repair_details(
             verification_outcome=(
                 patch_run.verification.outcome if patch_run.verification is not None else None
@@ -244,6 +287,9 @@ def create_cli(
             cumulative_diff=patch_run.cumulative_diff,
             error_kind=patch_run.error_kind,
         )
+        if patch_run.budget_name is not None:
+            console.print(f"[dim]Budget:[/] {patch_run.budget_name}")
+            console.print(f"[dim]Budget Usage:[/] {patch_run.budget_used}/{patch_run.budget_limit}")
         if patch_run.plan is not None and patch_run.plan_artifact is not None:
             console.print(f"[dim]Plan Artifact:[/] {patch_run.plan_artifact.path}")
             console.print(

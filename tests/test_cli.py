@@ -61,6 +61,150 @@ class InvalidPlanModel:
         return {"issue_summary": "Missing required Plan fields"}
 
 
+class FailingPlanModel:
+    model_id = "failing-plan"
+
+    def create_plan(self, request, tools):
+        tools.list_files()
+        raise RuntimeError("simulated provider outage")
+
+    def create_candidate(self, request, tools):
+        raise AssertionError("Candidate generation must not run after model failure")
+
+    def create_diagnosis(self, request, tools):
+        raise AssertionError("Diagnosis must not run after model failure")
+
+
+class ToolBudgetModel:
+    model_id = "tool-budget"
+
+    def create_plan(self, request, tools):
+        for _ in range(21):
+            tools.list_files()
+        return {
+            "issue_summary": "Exhaust tool operations",
+            "relevant_files": ["cart.py"],
+            "repair_strategy": "No repair should be generated.",
+            "verification_strategy": "Run the declared Verification.",
+        }
+
+    def create_candidate(self, request, tools):
+        return ScriptedModel().create_candidate(request, tools)
+
+    def create_diagnosis(self, request, tools):
+        return ScriptedModel().create_diagnosis(request, tools)
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class SlowPlanModel:
+    model_id = "slow-plan"
+
+    def __init__(self, clock: FakeClock) -> None:
+        self.clock = clock
+
+    def create_plan(self, request, tools):
+        result = ScriptedModel().create_plan(request, tools)
+        self.clock.advance(301.0)
+        return result
+
+    def create_candidate(self, request, tools):
+        return ScriptedModel().create_candidate(request, tools)
+
+    def create_diagnosis(self, request, tools):
+        return ScriptedModel().create_diagnosis(request, tools)
+
+
+class FilesReadBudgetModel:
+    model_id = "files-read-budget"
+
+    def create_plan(self, request, tools):
+        paths = tools.list_files().paths
+        for path in paths[:13]:
+            tools.read_file(path)
+        return {
+            "issue_summary": "Read too many distinct files",
+            "relevant_files": ["cart.py"],
+            "repair_strategy": "No repair should be generated.",
+            "verification_strategy": "Run the declared Verification.",
+        }
+
+    def create_candidate(self, request, tools):
+        return ScriptedModel().create_candidate(request, tools)
+
+    def create_diagnosis(self, request, tools):
+        return ScriptedModel().create_diagnosis(request, tools)
+
+
+class CumulativeFilesChangedBudgetModel:
+    model_id = "cumulative-files-changed-budget"
+
+    def create_plan(self, request, tools):
+        return {
+            "issue_summary": "Change too many files across Repair Attempts",
+            "relevant_files": ["file0.py"],
+            "repair_strategy": "Apply bounded groups of complete replacements.",
+            "verification_strategy": "Run the declared Verification.",
+        }
+
+    def create_candidate(self, request, tools):
+        paths = request.editable_paths[:3] if request.attempt == 1 else request.editable_paths[3:4]
+        replacements = []
+        for path in paths:
+            observed = tools.read_file(path)
+            replacements.append(
+                {
+                    "path": path,
+                    "expected_sha256": hashlib.sha256(observed.content.encode()).hexdigest(),
+                    "new_content": observed.content + f"# attempt {request.attempt}\n",
+                }
+            )
+        return {"replacements": replacements}
+
+    def create_diagnosis(self, request, tools):
+        return {
+            "failure_summary": "The prior candidate did not satisfy Verification.",
+            "evidence": request.verification_output_excerpt or "exit code 1",
+            "next_strategy": "Try the remaining editable file.",
+        }
+
+
+class CorrectedEveryOutputModel:
+    model_id = "corrected-every-output"
+
+    def __init__(self) -> None:
+        self.delegate = ScriptedModel(repair_failures=3)
+        self.calls = {"plan": 0, "candidate": 0, "diagnosis": 0}
+
+    def _needs_correction(self, phase: str) -> bool:
+        self.calls[phase] += 1
+        return self.calls[phase] % 2 == 1
+
+    def create_plan(self, request, tools):
+        if self._needs_correction("plan"):
+            return {}
+        return self.delegate.create_plan(request, tools)
+
+    def create_candidate(self, request, tools):
+        if self._needs_correction("candidate"):
+            return {}
+        return self.delegate.create_candidate(request, tools)
+
+    def create_diagnosis(self, request, tools):
+        if self._needs_correction("diagnosis"):
+            return {}
+        return self.delegate.create_diagnosis(request, tools)
+
+
 class CandidateScenarioModel:
     model_id = "candidate-scenario"
 
@@ -435,6 +579,189 @@ def test_run_pauses_with_an_immutable_candidate_patch_visible_from_status(
     assert "Repair Attempts: 0" in status_result.output
 
 
+def test_status_displays_independent_resource_budget_usage(tmp_path: Path) -> None:
+    data_root = tmp_path / "runs"
+    run_result = CliRunner().invoke(
+        create_cli(model_gateway=ScriptedModel(), data_root=data_root),
+        ["run", "cart-discount"],
+    )
+    run_identifier = _run_identifier(run_result.output)
+
+    status_result = CliRunner().invoke(
+        create_cli(model_gateway=ScriptedModel(), data_root=data_root),
+        ["status", run_identifier],
+    )
+
+    assert status_result.exit_code == 0, status_result.output
+    assert "Repair Attempts Budget: 0/3" in status_result.output
+    assert "Distinct Files Read Budget: 2/12" in status_result.output
+    assert "Files Changed Budget: 0/3" in status_result.output
+    assert "Tool Executions Budget: 5/20" in status_result.output
+    assert "Model Requests Budget: 2/8" in status_result.output
+    assert "Verification Seconds Budget:" in status_result.output
+    assert "/60.0" in status_result.output
+    assert "Active Seconds Budget:" in status_result.output
+    assert "/300.0" in status_result.output
+
+
+def test_tool_execution_budget_exceeded_names_limit_and_usage(tmp_path: Path) -> None:
+    data_root = tmp_path / "runs"
+
+    result = CliRunner().invoke(
+        create_cli(model_gateway=ToolBudgetModel(), data_root=data_root),
+        ["run", "cart-discount"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Outcome: Budget Exceeded" in result.output
+    assert "Budget: tool_executions" in result.output
+    assert "Budget Usage: 21/20" in result.output
+    run_root = data_root / _run_identifier(result.output)
+    assert (run_root / "plan.json").is_file()
+    assert not (run_root / "attempts").exists()
+
+
+def test_model_infrastructure_failure_is_not_a_failed_repair_attempt(tmp_path: Path) -> None:
+    data_root = tmp_path / "runs"
+
+    result = CliRunner().invoke(
+        create_cli(model_gateway=FailingPlanModel(), data_root=data_root),
+        ["run", "cart-discount"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Outcome: Error" in result.output
+    assert "Error Kind: model_failure" in result.output
+    assert "Model Requests: 1" in result.output
+    assert "Tool Executions: 1" in result.output
+    assert "Repair Attempts: 0" in result.output
+    assert "Attempts Exhausted" not in result.output
+
+
+def test_distinct_files_read_budget_exceeded_names_limit_and_usage(tmp_path: Path) -> None:
+    result, data_root = _run_trusted_inspection(
+        tmp_path,
+        FilesReadBudgetModel(),
+        extra_files={f"file{index:02}.py": b"VALUE = 1\n" for index in range(12)},
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Outcome: Budget Exceeded" in result.output
+    assert "Budget: files_read" in result.output
+    assert "Budget Usage: 13/12" in result.output
+    assert not (data_root / _run_identifier(result.output) / "attempts").exists()
+
+
+def test_files_changed_budget_accumulates_across_attempts(tmp_path: Path) -> None:
+    repository = tmp_path / "four-file-repository"
+    repository.mkdir()
+    paths = [f"file{index}.py" for index in range(4)]
+    for path in paths:
+        (repository / path).write_text("VALUE = 1\n", encoding="utf-8")
+    contract = tmp_path / "four-file-contract.toml"
+    contract.write_text(
+        f'''source_id = "four-file-repository"
+issue = "Change no more than three files"
+verification = {json.dumps([sys.executable, "-c", "raise SystemExit(1)"])}
+editable_paths = {json.dumps(paths)}
+''',
+        encoding="utf-8",
+    )
+    data_root = tmp_path / "runs"
+    model = CumulativeFilesChangedBudgetModel()
+    run_result = CliRunner().invoke(
+        create_cli(model_gateway=model, data_root=data_root),
+        ["run-local", str(repository), "--contract", str(contract), "--trust-repository"],
+    )
+    run_identifier = _run_identifier(run_result.output)
+
+    approve_result = CliRunner().invoke(
+        create_cli(model_gateway=model, data_root=data_root),
+        ["approve", run_identifier, "--yes"],
+    )
+
+    assert approve_result.exit_code == 0, approve_result.output
+    assert "Outcome: Budget Exceeded" in approve_result.output
+    assert "Budget: files_changed" in approve_result.output
+    assert "Budget Usage: 4/3" in approve_result.output
+    assert "Repair Attempts: 1" in approve_result.output
+    workspace = data_root / run_identifier / "workspace"
+    assert all("# attempt 1" in (workspace / path).read_text() for path in paths[:3])
+    assert (workspace / paths[3]).read_text() == "VALUE = 1\n"
+
+
+def test_model_request_budget_counts_schema_correction_requests(tmp_path: Path) -> None:
+    data_root = tmp_path / "runs"
+    model = CorrectedEveryOutputModel()
+    run_result = CliRunner().invoke(
+        create_cli(model_gateway=model, data_root=data_root),
+        ["run", "cart-discount"],
+    )
+    run_identifier = _run_identifier(run_result.output)
+    first_approval = CliRunner().invoke(
+        create_cli(model_gateway=model, data_root=data_root),
+        ["approve", run_identifier, "--yes"],
+    )
+
+    second_approval = CliRunner().invoke(
+        create_cli(model_gateway=model, data_root=data_root),
+        ["approve", run_identifier, "--yes"],
+    )
+
+    assert first_approval.exit_code == 0, first_approval.output
+    assert "status: pending_approval" in first_approval.output
+    assert second_approval.exit_code == 0, second_approval.output
+    assert "Outcome: Budget Exceeded" in second_approval.output
+    assert "Budget: model_requests" in second_approval.output
+    assert "Budget Usage: 10/8" in second_approval.output
+    assert "Repair Attempts: 2" in second_approval.output
+    assert "Attempts Exhausted" not in second_approval.output
+
+
+def test_active_time_budget_counts_model_work(tmp_path: Path) -> None:
+    clock = FakeClock()
+
+    result = CliRunner().invoke(
+        create_cli(
+            model_gateway=SlowPlanModel(clock),
+            data_root=tmp_path / "runs",
+            clock=clock,
+        ),
+        ["run", "cart-discount"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Outcome: Budget Exceeded" in result.output
+    assert "Budget: active_seconds" in result.output
+    assert "Budget Usage: 301.0/300.0" in result.output
+    assert "Candidate Patch" not in result.output
+
+
+def test_approval_wait_is_excluded_from_active_time(tmp_path: Path) -> None:
+    clock = FakeClock()
+    data_root = tmp_path / "runs"
+    run_result = CliRunner().invoke(
+        create_cli(model_gateway=ScriptedModel(), data_root=data_root, clock=clock),
+        ["run", "cart-discount"],
+    )
+    run_identifier = _run_identifier(run_result.output)
+
+    clock.advance(1_000.0)
+    approve_result = CliRunner().invoke(
+        create_cli(model_gateway=ScriptedModel(), data_root=data_root, clock=clock),
+        ["approve", run_identifier, "--yes"],
+    )
+    status_result = CliRunner().invoke(
+        create_cli(model_gateway=ScriptedModel(), data_root=data_root, clock=clock),
+        ["status", run_identifier],
+    )
+
+    assert approve_result.exit_code == 0, approve_result.output
+    assert "Outcome: Succeeded" in approve_result.output
+    assert status_result.exit_code == 0, status_result.output
+    assert "Active Seconds Budget: 0.000/300.0" in status_result.output
+
+
 @pytest.mark.parametrize("path", ["test_cart.py", "issue.md", "fixture.toml"])
 def test_candidate_patch_rejects_tests_issue_and_manifest_changes(
     tmp_path: Path,
@@ -521,8 +848,14 @@ def test_candidate_patch_rejects_unsafe_structured_replacements(
         ["run", "cart-discount"],
     )
 
-    assert result.exit_code == 2
-    assert message in result.output
+    if message == "validation error":
+        assert result.exit_code == 0, result.output
+        assert "Outcome: Error" in result.output
+        assert "Error Kind: invalid_model_output" in result.output
+        assert "Model Requests: 3" in result.output
+    else:
+        assert result.exit_code == 2
+        assert message in result.output
 
 
 def test_candidate_diff_marks_a_missing_trailing_newline_exactly(tmp_path: Path) -> None:
@@ -1329,8 +1662,11 @@ def test_search_response_is_predictably_limited_to_32_kib(tmp_path: Path) -> Non
 def test_model_plan_is_runtime_validated_before_artifact_persistence(tmp_path: Path) -> None:
     result, data_root = _run_trusted_inspection(tmp_path, InvalidPlanModel())
 
-    assert result.exit_code == 2
-    assert "validation error" in result.output
+    assert result.exit_code == 0, result.output
+    assert "Outcome: Error" in result.output
+    assert "Error Kind: invalid_model_output" in result.output
+    assert "Model Requests: 2" in result.output
+    assert "Repair Attempts: 0" in result.output
     run_roots = [path for path in data_root.iterdir() if path.is_dir()]
     assert len(run_roots) == 1
     assert not (run_roots[0] / "plan.json").exists()

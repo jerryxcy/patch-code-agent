@@ -8,6 +8,11 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from patch_code_agent.inspection import WorkspaceInspector
 from patch_code_agent.model import ModelGateway, Plan, PlanningRequest
+from patch_code_agent.model_output import (
+    InvalidModelOutputError,
+    ModelInvocationError,
+    request_typed_output,
+)
 
 
 class PlanArtifact(BaseModel):
@@ -94,16 +99,27 @@ class Planner:
         try:
             marker.touch(exist_ok=False)
         except FileExistsError as error:
-            raise RuntimeError("Plan replay ledger is incomplete; refusing a second model request") from error
+            raise RuntimeError(
+                "Plan replay ledger is incomplete; refusing a second model request"
+            ) from error
 
         inspector = WorkspaceInspector(workspace)
         request = PlanningRequest(issue=issue, verification=tuple(verification))
-        raw_plan = self._model_gateway.create_plan(request, inspector)
-        plan = Plan.model_validate(raw_plan)
+        try:
+            plan, model_requests = request_typed_output(
+                lambda: self._model_gateway.create_plan(request, inspector),
+                Plan,
+            )
+        except (InvalidModelOutputError, ModelInvocationError) as error:
+            error.record_inspection(
+                tool_executions=inspector.tool_executions,
+                files_read=inspector.files_read,
+            )
+            raise
         artifact = PlanArtifact(
             plan=plan,
             model_id=self._model_gateway.model_id,
-            model_requests=1,
+            model_requests=model_requests,
             tool_executions=inspector.tool_executions,
             files_read=inspector.files_read,
         )

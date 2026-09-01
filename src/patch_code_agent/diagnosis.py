@@ -9,6 +9,11 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from patch_code_agent.inspection import WorkspaceInspector
 from patch_code_agent.model import Diagnosis, DiagnosisRequest, ModelGateway
+from patch_code_agent.model_output import (
+    InvalidModelOutputError,
+    ModelInvocationError,
+    request_typed_output,
+)
 from patch_code_agent.planning import PlanArtifactReference, load_plan_artifact
 from patch_code_agent.verification import RepairVerificationSummary
 
@@ -91,16 +96,24 @@ class Diagnostician:
             verification_output_excerpt=verification.output_excerpt,
             verification_artifact_path=verification.artifact_path,
         )
-        diagnosis = Diagnosis.model_validate(
-            self._model_gateway.create_diagnosis(request, inspector)
-        )
+        try:
+            diagnosis, model_requests = request_typed_output(
+                lambda: self._model_gateway.create_diagnosis(request, inspector),
+                Diagnosis,
+            )
+        except (InvalidModelOutputError, ModelInvocationError) as error:
+            error.record_inspection(
+                tool_executions=inspector.tool_executions,
+                files_read=inspector.files_read,
+            )
+            raise
         artifact = DiagnosisArtifact(
             attempt=verification.attempt,
             diagnosis=diagnosis,
             verification_output_excerpt=verification.output_excerpt,
             verification_artifact_path=verification.artifact_path,
             model_id=self._model_gateway.model_id,
-            model_requests=1,
+            model_requests=model_requests,
             tool_executions=inspector.tool_executions,
             files_read=inspector.files_read,
         )

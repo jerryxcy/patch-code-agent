@@ -12,6 +12,11 @@ from pydantic import BaseModel, ConfigDict, Field
 from patch_code_agent.diagnosis import DiagnosisArtifactReference, load_diagnosis_artifact
 from patch_code_agent.inspection import WorkspaceInspector
 from patch_code_agent.model import CandidatePatch, CandidateRequest, ModelGateway
+from patch_code_agent.model_output import (
+    InvalidModelOutputError,
+    ModelInvocationError,
+    request_typed_output,
+)
 from patch_code_agent.planning import PlanArtifactReference, load_plan_artifact
 
 _MAX_REPLACEMENT_BYTES = 100 * 1024
@@ -131,8 +136,17 @@ class CandidatePatchBuilder:
                 else None
             ),
         )
-        raw_candidate = self._model_gateway.create_candidate(request, inspector)
-        candidate = CandidatePatch.model_validate(raw_candidate)
+        try:
+            candidate, model_requests = request_typed_output(
+                lambda: self._model_gateway.create_candidate(request, inspector),
+                CandidatePatch,
+            )
+        except (InvalidModelOutputError, ModelInvocationError) as error:
+            error.record_inspection(
+                tool_executions=inspector.tool_executions,
+                files_read=inspector.files_read,
+            )
+            raise
         candidate, exact_diff = _validate_and_diff(
             workspace=workspace,
             editable_paths=editable_paths,
@@ -147,7 +161,7 @@ class CandidatePatchBuilder:
             candidate=candidate,
             diff_sha256=diff_checksum,
             model_id=self._model_gateway.model_id,
-            model_requests=1,
+            model_requests=model_requests,
             tool_executions=inspector.tool_executions,
             files_read=inspector.files_read,
         )
