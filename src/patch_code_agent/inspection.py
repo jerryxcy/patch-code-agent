@@ -123,20 +123,8 @@ class WorkspaceInspector:
         """Validate and read one path without following any symlink segment."""
         self._claim_tool_execution()
         relative, candidate = self._resolve_regular_file(path)
-        if (
-            relative not in self._previously_read
-            and relative not in self._files_read
-            and len(self._previously_read | self._files_read) >= 12
-        ):
-            raise ResourceBudgetExceededError(
-                budget_name="files_read",
-                budget_limit=12,
-                budget_used=12,
-                tool_executions=self._tool_executions,
-                files_read=self.files_read,
-            )
+        self._claim_file_read(relative)
         content = self._read_text(candidate)
-        self._files_read.add(relative)
         self._read_hashes[relative] = hashlib.sha256(content.encode("utf-8")).hexdigest()
         return FileContent(path=relative, content=content)
 
@@ -150,6 +138,7 @@ class WorkspaceInspector:
         truncated = False
         for relative in self._visible_text_paths():
             _, candidate = self._resolve_regular_file(relative)
+            self._claim_file_read(relative)
             for line_number, line in enumerate(self._read_text(candidate).splitlines(), 1):
                 if query not in line:
                     continue
@@ -172,6 +161,19 @@ class WorkspaceInspector:
                 files_read=self.files_read,
             )
         self._tool_executions += 1
+
+    def _claim_file_read(self, relative: str) -> None:
+        if relative in self._previously_read or relative in self._files_read:
+            return
+        if len(self._previously_read | self._files_read) >= 12:
+            raise ResourceBudgetExceededError(
+                budget_name="files_read",
+                budget_limit=12,
+                budget_used=12,
+                tool_executions=self._tool_executions,
+                files_read=self.files_read,
+            )
+        self._files_read.add(relative)
 
     def _visible_text_paths(self) -> list[str]:
         paths: list[str] = []

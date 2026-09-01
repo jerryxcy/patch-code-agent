@@ -45,7 +45,9 @@ class CrashingDiagnosisModel(CountingModel):
 
 
 def test_graph_pauses_after_persisting_a_candidate_patch(tmp_path):
-    source = tmp_path / "cart.py"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    source = workspace / "cart.py"
     source.write_text("def total(items):\n    return sum(items)\n")
     data_root = tmp_path / "runs"
     (data_root / "test-run").mkdir(parents=True)
@@ -64,7 +66,7 @@ def test_graph_pauses_after_persisting_a_candidate_patch(tmp_path):
             "verification_argv": [sys.executable, "-c", "raise SystemExit(1)"],
             "editable_paths": ["cart.py"],
             "model_requests": 0,
-            "workspace_path": str(tmp_path),
+            "workspace_path": str(workspace),
             "status": "created",
         },
         config={"configurable": {"thread_id": "test-run"}},

@@ -12,6 +12,7 @@ from typer.testing import CliRunner
 from patch_code_agent.cli import create_cli
 from patch_code_agent.inspection import WorkspaceInspector
 from patch_code_agent.model import ScriptedInspectionCall, ScriptedModel
+from patch_code_agent.patching import PatchApplier
 
 
 class RecordingModel:
@@ -143,6 +144,25 @@ class FilesReadBudgetModel:
 
     def create_diagnosis(self, request, tools):
         return ScriptedModel().create_diagnosis(request, tools)
+
+
+class SearchFilesReadBudgetModel:
+    model_id = "search-files-read-budget"
+
+    def create_plan(self, request, tools):
+        tools.search_code("VALUE")
+        return {
+            "issue_summary": "Search too many distinct files",
+            "relevant_files": ["cart.py"],
+            "repair_strategy": "No repair should be generated.",
+            "verification_strategy": "Run the declared Verification.",
+        }
+
+    def create_candidate(self, request, tools):
+        raise AssertionError("Candidate generation must not run after budget exhaustion")
+
+    def create_diagnosis(self, request, tools):
+        raise AssertionError("Diagnosis must not run after budget exhaustion")
 
 
 class CumulativeFilesChangedBudgetModel:
@@ -508,7 +528,7 @@ def test_failing_baseline_creates_a_typed_checksummed_plan_artifact(tmp_path: Pa
     plan_artifact = json.loads(plan_bytes)
     checksum = hashlib.sha256(plan_bytes).hexdigest()
     assert plan_artifact == {
-        "files_read": ["cart.py", "test_cart.py"],
+        "files_read": ["cart.py", "fixture.toml", "issue.md", "test_cart.py"],
         "model_id": "scripted",
         "model_requests": 1,
         "plan": {
@@ -581,7 +601,7 @@ def test_run_pauses_with_an_immutable_candidate_patch_visible_from_status(
     assert exact_diff in status_result.output
     assert "Model Requests: 2" in status_result.output
     assert "Tool Executions: 5" in status_result.output
-    assert "Files Read: 2" in status_result.output
+    assert "Files Read: 4" in status_result.output
     assert "Repair Attempts: 0" in status_result.output
 
 
@@ -600,7 +620,7 @@ def test_status_displays_independent_resource_budget_usage(tmp_path: Path) -> No
 
     assert status_result.exit_code == 0, status_result.output
     assert "Repair Attempts Budget: 0/3" in status_result.output
-    assert "Distinct Files Read Budget: 2/12" in status_result.output
+    assert "Distinct Files Read Budget: 4/12" in status_result.output
     assert "Files Changed Budget: 0/3" in status_result.output
     assert "Tool Executions Budget: 5/20" in status_result.output
     assert "Model Requests Budget: 2/8" in status_result.output
@@ -681,6 +701,19 @@ def test_distinct_files_read_budget_exceeded_names_limit_and_usage(tmp_path: Pat
     assert "Budget: files_read" in result.output
     assert "Budget Usage: 12/12" in result.output
     assert not (data_root / _run_identifier(result.output) / "attempts").exists()
+
+
+def test_search_enforces_the_distinct_files_read_budget(tmp_path: Path) -> None:
+    result, _ = _run_trusted_inspection(
+        tmp_path,
+        SearchFilesReadBudgetModel(),
+        extra_files={f"file{index:02}.py": b"VALUE = 1\n" for index in range(12)},
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Outcome: Budget Exceeded" in result.output
+    assert "Budget: files_read" in result.output
+    assert "Budget Usage: 12/12" in result.output
 
 
 def test_files_changed_budget_accumulates_across_attempts(tmp_path: Path) -> None:
@@ -1482,6 +1515,33 @@ editable_paths = ["one.py", "two.py"]
     assert "Error Kind: partial_apply" in approve_result.output
     assert (run_root / "workspace" / second["path"]).read_text() != second["new_content"]
     assert not (run_root / "attempts" / "1" / "verification.json").exists()
+
+
+def test_patch_application_infrastructure_failure_is_a_stable_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_root = tmp_path / "runs"
+    run_result = CliRunner().invoke(
+        create_cli(model_gateway=ScriptedModel(), data_root=data_root),
+        ["run", "cart-discount"],
+    )
+    run_identifier = _run_identifier(run_result.output)
+
+    def fail_apply(*args, **kwargs):
+        raise OSError("simulated patch storage outage")
+
+    monkeypatch.setattr(PatchApplier, "apply_once", fail_apply)
+    approve_result = CliRunner().invoke(
+        create_cli(model_gateway=ScriptedModel(), data_root=data_root),
+        ["approve", run_identifier, "--yes"],
+    )
+
+    assert approve_result.exit_code == 0, approve_result.output
+    assert "Outcome: Error" in approve_result.output
+    assert "Error Kind: patching_failure" in approve_result.output
+    assert "Repair Attempts: 0" in approve_result.output
+    assert "Attempts Exhausted" not in approve_result.output
 
 
 def test_yes_cannot_skip_candidate_checksum_validation(tmp_path: Path) -> None:

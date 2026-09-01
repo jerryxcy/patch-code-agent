@@ -434,22 +434,35 @@ def run_repair_verification(
 ) -> RunState:
     """Execute one approved Repair Attempt and classify its Verification result."""
     attempt = state.get("attempt", 0) + 1
-    summary = verifier.verify(
-        run_id=state["run_id"],
-        workspace=Path(state["workspace_path"]),
-        argv=state["verification_argv"],
-        attempt=attempt,
-    )
+    try:
+        summary = verifier.verify(
+            run_id=state["run_id"],
+            workspace=Path(state["workspace_path"]),
+            argv=state["verification_argv"],
+            attempt=attempt,
+        )
+    except (OSError, RuntimeError):
+        return _infrastructure_failure(
+            "verification_failure",
+            "Verification infrastructure failed before a result could be persisted.",
+        )
     update: RunState = {
         "attempt": attempt,
         "verification": summary.model_dump(mode="json"),
     }
     if summary.outcome == "passed":
-        cumulative = applier.persist_cumulative_diff(
-            run_id=state["run_id"],
-            workspace=Path(state["workspace_path"]),
-            reference=CandidatePatchReference.model_validate(state["candidate_artifact"]),
-        )
+        try:
+            cumulative = applier.persist_cumulative_diff(
+                run_id=state["run_id"],
+                workspace=Path(state["workspace_path"]),
+                reference=CandidatePatchReference.model_validate(state["candidate_artifact"]),
+            )
+        except (OSError, RuntimeError, ValueError):
+            update.update(_infrastructure_failure(
+                "storage_failure",
+                "Cumulative diff storage failed after successful Verification.",
+            ))
+            return update
         update.update(
             {
                 "status": "succeeded",
