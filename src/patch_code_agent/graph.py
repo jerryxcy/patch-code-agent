@@ -216,6 +216,19 @@ def run_baseline_verification(state: RunState, verifier: BaselineVerifier) -> Ru
         "verification_duration_max": summary.duration_seconds,
         "status": _BASELINE_STATUS[summary.outcome],
     }
+    if summary.outcome == "passed":
+        update["report"] = {
+            "success": False,
+            "phase": "issue_not_reproduced",
+            "note": "Baseline Verification passed; the Issue was not reproduced.",
+        }
+    elif summary.outcome == "error":
+        update["error_kind"] = summary.error_kind or "verification_error"
+        update["report"] = {
+            "success": False,
+            "phase": "error",
+            "note": "Baseline Verification ended with an infrastructure Error.",
+        }
     if summary.outcome == "timeout":
         update.update(
             {

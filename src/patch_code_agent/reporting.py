@@ -6,9 +6,9 @@ import os
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal, cast
+from typing import Literal, cast, get_args
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 from patch_code_agent.budgets import ResourceBudgets
 from patch_code_agent.state import RunState
@@ -22,17 +22,8 @@ TerminalOutcome = Literal[
     "workspace_changed",
     "error",
 ]
-TERMINAL_OUTCOMES: frozenset[str] = frozenset(
-    {
-        "succeeded",
-        "rejected",
-        "issue_not_reproduced",
-        "attempts_exhausted",
-        "budget_exceeded",
-        "workspace_changed",
-        "error",
-    }
-)
+TERMINAL_OUTCOMES: frozenset[str] = frozenset(get_args(TerminalOutcome))
+_TERMINAL_OUTCOME_ADAPTER = TypeAdapter(TerminalOutcome)
 
 
 class ArtifactReference(BaseModel):
@@ -106,6 +97,7 @@ class RunReport(BaseModel):
     source_kind: str
     source_id: str
     source_revision: str
+    issue: str
     model_id: str
     outcome: TerminalOutcome
     terminal_reason: str | None
@@ -199,14 +191,19 @@ class RunAuditStore:
         run_root = self._data_root / state["run_id"]
         report_path = run_root / "report.json"
         completion_path = run_root / ".report-complete"
-        if report_path.exists() or completion_path.exists():
-            if not report_path.is_file() or not completion_path.is_file():
-                raise RuntimeError("Run Report has an incomplete replay ledger")
+        if report_path.is_file():
             existing = report_path.read_bytes()
-            recorded = completion_path.read_text(encoding="utf-8").strip()
-            if hashlib.sha256(existing).hexdigest() != recorded or existing != report_bytes:
+            if existing != report_bytes:
                 raise RuntimeError("Run Report does not match its replay completion checksum")
-            return RunReportReference(sha256=recorded)
+            if completion_path.is_file():
+                recorded = completion_path.read_text(encoding="utf-8").strip()
+                if hashlib.sha256(existing).hexdigest() != recorded:
+                    raise RuntimeError("Run Report completion checksum does not match")
+                return RunReportReference(sha256=recorded)
+            completion_path.write_text(checksum + "\n", encoding="utf-8")
+            return RunReportReference(sha256=checksum)
+        if completion_path.exists():
+            raise RuntimeError("Run Report completion marker exists without its report")
         report_path.write_bytes(report_bytes)
         completion_path.write_text(checksum + "\n", encoding="utf-8")
         return RunReportReference(sha256=checksum)
@@ -233,8 +230,9 @@ class RunAuditStore:
             source_kind=state["source_kind"],
             source_id=state["source_id"],
             source_revision=state["source_revision"],
+            issue=state["issue"],
             model_id=state["model_id"],
-            outcome=cast(TerminalOutcome, state["status"]),
+            outcome=_TERMINAL_OUTCOME_ADAPTER.validate_python(state["status"]),
             terminal_reason=terminal_reason,
             error_kind=state.get("error_kind"),
             started_at=events[0].occurred_at,

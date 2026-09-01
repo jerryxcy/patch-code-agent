@@ -318,6 +318,8 @@ def _assert_terminal_report(
     assert report.schema_version == "1"
     assert report.outcome == expected_outcome
     assert report.run_id == run_identifier
+    assert report.issue
+    assert report.terminal_reason
     assert report.attempts == status.attempts
     assert report.model_requests == status.model_requests
     assert report.tool_executions == status.tool_executions
@@ -326,6 +328,16 @@ def _assert_terminal_report(
     assert report.budgets == status.budgets
     assert report.started_at <= report.finished_at
     assert len({event.event_id for event in events}) == len(events)
+    assert all(event.run_id == run_identifier for event in events)
+    assert events[-1].transition == f"finalized:{expected_outcome}"
+    assert events[-1].status == report.outcome == status.phase
+    assert [event.attempt for event in events] == sorted(event.attempt for event in events)
+    assert [event.model_requests for event in events] == sorted(
+        event.model_requests for event in events
+    )
+    assert [event.tool_executions for event in events] == sorted(
+        event.tool_executions for event in events
+    )
     assert status.report_artifact is not None
     assert status.report_artifact.sha256 == hashlib.sha256(report_bytes).hexdigest()
     assert "Run Report: report.json" in output
@@ -2008,6 +2020,8 @@ editable_paths = ["cart.py"]
     status = CliRunner().invoke(status_cli, ["status", run_identifier])
     assert status.exit_code == 0, status.output
     assert "Phase: error" in status.output
+    report = _assert_terminal_report(data_root, result.output, "error")
+    assert report.error_kind == "verification_exit_code"
 
 
 def test_baseline_verification_infrastructure_failure_is_a_stable_error(
