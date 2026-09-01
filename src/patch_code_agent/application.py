@@ -373,6 +373,15 @@ class PatchCodeAgent:
         model-request counter begins at zero so baseline ordering remains observable and durable.
         LangGraph's thread ID equals the public Run Identifier used by later status/resume commands.
         """
+        if bool(getattr(self._model_gateway, "synthetic_only", False)):
+            allowed_roots = tuple(
+                Path(root).resolve()
+                for root in getattr(self._model_gateway, "allowed_fixture_roots", ())
+            )
+            if source.kind != "fixture" or source.root.resolve() not in allowed_roots:
+                raise ValueError(
+                    "This Model Gateway only accepts bundled synthetic Fixture Repositories"
+                )
         workspace = self._workspaces.create(run_id, source.root)
         graph = self._run_graph()
         result = graph.invoke(

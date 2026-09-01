@@ -104,11 +104,17 @@ class Diagnostician:
             attempt=verification.attempt,
             verification_output_excerpt=verification.output_excerpt,
             verification_artifact_path=verification.artifact_path,
+            run_id=run_id,
         )
         try:
             diagnosis, model_requests = request_typed_output(
-                lambda errors: self._model_gateway.create_diagnosis(
-                    replace(request, validation_errors=errors), inspector
+                lambda errors, remaining: self._model_gateway.create_diagnosis(
+                    replace(
+                        request,
+                        validation_errors=errors,
+                        model_requests_remaining=remaining,
+                    ),
+                    inspector,
                 ),
                 Diagnosis,
                 prior_model_requests=prior_model_requests,

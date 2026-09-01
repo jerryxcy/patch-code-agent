@@ -53,6 +53,8 @@ class PlanningRequest:
     issue: str
     verification: VerificationArgv
     validation_errors: tuple[str, ...] = ()
+    model_requests_remaining: int = 1
+    run_id: str = ""
 
 
 class FileReplacement(BaseModel):
@@ -104,6 +106,8 @@ class DiagnosisRequest:
     verification_output_excerpt: str
     verification_artifact_path: str
     validation_errors: tuple[str, ...] = ()
+    model_requests_remaining: int = 1
+    run_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +124,20 @@ class CandidateRequest:
     attempt: int
     diagnosis: Diagnosis | None = None
     validation_errors: tuple[str, ...] = ()
+    model_requests_remaining: int = 1
+    run_id: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class ModelGatewayResult:
+    """Untrusted output plus the number of actual provider requests it consumed."""
+
+    output: object
+    model_requests: int
+
+    def __post_init__(self) -> None:
+        if self.model_requests < 1:
+            raise ValueError("Model Gateway result must consume at least one request")
 
 
 class ModelGateway(Protocol):
