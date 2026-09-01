@@ -16,9 +16,14 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import interrupt
 
 from patch_code_agent.candidate import CandidatePatchBuilder, CandidatePatchReference
+from patch_code_agent.patching import PatchApplier
 from patch_code_agent.planning import PlanArtifactReference, Planner
 from patch_code_agent.state import RunState, RunStatus
-from patch_code_agent.verification import BaselineVerificationOutcome, BaselineVerifier
+from patch_code_agent.verification import (
+    BaselineVerificationOutcome,
+    BaselineVerifier,
+    RepairVerifier,
+)
 
 _BASELINE_STATUS: dict[BaselineVerificationOutcome, RunStatus] = {
     "failed": "baseline_failed",
@@ -143,9 +148,14 @@ def await_approval(state: RunState) -> RunState:
             "candidate_artifact": state["candidate_artifact"],
         }
     )
-    if decision != "reject":
-        raise ValueError("Approval is not implemented; refusing to advance the Patch Run")
-    return {"approval_decision": "reject"}
+    if decision not in {"approve", "reject"}:
+        raise ValueError(f"Unknown Approval decision: {decision}")
+    return {"approval_decision": decision}
+
+
+def route_after_approval(state: RunState) -> str:
+    """Send the host-supplied decision to rejection or replay-safe application."""
+    return state["approval_decision"]
 
 
 def reject_candidate(state: RunState) -> RunState:
@@ -161,11 +171,88 @@ def reject_candidate(state: RunState) -> RunState:
     }
 
 
+def apply_candidate(state: RunState, applier: PatchApplier) -> RunState:
+    """Revalidate and apply the approved Candidate Patch without trusting model state."""
+    reference = CandidatePatchReference.model_validate(state["candidate_artifact"])
+    summary = applier.apply_once(
+        run_id=state["run_id"],
+        workspace=Path(state["workspace_path"]),
+        reference=reference,
+    )
+    update: RunState = {
+        "approved": True,
+        "apply_summary": summary.model_dump(mode="json"),
+        "files_changed": list(summary.files_changed),
+    }
+    if summary.outcome in {"applied", "already_applied"}:
+        update["status"] = "testing"
+    elif summary.outcome == "workspace_changed":
+        update["status"] = "workspace_changed"
+        update["error_kind"] = "workspace_changed"
+    else:
+        update["status"] = "error"
+        update["error_kind"] = "partial_apply"
+    return update
+
+
+def route_after_apply(state: RunState) -> str:
+    """Run Verification only after an all-before or all-after apply state."""
+    if state["status"] == "testing":
+        return "verify"
+    return "end"
+
+
+def run_repair_verification(
+    state: RunState,
+    verifier: RepairVerifier,
+    applier: PatchApplier,
+) -> RunState:
+    """Execute one approved Repair Attempt and classify its Verification result."""
+    attempt = state.get("attempt", 0) + 1
+    summary = verifier.verify(
+        run_id=state["run_id"],
+        workspace=Path(state["workspace_path"]),
+        argv=state["verification_argv"],
+        attempt=attempt,
+    )
+    update: RunState = {
+        "attempt": attempt,
+        "verification": summary.model_dump(mode="json"),
+    }
+    if summary.outcome == "passed":
+        cumulative = applier.persist_first_cumulative_diff(
+            run_id=state["run_id"],
+            reference=CandidatePatchReference.model_validate(state["candidate_artifact"]),
+        )
+        update.update(
+            {
+                "status": "succeeded",
+                "cumulative_diff": cumulative.model_dump(mode="json"),
+                "report": {
+                    "success": True,
+                    "phase": "succeeded",
+                    "note": "The approved Candidate Patch passed Verification.",
+                },
+            }
+        )
+    elif summary.outcome == "failed":
+        update["status"] = "verification_failed"
+    elif summary.outcome == "timeout":
+        update["status"] = "budget_exceeded"
+        update["error_kind"] = "verification_timeout"
+    else:
+        update["status"] = "error"
+        update["error_kind"] = summary.error_kind or "verification_error"
+    return update
+
+
 def build_graph(
     *,
     baseline_verifier: BaselineVerifier,
     planner: Planner,
     candidate_builder: CandidatePatchBuilder,
+    patch_applier: PatchApplier,
+    repair_verifier: RepairVerifier,
     checkpointer: BaseCheckpointSaver | None = None,
 ) -> CompiledStateGraph:
     """Compile the Patch Run graph with durable or in-memory checkpointing.
@@ -188,6 +275,11 @@ def build_graph(
     )
     builder.add_node("approval_gate", await_approval)
     builder.add_node("reject_candidate", reject_candidate)
+    builder.add_node("apply_candidate", lambda state: apply_candidate(state, patch_applier))
+    builder.add_node(
+        "repair_verification",
+        lambda state: run_repair_verification(state, repair_verifier, patch_applier),
+    )
     builder.add_edge(START, "validate_input")
     builder.add_edge("validate_input", "baseline_verification")
     builder.add_conditional_edges(
@@ -197,6 +289,16 @@ def build_graph(
     )
     builder.add_edge("create_plan", "create_candidate")
     builder.add_edge("create_candidate", "approval_gate")
-    builder.add_edge("approval_gate", "reject_candidate")
+    builder.add_conditional_edges(
+        "approval_gate",
+        route_after_approval,
+        {"reject": "reject_candidate", "approve": "apply_candidate"},
+    )
     builder.add_edge("reject_candidate", END)
+    builder.add_conditional_edges(
+        "apply_candidate",
+        route_after_apply,
+        {"verify": "repair_verification", "end": END},
+    )
+    builder.add_edge("repair_verification", END)
     return builder.compile(checkpointer=selected_checkpointer)

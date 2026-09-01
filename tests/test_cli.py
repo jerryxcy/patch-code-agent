@@ -10,6 +10,7 @@ import pytest
 from typer.testing import CliRunner
 
 from patch_code_agent.cli import create_cli
+from patch_code_agent.inspection import WorkspaceInspector
 from patch_code_agent.model import ScriptedInspectionCall, ScriptedModel
 
 
@@ -99,13 +100,37 @@ class CandidateScenarioModel:
         return {"replacements": [replacement]}
 
 
+class TwoFileCandidateModel:
+    model_id = "two-file-candidate"
+
+    def create_plan(self, request, tools):
+        return ScriptedModel().create_plan(request, tools)
+
+    def create_candidate(self, request, tools):
+        replacements = []
+        for path in request.editable_paths:
+            observed = tools.read_file(path)
+            replacements.append(
+                {
+                    "path": path,
+                    "expected_sha256": hashlib.sha256(observed.content.encode()).hexdigest(),
+                    "new_content": observed.content + "# approved change\n",
+                }
+            )
+        return {"replacements": replacements}
+
+
 def _run_identifier(output: str) -> str:
     match = re.search(r"Run Identifier: ([0-9a-f-]{36})", output)
     assert match is not None
     return match.group(1)
 
 
-def _invoke_cli_process(tmp_path: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+def _invoke_cli_process(
+    tmp_path: Path,
+    *arguments: str,
+    input_text: str | None = None,
+) -> subprocess.CompletedProcess[str]:
     environment = os.environ.copy()
     environment["HOME"] = str(tmp_path / "process-home")
     return subprocess.run(
@@ -114,6 +139,7 @@ def _invoke_cli_process(tmp_path: Path, *arguments: str) -> subprocess.Completed
         env=environment,
         capture_output=True,
         text=True,
+        input=input_text,
         check=False,
         timeout=30,
     )
@@ -135,11 +161,11 @@ def _run_trusted_inspection(
         target.write_bytes(content)
     contract = tmp_path / "inspection-contract.toml"
     contract.write_text(
-        f'''source_id = "inspection-repository"
+        f"""source_id = "inspection-repository"
 issue = "Inspect the reported problem"
 verification = {json.dumps([sys.executable, "-c", baseline_program])}
 editable_paths = ["cart.py"]
-''',
+""",
         encoding="utf-8",
     )
     data_root = tmp_path / "runs"
@@ -441,11 +467,11 @@ def test_candidate_patch_rejects_protected_files_even_when_manifest_marks_them_e
     fixture = tmp_path / "unsafe-fixture"
     fixture.mkdir()
     (fixture / "fixture.toml").write_text(
-        '''fixture_id = "unsafe-fixture"
+        """fixture_id = "unsafe-fixture"
 issue_path = "issue.md"
 verification = ["pytest", "test_cart.py"]
 editable_paths = ["cart.py", "test_cart.py", "issue.md", "fixture.toml"]
-''',
+""",
         encoding="utf-8",
     )
     (fixture / "issue.md").write_text("# Protected files stay immutable\n", encoding="utf-8")
@@ -600,11 +626,11 @@ def test_reject_refuses_a_non_pending_patch_run(tmp_path: Path) -> None:
     (repository / "cart.py").write_text("VALUE = 1\n", encoding="utf-8")
     contract = tmp_path / "passing-contract.toml"
     contract.write_text(
-        f'''source_id = "passing-repository"
+        f"""source_id = "passing-repository"
 issue = "No reproducible failure"
 verification = {json.dumps([sys.executable, "-c", "raise SystemExit(0)"])}
 editable_paths = ["cart.py"]
-''',
+""",
         encoding="utf-8",
     )
     data_root = tmp_path / "runs"
@@ -717,6 +743,398 @@ def test_reject_never_follows_a_symlinked_lock_file(tmp_path: Path) -> None:
     assert reject_result.exit_code == 2
     assert f"Unsafe Patch Run lock file: {run_identifier}" in reject_result.output
     assert outside_lock.read_text(encoding="utf-8") == "unchanged\n"
+
+
+def test_user_approves_and_verifies_a_candidate_from_a_separate_cli_process(
+    tmp_path: Path,
+) -> None:
+    fixture_repository = Path(__file__).parents[1] / "examples" / "tiny_repo"
+    original_source = (fixture_repository / "cart.py").read_bytes()
+    data_root = tmp_path / "runs"
+    run_result = CliRunner().invoke(
+        create_cli(model_gateway=ScriptedModel(), data_root=data_root),
+        ["run", "cart-discount"],
+    )
+    run_identifier = _run_identifier(run_result.output)
+    run_root = data_root / run_identifier
+    candidate_diff = (run_root / "attempts" / "1" / "candidate.diff").read_text()
+    candidate_checksum = hashlib.sha256(
+        (run_root / "attempts" / "1" / "candidate.json").read_bytes()
+    ).hexdigest()
+
+    approve_result = CliRunner().invoke(
+        create_cli(model_gateway=ScriptedModel(), data_root=data_root),
+        ["approve", run_identifier, "--yes"],
+    )
+
+    assert approve_result.exit_code == 0, approve_result.output
+    assert candidate_diff in approve_result.output
+    assert f"Candidate Checksum: {candidate_checksum}" in approve_result.output
+    assert "Outcome: Succeeded" in approve_result.output
+    assert "Repair Attempts: 1" in approve_result.output
+    assert "Verification: passed" in approve_result.output
+    assert "Cumulative Diff: cumulative.diff" in approve_result.output
+    assert "subtotal = sum(prices)" in (run_root / "workspace" / "cart.py").read_text()
+    assert (fixture_repository / "cart.py").read_bytes() == original_source
+    verification = json.loads((run_root / "attempts" / "1" / "verification.json").read_text())
+    assert verification["outcome"] == "passed"
+    assert verification["exit_code"] == 0
+    assert "1 passed" in (run_root / "attempts" / "1" / "verification.log").read_text()
+    assert (run_root / "cumulative.diff").read_text() == candidate_diff
+
+    status_result = CliRunner().invoke(
+        create_cli(model_gateway=ScriptedModel(), data_root=data_root),
+        ["status", run_identifier],
+    )
+    assert status_result.exit_code == 0, status_result.output
+    assert "Phase: succeeded" in status_result.output
+    assert "Outcome: Succeeded" in status_result.output
+    assert "Repair Attempts: 1" in status_result.output
+
+
+def test_approval_prompt_defaults_to_no_and_keeps_the_run_pending(tmp_path: Path) -> None:
+    fixture_repository = Path(__file__).parents[1] / "examples" / "tiny_repo"
+    original_source = (fixture_repository / "cart.py").read_bytes()
+    data_root = tmp_path / "runs"
+    run_result = CliRunner().invoke(
+        create_cli(model_gateway=ScriptedModel(), data_root=data_root),
+        ["run", "cart-discount"],
+    )
+    run_identifier = _run_identifier(run_result.output)
+    candidate_diff = (data_root / run_identifier / "attempts" / "1" / "candidate.diff").read_text()
+
+    approve_result = CliRunner().invoke(
+        create_cli(model_gateway=ScriptedModel(), data_root=data_root),
+        ["approve", run_identifier],
+        input="\n",
+    )
+
+    assert approve_result.exit_code == 0, approve_result.output
+    assert candidate_diff in approve_result.output
+    assert "Approve this exact Candidate Patch? [y/N]" in approve_result.output
+    assert "Approval cancelled; Patch Run remains pending." in approve_result.output
+    assert not (data_root / run_identifier / "attempts" / "1" / "apply.json").exists()
+    assert (data_root / run_identifier / "workspace" / "cart.py").read_bytes() == original_source
+
+    status_result = CliRunner().invoke(
+        create_cli(model_gateway=ScriptedModel(), data_root=data_root),
+        ["status", run_identifier],
+    )
+    assert "Phase: pending_approval" in status_result.output
+    assert "Repair Attempts: 0" in status_result.output
+
+
+def test_interactive_yes_approves_the_exact_candidate(tmp_path: Path) -> None:
+    data_root = tmp_path / "runs"
+    run_result = CliRunner().invoke(
+        create_cli(model_gateway=ScriptedModel(), data_root=data_root),
+        ["run", "cart-discount"],
+    )
+    run_identifier = _run_identifier(run_result.output)
+    candidate_checksum = hashlib.sha256(
+        (data_root / run_identifier / "attempts" / "1" / "candidate.json").read_bytes()
+    ).hexdigest()
+
+    approve_result = CliRunner().invoke(
+        create_cli(model_gateway=ScriptedModel(), data_root=data_root),
+        ["approve", run_identifier],
+        input="y\n",
+    )
+
+    assert approve_result.exit_code == 0, approve_result.output
+    assert f"Candidate Checksum: {candidate_checksum}" in approve_result.output
+    assert "Approve this exact Candidate Patch? [y/N]: y" in approve_result.output
+    assert "Outcome: Succeeded" in approve_result.output
+
+
+def test_run_approve_and_status_work_across_real_os_processes(tmp_path: Path) -> None:
+    fixture_repository = Path(__file__).parents[1] / "examples" / "tiny_repo"
+    original_source = (fixture_repository / "cart.py").read_bytes()
+    run_result = _invoke_cli_process(tmp_path, "run", "cart-discount")
+    run_identifier = _run_identifier(run_result.stdout)
+
+    approve_result = _invoke_cli_process(tmp_path, "approve", run_identifier, "--yes")
+    status_result = _invoke_cli_process(tmp_path, "status", run_identifier)
+
+    assert run_result.returncode == 0, run_result.stderr
+    assert approve_result.returncode == 0, approve_result.stderr
+    assert "Candidate Checksum:" in approve_result.stdout
+    assert "Outcome: Succeeded" in approve_result.stdout
+    assert status_result.returncode == 0, status_result.stderr
+    assert "Phase: succeeded" in status_result.stdout
+    assert "Verification: passed" in status_result.stdout
+    assert (fixture_repository / "cart.py").read_bytes() == original_source
+
+
+def test_repeated_approve_does_not_repeat_apply_verification_or_counters(tmp_path: Path) -> None:
+    data_root = tmp_path / "runs"
+    run_result = CliRunner().invoke(
+        create_cli(model_gateway=ScriptedModel(), data_root=data_root),
+        ["run", "cart-discount"],
+    )
+    run_identifier = _run_identifier(run_result.output)
+    first_approve = CliRunner().invoke(
+        create_cli(model_gateway=ScriptedModel(), data_root=data_root),
+        ["approve", run_identifier, "--yes"],
+    )
+    run_root = data_root / run_identifier
+    database_before = (data_root / "checkpoints.sqlite").read_bytes()
+    workspace_before = (run_root / "workspace" / "cart.py").read_bytes()
+    verification_before = (run_root / "attempts" / "1" / "verification.log").read_bytes()
+
+    repeated_approve = CliRunner().invoke(
+        create_cli(model_gateway=ScriptedModel(), data_root=data_root),
+        ["approve", run_identifier, "--yes"],
+    )
+
+    assert first_approve.exit_code == 0, first_approve.output
+    assert repeated_approve.exit_code == 2
+    assert "not awaiting Approval (current phase: succeeded)" in repeated_approve.output
+    assert (data_root / "checkpoints.sqlite").read_bytes() == database_before
+    assert (run_root / "workspace" / "cart.py").read_bytes() == workspace_before
+    assert (run_root / "attempts" / "1" / "verification.log").read_bytes() == verification_before
+
+    status_result = CliRunner().invoke(
+        create_cli(model_gateway=ScriptedModel(), data_root=data_root),
+        ["status", run_identifier],
+    )
+    assert "Repair Attempts: 1" in status_result.output
+
+
+def test_approve_reports_busy_without_advancing_the_pending_run(tmp_path: Path) -> None:
+    data_root = tmp_path / "runs"
+    run_result = CliRunner().invoke(
+        create_cli(model_gateway=ScriptedModel(), data_root=data_root),
+        ["run", "cart-discount"],
+    )
+    run_identifier = _run_identifier(run_result.output)
+    candidate_path = data_root / run_identifier / "attempts" / "1" / "candidate.json"
+    candidate_before = candidate_path.read_bytes()
+
+    lock_holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; from pathlib import Path; "
+                "from patch_code_agent.locking import RunMutationLock; "
+                "lock = RunMutationLock(Path(sys.argv[1]), sys.argv[2]); "
+                "lock.__enter__(); print('locked', flush=True); "
+                "sys.stdin.readline(); lock.__exit__(None, None, None)"
+            ),
+            str(data_root),
+            run_identifier,
+        ],
+        cwd=Path(__file__).parents[1],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert lock_holder.stdout is not None
+        assert lock_holder.stdout.readline().strip() == "locked"
+        approve_result = CliRunner().invoke(
+            create_cli(model_gateway=ScriptedModel(), data_root=data_root),
+            ["approve", run_identifier, "--yes"],
+        )
+    finally:
+        if lock_holder.stdin is not None:
+            lock_holder.stdin.write("release\n")
+            lock_holder.stdin.flush()
+        lock_holder.wait(timeout=10)
+
+    assert approve_result.exit_code == 2
+    assert f"Patch Run is busy: {run_identifier}" in approve_result.output
+    assert candidate_path.read_bytes() == candidate_before
+    assert not (data_root / run_identifier / "attempts" / "1" / "apply.json").exists()
+
+
+def test_approve_continues_when_every_replacement_is_already_applied(tmp_path: Path) -> None:
+    data_root = tmp_path / "runs"
+    run_result = CliRunner().invoke(
+        create_cli(model_gateway=ScriptedModel(), data_root=data_root),
+        ["run", "cart-discount"],
+    )
+    run_identifier = _run_identifier(run_result.output)
+    run_root = data_root / run_identifier
+    candidate = json.loads((run_root / "attempts" / "1" / "candidate.json").read_text())
+    replacement = candidate["candidate"]["replacements"][0]
+    (run_root / "workspace" / replacement["path"]).write_text(
+        replacement["new_content"], encoding="utf-8"
+    )
+
+    approve_result = CliRunner().invoke(
+        create_cli(model_gateway=ScriptedModel(), data_root=data_root),
+        ["approve", run_identifier, "--yes"],
+    )
+
+    assert approve_result.exit_code == 0, approve_result.output
+    assert "Outcome: Succeeded" in approve_result.output
+    apply_summary = json.loads((run_root / "attempts" / "1" / "apply.json").read_text())
+    assert apply_summary["outcome"] == "already_applied"
+    assert (run_root / "attempts" / "1" / "verification.json").is_file()
+
+
+def test_approve_reports_workspace_changed_without_running_verification(tmp_path: Path) -> None:
+    data_root = tmp_path / "runs"
+    run_result = CliRunner().invoke(
+        create_cli(model_gateway=ScriptedModel(), data_root=data_root),
+        ["run", "cart-discount"],
+    )
+    run_identifier = _run_identifier(run_result.output)
+    run_root = data_root / run_identifier
+    workspace_source = run_root / "workspace" / "cart.py"
+    workspace_source.write_text(
+        workspace_source.read_text() + "# external edit\n", encoding="utf-8"
+    )
+
+    approve_result = CliRunner().invoke(
+        create_cli(model_gateway=ScriptedModel(), data_root=data_root),
+        ["approve", run_identifier, "--yes"],
+    )
+
+    assert approve_result.exit_code == 0, approve_result.output
+    assert "Outcome: Workspace Changed" in approve_result.output
+    assert "Error Kind: workspace_changed" in approve_result.output
+    assert "Repair Attempts: 0" in approve_result.output
+    assert not (run_root / "attempts" / "1" / "verification.json").exists()
+
+
+def test_apply_does_not_follow_a_parent_symlink_swapped_after_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = tmp_path / "nested-repository"
+    (repository / "pkg").mkdir(parents=True)
+    (repository / "pkg" / "cart.py").write_text("VALUE = 1\n", encoding="utf-8")
+    contract = tmp_path / "nested-contract.toml"
+    contract.write_text(
+        f"""source_id = "nested-repository"
+issue = "Repair nested source"
+verification = {json.dumps([sys.executable, "-c", "raise SystemExit(1)"])}
+editable_paths = ["pkg/cart.py"]
+""",
+        encoding="utf-8",
+    )
+    data_root = tmp_path / "runs"
+    run_result = CliRunner().invoke(
+        create_cli(
+            model_gateway=CandidateScenarioModel("valid", "pkg/cart.py"),
+            data_root=data_root,
+        ),
+        [
+            "run-local",
+            str(repository),
+            "--contract",
+            str(contract),
+            "--trust-repository",
+        ],
+    )
+    run_identifier = _run_identifier(run_result.output)
+    workspace = data_root / run_identifier / "workspace"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_source = outside / "cart.py"
+    outside_source.write_text("OUTSIDE = True\n", encoding="utf-8")
+    original_read = WorkspaceInspector.read_file
+    swapped = False
+
+    def read_then_swap_parent(inspector: WorkspaceInspector, path: str):
+        nonlocal swapped
+        result = original_read(inspector, path)
+        if not swapped:
+            (workspace / "pkg").rename(workspace / "pkg-original")
+            (workspace / "pkg").symlink_to(outside, target_is_directory=True)
+            swapped = True
+        return result
+
+    monkeypatch.setattr(WorkspaceInspector, "read_file", read_then_swap_parent)
+
+    approve_result = CliRunner().invoke(
+        create_cli(
+            model_gateway=CandidateScenarioModel("valid", "pkg/cart.py"),
+            data_root=data_root,
+        ),
+        ["approve", run_identifier, "--yes"],
+    )
+
+    assert approve_result.exit_code == 0, approve_result.output
+    assert "Outcome: Workspace Changed" in approve_result.output
+    assert outside_source.read_text(encoding="utf-8") == "OUTSIDE = True\n"
+    assert (workspace / "pkg-original" / "cart.py").read_text() == "VALUE = 1\n"
+
+
+def test_approve_reports_partial_apply_for_mixed_before_and_after_files(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "two-file-repository"
+    repository.mkdir()
+    (repository / "one.py").write_text("ONE = 1\n", encoding="utf-8")
+    (repository / "two.py").write_text("TWO = 2\n", encoding="utf-8")
+    verification_program = (
+        "from pathlib import Path; "
+        "raise SystemExit(0 if all('# approved change' in Path(path).read_text() "
+        "for path in ('one.py', 'two.py')) else 1)"
+    )
+    contract = tmp_path / "two-file-contract.toml"
+    contract.write_text(
+        f"""source_id = "two-file-repository"
+issue = "Repair both files"
+verification = {json.dumps([sys.executable, "-c", verification_program])}
+editable_paths = ["one.py", "two.py"]
+""",
+        encoding="utf-8",
+    )
+    data_root = tmp_path / "runs"
+    run_result = CliRunner().invoke(
+        create_cli(model_gateway=TwoFileCandidateModel(), data_root=data_root),
+        [
+            "run-local",
+            str(repository),
+            "--contract",
+            str(contract),
+            "--trust-repository",
+        ],
+    )
+    run_identifier = _run_identifier(run_result.output)
+    run_root = data_root / run_identifier
+    candidate = json.loads((run_root / "attempts" / "1" / "candidate.json").read_text())
+    first, second = candidate["candidate"]["replacements"]
+    (run_root / "workspace" / first["path"]).write_text(first["new_content"], encoding="utf-8")
+
+    approve_result = CliRunner().invoke(
+        create_cli(model_gateway=TwoFileCandidateModel(), data_root=data_root),
+        ["approve", run_identifier, "--yes"],
+    )
+
+    assert approve_result.exit_code == 0, approve_result.output
+    assert "Outcome: Error" in approve_result.output
+    assert "Error Kind: partial_apply" in approve_result.output
+    assert (run_root / "workspace" / second["path"]).read_text() != second["new_content"]
+    assert not (run_root / "attempts" / "1" / "verification.json").exists()
+
+
+def test_yes_cannot_skip_candidate_checksum_validation(tmp_path: Path) -> None:
+    data_root = tmp_path / "runs"
+    run_result = CliRunner().invoke(
+        create_cli(model_gateway=ScriptedModel(), data_root=data_root),
+        ["run", "cart-discount"],
+    )
+    run_identifier = _run_identifier(run_result.output)
+    run_root = data_root / run_identifier
+    candidate_path = run_root / "attempts" / "1" / "candidate.json"
+    candidate_path.write_text(candidate_path.read_text() + " ", encoding="utf-8")
+    database_before = (data_root / "checkpoints.sqlite").read_bytes()
+
+    approve_result = CliRunner().invoke(
+        create_cli(model_gateway=ScriptedModel(), data_root=data_root),
+        ["approve", run_identifier, "--yes"],
+    )
+
+    assert approve_result.exit_code == 2
+    assert "Candidate Patch does not match its replay completion checksums" in approve_result.output
+    assert (data_root / "checkpoints.sqlite").read_bytes() == database_before
+    assert not (run_root / "attempts" / "1" / "apply.json").exists()
 
 
 def test_model_cannot_read_an_absolute_workspace_path(tmp_path: Path) -> None:
