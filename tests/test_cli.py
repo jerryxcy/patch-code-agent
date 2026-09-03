@@ -452,6 +452,7 @@ def test_live_smoke_without_api_key_is_inconclusive_and_offline(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     factory_called = False
 
@@ -469,6 +470,49 @@ def test_live_smoke_without_api_key_is_inconclusive_and_offline(
     assert "Live Smoke Inconclusive: GEMINI_API_KEY is not configured" in result.output
     assert factory_called is False
     assert not (tmp_path / "runs").exists()
+
+
+def test_live_smoke_loads_gemini_api_key_from_dotenv(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api_key = "test-only-dotenv-gemini-secret"
+    (tmp_path / ".env").write_text(f"GEMINI_API_KEY={api_key}\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+
+    def factory(observed_key: str, _data_root: Path, _model: str):
+        assert observed_key == api_key
+        return ScriptedModel()
+
+    result = CliRunner().invoke(
+        create_cli(data_root=tmp_path / "runs", live_model_factory=factory),
+        ["live-smoke", "cart-discount", "--yes"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Live Smoke Succeeded" in result.output
+
+
+def test_live_smoke_environment_api_key_overrides_dotenv(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / ".env").write_text("GEMINI_API_KEY=dotenv-key\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("GEMINI_API_KEY", "environment-key")
+
+    def factory(observed_key: str, _data_root: Path, _model: str):
+        assert observed_key == "environment-key"
+        return ScriptedModel()
+
+    result = CliRunner().invoke(
+        create_cli(data_root=tmp_path / "runs", live_model_factory=factory),
+        ["live-smoke", "cart-discount", "--yes"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Live Smoke Succeeded" in result.output
 
 
 def test_live_smoke_rejects_injected_fixture_registry_before_model_request(
