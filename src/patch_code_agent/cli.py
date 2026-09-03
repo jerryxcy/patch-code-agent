@@ -23,7 +23,16 @@ from patch_code_agent.candidate import CandidatePatchReference, load_candidate_p
 from patch_code_agent.diagnosis import DiagnosisArtifactReference, load_diagnosis_artifact
 from patch_code_agent.fixtures import bundled_fixture_roots
 from patch_code_agent.gemini import SUPPORTED_GEMINI_MODEL_IDS, GeminiModelGateway
-from patch_code_agent.model import Diagnosis, ModelGateway, Plan, ScriptedModel
+from patch_code_agent.inspection import InspectionTools
+from patch_code_agent.model import (
+    CandidateRequest,
+    Diagnosis,
+    DiagnosisRequest,
+    ModelGateway,
+    Plan,
+    PlanningRequest,
+    ScriptedModel,
+)
 from patch_code_agent.patching import CumulativeDiffReference
 from patch_code_agent.planning import PlanArtifactReference, load_plan_artifact
 from patch_code_agent.sources import RepositorySourceKind
@@ -38,6 +47,29 @@ def _plan_lines(plan: Plan) -> tuple[tuple[str, str], ...]:
         ("Repair", plan.repair_strategy),
         ("Verification", plan.verification_strategy),
     )
+
+
+class _DeferredModelGateway:
+    """Create an external Model Gateway only when the resumed graph requests model work."""
+
+    def __init__(self, model_id: str, factory: Callable[[], ModelGateway]) -> None:
+        self.model_id = model_id
+        self._factory = factory
+        self._gateway: ModelGateway | None = None
+
+    def _get(self) -> ModelGateway:
+        if self._gateway is None:
+            self._gateway = self._factory()
+        return self._gateway
+
+    def create_plan(self, request: PlanningRequest, tools: InspectionTools) -> object:
+        return self._get().create_plan(request, tools)
+
+    def create_candidate(self, request: CandidateRequest, tools: InspectionTools) -> object:
+        return self._get().create_candidate(request, tools)
+
+    def create_diagnosis(self, request: DiagnosisRequest, tools: InspectionTools) -> object:
+        return self._get().create_diagnosis(request, tools)
 
 
 def create_cli(
@@ -65,7 +97,20 @@ def create_cli(
     )
     application: PatchCodeAgent | None = None
 
-    def get_application() -> PatchCodeAgent:
+    def create_gemini_gateway(model_id: str) -> ModelGateway:
+        """Validate explicit Gemini selection and load credentials at the provider seam."""
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if api_key is None:
+            api_key = dotenv_values(Path.cwd() / ".env").get("GEMINI_API_KEY")
+        if not api_key:
+            raise ValueError("GEMINI_API_KEY is not configured")
+        return live_model_factory(api_key, selected_data_root, model_id)
+
+    def get_application(
+        model_id: str | None = None,
+        *,
+        defer_model: bool = False,
+    ) -> PatchCodeAgent:
         """Create the stateful application lazily for commands that need writes.
 
         A single CLI invocation reuses one application, but ``close_application`` resets the local
@@ -73,8 +118,23 @@ def create_cli(
         """
         nonlocal application
         if application is None:
+            gateway = selected_model
+            if model_id is not None:
+                if model_id not in SUPPORTED_GEMINI_MODEL_IDS:
+                    supported = ", ".join(SUPPORTED_GEMINI_MODEL_IDS)
+                    raise ValueError(
+                        f"Unsupported Gemini model: {model_id}; choose one of: {supported}"
+                    )
+                gateway = (
+                    _DeferredModelGateway(
+                        model_id,
+                        lambda: create_gemini_gateway(model_id),
+                    )
+                    if defer_model
+                    else create_gemini_gateway(model_id)
+                )
             application = PatchCodeAgent(
-                model_gateway=selected_model,
+                model_gateway=gateway,
                 data_root=selected_data_root,
                 fixture_roots=fixture_roots,
                 verification_timeout_seconds=verification_timeout_seconds,
@@ -88,6 +148,13 @@ def create_cli(
         if application is not None:
             application.close()
             application = None
+
+    def get_resume_application(run_id: str) -> PatchCodeAgent:
+        """Restore the Run's original model, deferring external setup until it is needed."""
+        model_id = PatchRunStatusReader(selected_data_root).get(run_id).model_id
+        if model_id == selected_model.model_id:
+            return get_application()
+        return get_application(model_id, defer_model=True)
 
     def source_label(source_kind: RepositorySourceKind) -> str:
         """Render the closed Repository Source kind set for humans."""
@@ -131,22 +198,55 @@ def create_cli(
     def print_repair_details(
         *,
         verification_outcome: object | None,
-        verification_artifact: object | None,
-        cumulative_diff: CumulativeDiffReference | None,
         error_kind: object | None,
     ) -> None:
         """Render the shared post-Approval details for command results and durable status."""
-        if verification_outcome is not None and verification_artifact is not None:
+        if verification_outcome is not None:
             console.print(f"[dim]Verification:[/] {verification_outcome}")
-            console.print(f"[dim]Verification Artifact:[/] {verification_artifact}")
-        if cumulative_diff is not None:
-            console.print(f"[dim]Cumulative Diff:[/] {cumulative_diff.path}")
-            console.print(
-                f"[dim]Cumulative Diff Checksum:[/] {cumulative_diff.sha256}",
-                soft_wrap=True,
-            )
         if error_kind is not None:
             console.print(f"[dim]Error Kind:[/] {error_kind}")
+
+    def print_run_locations(
+        *,
+        status: str,
+        run_id: str,
+        files_changed: tuple[str, ...] | list[str],
+        verification_artifact: str | None,
+        cumulative_diff: CumulativeDiffReference | None,
+        report_path: str | None,
+    ) -> None:
+        """Show newcomers where to inspect a completed Patch Run."""
+        if outcome_label(status) is None:
+            return
+
+        run_root = (selected_data_root / run_id).resolve()
+        if status == "succeeded":
+            console.print(
+                "[bold green]Patch Run succeeded: the patch was applied and "
+                "Verification passed.[/]"
+            )
+        console.print("[bold]Files to review:[/]")
+        console.print(f"[dim]Run Workspace:[/] {run_root / 'workspace'}", soft_wrap=True)
+        for path in files_changed:
+            console.print(
+                f"[dim]Modified File:[/] {(run_root / 'workspace' / path).resolve()}",
+                soft_wrap=True,
+            )
+        if verification_artifact is not None:
+            console.print(
+                f"[dim]Verification Log:[/] {(run_root / verification_artifact).resolve()}",
+                soft_wrap=True,
+            )
+        if cumulative_diff is not None:
+            console.print(
+                f"[dim]Cumulative Diff:[/] {(run_root / cumulative_diff.path).resolve()}",
+                soft_wrap=True,
+            )
+        if report_path is not None:
+            console.print(
+                f"[dim]Run Report:[/] {(run_root / report_path).resolve()}",
+                soft_wrap=True,
+            )
 
     def print_budgets(budgets: ResourceBudgets) -> None:
         """Render every Resource Budget as durable used/limit values."""
@@ -214,6 +314,7 @@ def create_cli(
         console.print(f"[dim]Run Identifier:[/] {result['run_id']}")
         console.print(f"[dim]{source_label(result['source_kind'])}:[/] {result['source_id']}")
         console.print(f"[dim]Source Revision:[/] {result['source_revision']}", soft_wrap=True)
+        console.print(f"[dim]Model:[/] {result['model_id']}")
         if baseline := result.get("baseline_verification"):
             console.print(f"[dim]Baseline Verification:[/] {baseline['outcome']}")
         else:
@@ -229,12 +330,6 @@ def create_cli(
         verification = result.get("verification")
         print_repair_details(
             verification_outcome=(verification.get("outcome") if verification else None),
-            verification_artifact=(verification.get("artifact_path") if verification else None),
-            cumulative_diff=(
-                CumulativeDiffReference.model_validate(raw_cumulative_diff)
-                if (raw_cumulative_diff := result.get("cumulative_diff"))
-                else None
-            ),
             error_kind=result.get("error_kind"),
         )
         if budget_name := result.get("budget_name"):
@@ -243,9 +338,22 @@ def create_cli(
                 f"[dim]Budget Usage:[/] {result.get('budget_used')}/{result.get('budget_limit')}"
             )
         if report := result.get("report_artifact"):
-            console.print(f"[dim]Run Report:[/] {report['path']}")
             console.print(f"[dim]Run Report Checksum:[/] {report['sha256']}", soft_wrap=True)
         console.print(f"[dim]status:[/] {result['status']}")
+        print_run_locations(
+            status=result["status"],
+            run_id=result["run_id"],
+            files_changed=result.get("files_changed", []),
+            verification_artifact=(
+                str(verification["artifact_path"]) if verification is not None else None
+            ),
+            cumulative_diff=(
+                CumulativeDiffReference.model_validate(raw_cumulative_diff)
+                if (raw_cumulative_diff := result.get("cumulative_diff"))
+                else None
+            ),
+            report_path=(str(report["path"]) if report else None),
+        )
 
     @cli.callback()
     def main() -> None:
@@ -262,7 +370,7 @@ def create_cli(
         finally:
             close_application()
         for repository in repositories:
-            console.print(f"[bold]{repository.manifest.fixture_id}[/]: {repository.issue_title}")
+            console.print(f"[bold]{repository.source_id}[/]: {repository.issue_title}")
 
     @cli.command()
     def status(
@@ -280,6 +388,7 @@ def create_cli(
             f"[dim]Source Revision:[/] {patch_run.source_revision}",
             soft_wrap=True,
         )
+        console.print(f"[dim]Model:[/] {patch_run.model_id}")
         console.print(f"[dim]Phase:[/] {patch_run.phase}")
         if outcome := outcome_label(patch_run.phase):
             console.print(f"[dim]Outcome:[/] {outcome}")
@@ -293,17 +402,12 @@ def create_cli(
             verification_outcome=(
                 patch_run.verification.outcome if patch_run.verification is not None else None
             ),
-            verification_artifact=(
-                patch_run.verification.artifact_path if patch_run.verification is not None else None
-            ),
-            cumulative_diff=patch_run.cumulative_diff,
             error_kind=patch_run.error_kind,
         )
         if patch_run.budget_name is not None:
             console.print(f"[dim]Budget:[/] {patch_run.budget_name}")
             console.print(f"[dim]Budget Usage:[/] {patch_run.budget_used}/{patch_run.budget_limit}")
         if patch_run.report_artifact is not None:
-            console.print(f"[dim]Run Report:[/] {patch_run.report_artifact.path}")
             console.print(
                 f"[dim]Run Report Checksum:[/] {patch_run.report_artifact.sha256}",
                 soft_wrap=True,
@@ -327,6 +431,22 @@ def create_cli(
             and patch_run.candidate_artifact is not None
         ):
             print_candidate_patch(patch_run.candidate_artifact, patch_run.candidate_diff)
+        print_run_locations(
+            status=patch_run.phase,
+            run_id=patch_run.run_id,
+            files_changed=patch_run.files_changed,
+            verification_artifact=(
+                patch_run.verification.artifact_path
+                if patch_run.verification is not None
+                else None
+            ),
+            cumulative_diff=patch_run.cumulative_diff,
+            report_path=(
+                patch_run.report_artifact.path
+                if patch_run.report_artifact is not None
+                else None
+            ),
+        )
 
     @cli.command()
     def run(
@@ -334,12 +454,19 @@ def create_cli(
             str,
             typer.Argument(help="Registered Fixture Repository identifier."),
         ],
+        model: Annotated[
+            str | None,
+            typer.Option(
+                "--model",
+                help="Send inspected Fixture contents to this Gemini model.",
+            ),
+        ] = None,
     ) -> None:
         """Start a Patch Run for a registered Fixture Repository."""
         run_id = str(uuid4())
         try:
-            result = get_application().start_patch_run(fixture_id=fixture_id, run_id=run_id)
-        except ValueError as error:
+            result = get_application(model).start_patch_run(fixture_id=fixture_id, run_id=run_id)
+        except (RuntimeError, ValueError) as error:
             console.print(f"[red]{error}[/]")
             raise typer.Exit(code=2) from error
         finally:
@@ -471,7 +598,7 @@ def create_cli(
             return typer.confirm("Approve this exact Candidate Patch?", default=False)
 
         try:
-            result = get_application().approve_patch_run(
+            result = get_resume_application(run_id).approve_patch_run(
                 run_id=run_id,
                 confirm=confirm_candidate,
             )
@@ -495,16 +622,7 @@ def create_cli(
             typer.Argument(
                 exists=True,
                 file_okay=False,
-                help="Explicitly selected local Trusted Repository.",
-            ),
-        ],
-        contract: Annotated[
-            Path,
-            typer.Option(
-                "--contract",
-                exists=True,
-                dir_okay=False,
-                help="TOML Patch Run Contract outside the repository.",
+                help="Local Trusted Repository containing patch-run.toml.",
             ),
         ],
         trust_repository: Annotated[
@@ -514,6 +632,13 @@ def create_cli(
                 help="Acknowledge that repository Verification executes with host authority.",
             ),
         ] = False,
+        model: Annotated[
+            str | None,
+            typer.Option(
+                "--model",
+                help="Send inspected Trusted Repository contents to this Gemini model.",
+            ),
+        ] = None,
     ) -> None:
         """Start a Patch Run from an explicitly trusted local repository."""
         if not trust_repository:
@@ -524,12 +649,11 @@ def create_cli(
 
         run_id = str(uuid4())
         try:
-            result = get_application().start_trusted_patch_run(
+            result = get_application(model).start_trusted_patch_run(
                 repository=repository,
-                contract_path=contract,
                 run_id=run_id,
             )
-        except ValueError as error:
+        except (RuntimeError, ValueError) as error:
             console.print(f"[red]{error}[/]")
             raise typer.Exit(code=2) from error
         finally:

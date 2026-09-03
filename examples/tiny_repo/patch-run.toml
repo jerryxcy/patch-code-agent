@@ -1,4 +1,4 @@
-fixture_id = "cart-discount"
+source_id = "cart-discount"
 issue_path = "issue.md"
 verification = ["pytest", "test_cart.py"]
 editable_paths = ["cart.py"]

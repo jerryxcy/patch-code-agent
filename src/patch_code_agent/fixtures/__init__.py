@@ -1,109 +1,33 @@
-"""Discover bundled fixtures and translate manifests into Patch Run contracts.
-
-A Fixture Manifest stores paths because its Issue lives inside the synthetic repository. Loading
-resolves those paths, reads the Issue, and creates the same source-neutral ``PatchRunContract`` used
-by trusted repositories. This keeps fixture packaging concerns out of the execution graph.
-"""
+"""Discover bundled Fixture Repositories through the shared Patch Run manifest."""
 
 from __future__ import annotations
 
-import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict
-
-from patch_code_agent.sources import (
-    EditablePaths,
-    PatchRunContract,
-    RelativeSourcePath,
-    RepositorySource,
-    RepositorySourceId,
-    VerificationArgv,
-    reject_source_symlinks,
-    resolve_source_file,
-    validate_relative_path,
-)
-
-
-class FixtureManifest(BaseModel):
-    """Validated on-disk metadata for a registered Fixture Repository.
-
-    Attributes:
-        fixture_id: Unique lowercase kebab-case identifier used by the ``run`` CLI command.
-        issue_path: Fixture-relative Markdown/text file containing the Issue.
-        verification: Controlled argv tuple used for baseline and later Verification.
-        editable_paths: Fixture-relative files that future patches may modify.
-
-    Example:
-        >>> manifest = FixtureManifest(
-        ...     fixture_id="cart-discount",
-        ...     issue_path="issue.md",
-        ...     verification=("pytest", "-q"),
-        ...     editable_paths=("cart.py",),
-        ... )
-        >>> manifest.issue_path
-        'issue.md'
-    """
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    fixture_id: RepositorySourceId
-    issue_path: RelativeSourcePath
-    verification: VerificationArgv
-    editable_paths: EditablePaths
+from patch_code_agent.sources import RepositorySource, load_repository_source
 
 
 @dataclass(frozen=True, slots=True)
 class FixtureRepository:
-    """A registered synthetic repository and its validated contract.
+    """A registered synthetic repository backed by a normalized source."""
 
-    The original manifest remains available for registry/UI metadata, while ``contract`` contains
-    the fully loaded Issue text consumed by Patch Run execution.
+    source: RepositorySource
 
-    Attributes:
-        manifest: Validated path-based metadata read from ``fixture.toml``.
-        root: Resolved root directory containing the synthetic repository.
-        contract: Source-neutral contract with the Issue file replaced by its loaded text.
-
-    Example:
-        >>> manifest = FixtureManifest(
-        ...     fixture_id="cart-discount",
-        ...     issue_path="issue.md",
-        ...     verification=("pytest",),
-        ...     editable_paths=("cart.py",),
-        ... )
-        >>> fixture = FixtureRepository(
-        ...     manifest=manifest,
-        ...     root=Path("examples/tiny_repo").resolve(),
-        ...     contract=PatchRunContract(
-        ...         issue="# Incorrect discount calculation",
-        ...         verification=manifest.verification,
-        ...         editable_paths=manifest.editable_paths,
-        ...     ),
-        ... )
-        >>> fixture.issue_title
-        'Incorrect discount calculation'
-    """
-
-    manifest: FixtureManifest
-    root: Path
-    contract: PatchRunContract
+    @property
+    def source_id(self) -> str:
+        """Return the stable identifier used by the ``run`` command."""
+        return self.source.source_id
 
     @property
     def issue_title(self) -> str:
         """Return the first non-empty Issue line as a compact CLI label."""
-        first_line = next(line for line in self.contract.issue.splitlines() if line.strip())
+        first_line = next(line for line in self.source.contract.issue.splitlines() if line.strip())
         return first_line.removeprefix("# ").strip()
 
     def as_repository_source(self) -> RepositorySource:
         """Expose a fixture through the source-neutral Repository Source interface."""
-        return RepositorySource(
-            kind="fixture",
-            source_id=self.manifest.fixture_id,
-            root=self.root,
-            contract=self.contract,
-        )
+        return self.source
 
 
 class FixtureRegistry:
@@ -111,7 +35,7 @@ class FixtureRegistry:
 
     def __init__(self, repositories: tuple[FixtureRepository, ...]) -> None:
         """Index validated repositories while enforcing unique identifiers."""
-        self._repositories = {repository.manifest.fixture_id: repository for repository in repositories}
+        self._repositories = {repository.source_id: repository for repository in repositories}
         if len(self._repositories) != len(repositories):
             raise ValueError("Fixture identifiers must be unique")
 
@@ -128,11 +52,7 @@ class FixtureRegistry:
 
 
 def bundled_fixture_roots() -> tuple[Path, ...]:
-    """Locate packaged fixtures, falling back to the source checkout layout.
-
-    Installed wheels include ``cart_discount`` beside this module. During repository development,
-    the equivalent fixture lives under ``examples/tiny_repo`` instead.
-    """
+    """Locate packaged fixtures, falling back to the source checkout layout."""
     installed_fixture = Path(__file__).resolve().parent / "cart_discount"
     if installed_fixture.is_dir():
         return (installed_fixture,)
@@ -141,59 +61,7 @@ def bundled_fixture_roots() -> tuple[Path, ...]:
 
 
 def load_fixture_registry(roots: tuple[Path, ...]) -> FixtureRegistry:
-    """Validate fixture roots and build an identifier-indexed registry."""
-    return FixtureRegistry(tuple(_load_fixture_repository(root) for root in roots))
-
-
-def _load_fixture_repository(root: Path) -> FixtureRepository:
-    """Validate one fixture tree and normalize its manifest and Issue.
-
-    Symlinks, missing files, ignored editable paths, malformed TOML, unknown fields, and empty Issue
-    text all fail during registry loading—before a Run Identifier, workspace, or subprocess exists.
-    """
-    reject_source_symlinks(root)
-    manifest_path = root / "fixture.toml"
-    try:
-        with manifest_path.open("rb") as manifest_file:
-            manifest = FixtureManifest.model_validate(tomllib.load(manifest_file))
-    except (OSError, ValueError) as error:
-        raise ValueError(f"Invalid Fixture Manifest at {manifest_path}: {error}") from error
-
-    resolved_root = root.resolve()
-    issue_path = resolve_source_file(resolved_root, manifest.issue_path, "Issue")
-    for editable_path in manifest.editable_paths:
-        resolve_source_file(resolved_root, editable_path, "editable path")
-
-    issue = issue_path.read_text(encoding="utf-8")
-    if not issue.strip():
-        raise ValueError("Fixture Issue must not be empty")
-    try:
-        contract = PatchRunContract(
-            issue=issue,
-            verification=manifest.verification,
-            editable_paths=manifest.editable_paths,
-            protected_paths=_fixture_protected_paths(resolved_root, manifest),
-        )
-    except ValueError as error:
-        raise ValueError(f"Invalid Fixture Manifest at {manifest_path}: {error}") from error
-
-    return FixtureRepository(
-        manifest=manifest,
-        root=resolved_root,
-        contract=contract,
+    """Load fixtures through the same manifest interface as local repositories."""
+    return FixtureRegistry(
+        tuple(FixtureRepository(load_repository_source(root, kind="fixture")) for root in roots)
     )
-
-
-def _fixture_protected_paths(root: Path, manifest: FixtureManifest) -> tuple[str, ...]:
-    """Identify the Issue, manifest, and file arguments used by Verification."""
-    protected = [manifest.issue_path, "fixture.toml"]
-    for argument in manifest.verification:
-        candidate_value = argument.split("::", 1)[0]
-        try:
-            validate_relative_path(candidate_value)
-        except ValueError:
-            continue
-        candidate = root.joinpath(*Path(candidate_value).parts)
-        if candidate.is_file():
-            protected.append(Path(candidate_value).as_posix())
-    return tuple(dict.fromkeys(protected))

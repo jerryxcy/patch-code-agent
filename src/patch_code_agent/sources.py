@@ -1,9 +1,8 @@
-"""Validate repository sources and normalize them into Patch Run inputs.
+"""Load every repository source through one Patch Run manifest interface.
 
-Bundled fixtures and explicitly trusted local repositories have different file representations,
-but graph execution should not care where a source came from. This module defines their shared
-``RepositorySource`` and ``PatchRunContract`` boundary, including bounded Issue text, controlled
-Verification argv, editable paths, containment checks, and the no-symlink policy.
+Bundled fixtures and explicitly trusted local repositories share ``patch-run.toml`` and normalize
+into the same ``RepositorySource`` and ``PatchRunContract`` types. This module also enforces bounded
+Issue text, controlled Verification argv, editable paths, containment checks, and no symlinks.
 """
 
 from __future__ import annotations
@@ -14,7 +13,14 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Annotated, Literal
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    model_validator,
+)
 
 _MAX_EDITABLE_PATHS = 256
 _MAX_ISSUE_CHARACTERS = 32_768
@@ -135,27 +141,41 @@ class PatchRunContract(BaseModel):
     protected_paths: tuple[RelativeSourcePath, ...] = ()
 
 
-class TrustedRepositoryContract(PatchRunContract):
-    """File representation of a Trusted Repository's Patch Run Contract.
+class PatchRunManifest(BaseModel):
+    """Shared ``patch-run.toml`` representation for every Repository Source.
 
     Attributes:
-        source_id: Lowercase kebab-case identifier supplied by the external TOML contract.
-        issue: Inherited problem statement describing the requested repair.
-        verification: Inherited controlled argv executed with host authority after explicit opt-in.
-        editable_paths: Inherited allowlist of repository-relative paths.
+        source_id: Lowercase kebab-case identifier used by CLI commands and output.
+        issue: Optional inline problem statement; mutually exclusive with ``issue_path``.
+        issue_path: Optional repository-relative problem statement file.
+        verification: Controlled argv used for baseline and later Verification.
+        editable_paths: Repository-relative files that Candidate Patches may modify.
 
     Example:
-        >>> contract = TrustedRepositoryContract(
-        ...     source_id="trusted-cart",
-        ...     issue="Fix total calculation",
+        >>> manifest = PatchRunManifest(
+        ...     source_id="cart-discount",
+        ...     issue_path="issue.md",
         ...     verification=("pytest",),
         ...     editable_paths=("cart.py",),
         ... )
-        >>> contract.source_id
-        'trusted-cart'
+        >>> manifest.source_id
+        'cart-discount'
     """
 
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
     source_id: RepositorySourceId
+    issue: IssueText | None = None
+    issue_path: RelativeSourcePath | None = None
+    verification: VerificationArgv
+    editable_paths: EditablePaths
+
+    @model_validator(mode="after")
+    def require_one_issue_source(self) -> PatchRunManifest:
+        """Require exactly one inline Issue or Issue file."""
+        if (self.issue is None) == (self.issue_path is None):
+            raise ValueError("exactly one of issue or issue_path is required")
+        return self
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,33 +209,60 @@ class RepositorySource:
     contract: PatchRunContract
 
 
-def load_trusted_repository(repository: Path, contract_path: Path) -> RepositorySource:
-    """Load an explicitly trusted local repository and its external TOML contract.
+def load_trusted_repository(repository: Path) -> RepositorySource:
+    """Load an explicitly trusted local repository and its ``patch-run.toml`` contract."""
+    return load_repository_source(repository, kind="trusted")
 
-    Keeping the contract outside the repository prevents repository content from silently
-    changing its own Issue, Verification command, or edit policy. This validates structure and
-    containment only; execution still has host authority and therefore requires CLI opt-in.
-    """
+
+def load_repository_source(repository: Path, *, kind: RepositorySourceKind) -> RepositorySource:
+    """Load either source kind through the shared ``patch-run.toml`` interface."""
     reject_source_symlinks(repository)
-    if contract_path.is_symlink():
-        raise ValueError(f"Patch Run Contract must not be a symbolic link: {contract_path}")
     resolved_root = repository.resolve()
-    if contract_path.resolve().is_relative_to(resolved_root):
-        raise ValueError("Patch Run Contract must be outside the Repository Source")
+    manifest_path = resolved_root / "patch-run.toml"
     try:
-        with contract_path.open("rb") as contract_file:
-            contract = TrustedRepositoryContract.model_validate(tomllib.load(contract_file))
+        with manifest_path.open("rb") as manifest_file:
+            manifest = PatchRunManifest.model_validate(tomllib.load(manifest_file))
     except (OSError, ValueError) as error:
-        raise ValueError(f"Invalid Patch Run Contract at {contract_path}: {error}") from error
+        raise ValueError(f"Invalid Patch Run Manifest at {manifest_path}: {error}") from error
 
-    for editable_path in contract.editable_paths:
+    issue = manifest.issue
+    if manifest.issue_path is not None:
+        issue_path = resolve_source_file(resolved_root, manifest.issue_path, "Issue")
+        issue = issue_path.read_text(encoding="utf-8")
+    for editable_path in manifest.editable_paths:
         resolve_source_file(resolved_root, editable_path, "editable path")
+    try:
+        contract = PatchRunContract(
+            issue=issue,
+            verification=manifest.verification,
+            editable_paths=manifest.editable_paths,
+            protected_paths=_protected_paths(resolved_root, manifest),
+        )
+    except ValueError as error:
+        raise ValueError(f"Invalid Patch Run Manifest at {manifest_path}: {error}") from error
     return RepositorySource(
-        kind="trusted",
-        source_id=contract.source_id,
+        kind=kind,
+        source_id=manifest.source_id,
         root=resolved_root,
         contract=contract,
     )
+
+
+def _protected_paths(root: Path, manifest: PatchRunManifest) -> tuple[str, ...]:
+    """Protect the manifest, Issue file, and file arguments used by Verification."""
+    protected = ["patch-run.toml"]
+    if manifest.issue_path is not None:
+        protected.append(manifest.issue_path)
+    for argument in manifest.verification:
+        candidate_value = argument.split("::", 1)[0]
+        try:
+            validate_relative_path(candidate_value)
+        except ValueError:
+            continue
+        candidate = root.joinpath(*Path(candidate_value).parts)
+        if candidate.is_file():
+            protected.append(Path(candidate_value).as_posix())
+    return tuple(dict.fromkeys(protected))
 
 
 def reject_source_symlinks(root: Path) -> None:

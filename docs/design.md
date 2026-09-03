@@ -5,31 +5,14 @@
 implementation 與 acceptance spec 見
 [GitHub Issue #2](https://github.com/jerryxcy/patch-code-agent/issues/2)。
 
-這份文件描述的是已確認的 **MVP target design**。目前已完成 Fixture Registry、明確 opt-in
-的 Trusted Repository Adapter、隔離 Run Workspace、Baseline Verification 與 SQLite-backed
-durable status，以及透過 bounded inspection tools 產生的 typed Plan Artifact。Baseline 失敗後，
-模型會提出 bounded structured replacements；host 驗證 editable path、read hash 與大小，產生
-exact diff、保存 immutable Candidate Patch Artifact，再以 LangGraph interrupt 跨程序停在
-Approval Gate。另一個 CLI process 可在 per-run exclusive lock 下核准或拒絕 Candidate；核准路徑
-會重驗 checksum 與 workspace preimage，以 before/after hashes replay-safe 套用，再執行並保存
-post-apply Verification。通過時形成 durable Succeeded outcome 與 cumulative diff；拒絕時 workspace
-與 Repair Attempt 均不改變。Verification failure 會保存 typed Diagnosis，保留已核准修改並產生
-相對目前 workspace 的下一份 Candidate；第三次失敗形成 Attempts Exhausted。完整 Resource
-Budget enforcement 會在 host 邊界停止額外工作；每個 transition 保存 replay-safe Run Event，
-所有 terminal outcomes 都形成 versioned Run Report。驗收進度以 GitHub Issue #2 為準。
-外部 provider adapter 與 transient retry 由後續 MVP ticket 實作。
+這份文件描述目前的 MVP 設計；驗收進度以 GitHub Issue #2 為準。
 
 ---
 
 ## 一、Patch Run lifecycle
 
-Repository acquisition 與 Patch Run execution 是不同的 seam。Patch Run 接收已驗證的
-Repository Source、Patch Run Contract 與 immutable snapshot，而不依賴來源位於 wheel、
-本機 checkout 或其他儲存位置。Required deterministic scenarios 使用 registry-backed Fixture
-Adapter；Trusted Repository Adapter 需要明確的 local path、外部 Patch Run Contract 與 trust
-acknowledgement，但不改變 Run Workspace、graph、Checkpoint、Approval 或 Verification 的
-interface。Trusted Repository code 具有 host execution authority，不因 path containment 而
-成為 sandbox，且不得送入 Gemini free tier。
+Patch Run 可以使用內建 Fixture，或使用者明確信任的本機 Repository。兩者進入 graph 後都走
+相同流程；來源 Repository 不會被直接修改。
 
 ```mermaid
 flowchart TD
@@ -73,6 +56,19 @@ flowchart TD
     succeeded --> report
     exhausted --> report
 ```
+
+Graph flow：
+
+1. **建立隔離 workspace。** 把 Repository Source 複製到這次 Run 專用的目錄。
+2. **驗證輸入。** 確認 workspace、Issue 與 Patch Run Contract 可以使用。
+3. **執行 Baseline Verification。** 若已通過，代表問題無法重現；若測試失敗，才請模型規劃修補。
+4. **建立 Plan。** 模型透過受限的 list、read、search 工具了解程式碼並提出計畫。
+5. **建立 Candidate Patch。** 模型提出檔案替換內容，host 驗證後產生並保存 exact diff。
+6. **等待 Approval。** Graph 暫停讓使用者核准或拒絕，此時 workspace 還沒有被修改。
+7. **套用已核准的 Candidate。** Host 再次核對 checksum 與檔案版本，確認一致才寫入 workspace。
+8. **再次執行 Verification。** 通過就完成；執行錯誤或超時就以對應狀態結束。
+9. **診斷失敗並重試。** 測試仍失敗時保存 Diagnosis，再建立下一份增量 Candidate，最多三次。
+10. **產生 Run Report。** 所有結束路徑都保存最終狀態與可追蹤的 artifacts。
 
 順序有三個不能交換的 invariant：
 
@@ -165,9 +161,16 @@ Candidate Patch 只能替換 Patch Run Contract `editable_paths` 中已存在、
 每個 replacement 包含 `path + expected_sha256 + new_content`；MVP 不支援 create、delete、rename
 或 binary changes。Host 驗證 replacements 後，自己計算供 Approval Gate 顯示的 unified diff。
 
-Gemini Developer API free tier 只用於 synthetic Fixture Repository。Private code、credentials、
-個資與 arbitrary repository 不得進入 request。Required pytest 使用 Scripted Model，不依賴
-provider availability。
+Fixture 與 Trusted Repository 都可以使用 Gemini，但必須由使用者在 command 明確指定
+`--model`。這代表同意把 Gemini 透過 bounded tools 讀取的檔案內容與搜尋結果送到 Gemini
+Developer API；`--trust-repository` 只代表允許本機 Verification execution，兩種同意不能互相
+取代。Credentials、個資與其他不可外傳內容仍不得進入 request。Required pytest 使用 Scripted
+Model，不依賴 provider availability。
+
+CLI 會從目前目錄的 `.env` 載入 `GEMINI_API_KEY`，shell 中的同名環境變數優先。Key 只會傳入
+Gemini client，不會寫入 SQLite Checkpoint、Run Events、Run Artifacts、Run Report 或
+Verification environment。每個 provider request（包含 retry）的 credential-free transcript
+會保存在 `model-transcripts/*.jsonl`；Run Report 則記錄實際使用的 model ID。
 
 ---
 
@@ -180,6 +183,10 @@ Identifier resume。
 `approve` 必須重新顯示 immutable diff 與 checksum，並以 **No** 為預設。自動化只能顯式傳
 `--yes`；這個 flag 只略過互動 prompt，不略過 candidate checksum、file preimage hashes、
 Run Workspace 狀態或 per-run lock。
+
+CLI 會從 Run state 恢復原本的 model ID，不要求使用者在 `approve` 重複指定。若 Verification
+通過，resume 不會建立外部 model client；只有失敗後進入 Diagnosis 時才載入 Gemini credential
+並繼續使用同一個 model。
 
 Apply node 以所有 replacements 的 before / after hashes 保持可重入：
 
@@ -223,8 +230,8 @@ pytest exit code 的分類：
 | timeout | Budget Exceeded | Budget Exceeded |
 
 完整 stdout / stderr 永遠寫入 Run Artifact；模型與 Checkpoint 最多只收到 32 KiB failure
-excerpt。Free-tier quota、429 或 provider unavailable 讓外層 Live Smoke Run 成為 inconclusive，
-不改寫 Patch Run 的修補結果，也不讓 required pytest 失敗。
+excerpt。一般 Gemini Patch Run 遇到 quota、429 或 provider unavailable 時會保存 Error outcome；
+`live-smoke` 則回報 inconclusive。兩者都不會讓 required pytest 失敗。
 
 ---
 

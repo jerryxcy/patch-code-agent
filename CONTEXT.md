@@ -93,13 +93,15 @@ A small, registered synthetic Repository Source whose known Issue has a reproduc
 baseline, used for deterministic Patch Runs and integration checks.
 _Avoid_: Example repo, sample project, test repo
 
-**Fixture Manifest**:
-The packaged representation of a Fixture Repository's Patch Run Contract.
-_Avoid_: Fixture config, fixture metadata
+**Patch Run Manifest**:
+The repository-owned representation of a Patch Run Contract, shared by Fixture Repositories and
+Trusted Repositories.
+_Avoid_: Fixture manifest, repository config, fixture metadata
 
 **Trusted Repository**:
 A local Repository Source explicitly selected by a user who accepts that its code and
-Verification command execute with host authority.
+Verification command execute with host authority. Sending its contents to an external Model
+Gateway requires a separate, explicit model selection.
 _Avoid_: Arbitrary repository, safe repository
 
 **Run Workspace**:

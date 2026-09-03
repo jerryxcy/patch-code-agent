@@ -1,3 +1,7 @@
+---
+status: superseded by ADR-0014
+---
+
 # Limit Gemini free-tier data to synthetic fixtures
 
 The opt-in Live Smoke Run will use the Gemini Developer API free tier with

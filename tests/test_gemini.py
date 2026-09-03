@@ -132,7 +132,7 @@ def test_gemini_adapter_uses_bounded_tools_for_all_typed_outputs(tmp_path: Path)
     assert inspector.tool_executions == 2
     assert inspector.files_read == ("cart.py",)
     assert "do not call list_files" in transport.prompts[2]
-    assert "do not read tests, issue files, or fixture manifests" in transport.prompts[2]
+    assert "do not read tests, issue files, or Patch Run manifests" in transport.prompts[2]
     assert transport.conversations[1][0] is model_content
     assert transport.conversations[1][1] == {
         "role": "user",

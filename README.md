@@ -3,65 +3,109 @@
 以 LangGraph 實作的 test-driven coding-agent harness 練習專案。
 
 PatchCodeAgent 的重點不是讓模型自由操作 shell，而是把一次程式修補拆成可觀察、可暫停、
-可核准、可驗證的 **Patch Run**：host 控制狀態轉移與副作用，模型只負責產生 Plan、
-Candidate Patch 與 Diagnosis。
-
-> [!IMPORTANT]
-> 目前程式已支援列出 bundled fixtures、建立具唯一 Run Identifier 的隔離 workspace，
-> 也可用外部 Patch Run Contract 明確啟動本機 Trusted Repository，並以 SQLite 保存可跨程序
-> 查詢的狀態。Baseline Verification 會在隔離 workspace 中以受限環境執行：失敗才進入
-> planning；Scripted Model 只能透過 bounded list/read/search 工具觀察 workspace，產生 typed、
-> checksummed Plan Artifact 與 bounded structured replacements。Host 會驗證 replacement 的
-> editable path、read hash 與大小，自行產生 exact diff 和 checksummed Candidate Patch Artifact，
-> 再跨程序停在 Approval Gate；此時 workspace 尚未修改。另一個 CLI process 可以取得 per-run
-> exclusive lock 後核准或拒絕 Candidate。核准時會再次顯示 exact diff 與 checksum，以 replay-safe
-> before/after hash 規則套用修改，執行 post-apply Verification，並在成功時保存 cumulative diff；
-> Verification 失敗時會保留已核准修改、保存 typed Diagnosis，再提出相對目前 workspace 的
-> 增量 Candidate，最多三次 Repair Attempts；拒絕則不修改 workspace、也不消耗 Repair Attempt。
-> Host 會在 model、inspection、apply 與 Verification 邊界強制完整 Resource Budgets；每個 graph
-> transition 寫入 replay-safe Run Events，所有 terminal outcomes 產生 checksummed Run Report。
-
-完整的 MVP implementation 與 acceptance spec 見
-[GitHub Issue #2](https://github.com/jerryxcy/patch-code-agent/issues/2)。
+可核准、可驗證的 **Patch Run**：PatchCodeAgent 程式負責控制流程、修改檔案與執行測試，
+模型只負責提出 Plan、Candidate Patch 與 Diagnosis。
 
 ---
 
 ## 架構
 
 ```mermaid
-flowchart LR
-    human["使用者"] -->|run · status · approve · reject| cli["Typer CLI"]
-    fixture["Fixture Repository<br/>bundled · synthetic"] --> source["Repository Source Adapter"]
-    trusted["Trusted Repository<br/>explicit local opt-in"] --> source
-    source --> workspace["Run Workspace"]
-    cli --> workflow["LangGraph<br/>host-controlled flow"]
+flowchart TD
+    human["使用者"] --> cli["PatchCodeAgent CLI"]
+
+    cli -->|"command: patch-code-agent run cart-discount<br/>可加 --model gemini-..."| fixture["內建練習專案<br/>Fixture Repository<br/>例：cart-discount"]
+
+    fixture --> source["讀取專案與修補規則<br/>Repository Source Adapter"]
+    source --> app["準備並執行一次 Patch Run<br/>PatchCodeAgent"]
+    app -->|"複製；不修改來源專案"| workspace["本次執行的獨立副本<br/>Run Workspace"]
+    app --> workflow["修補流程<br/>LangGraph"]
     workspace <--> workflow
 
-    scripted["Scripted Model<br/>required pytest"] --> workflow
-    gemini["Gemini 3.7 Flash<br/>opt-in smoke"] --> workflow
+    model["選用的模型<br/>自動化測試：Scripted Model<br/>實際模型：Gemini"] -.->|"只提出 Plan、Patch、Diagnosis"| workflow
+    workflow --> candidate["等待核准的修改<br/>Candidate Patch"]
+    candidate --> approval{"要不要套用這份修改？<br/>Approval Gate"}
+    cli -->|"command: patch-code-agent approve RUN_ID"| approval
+    cli -->|"command: patch-code-agent reject RUN_ID"| approval
 
-    workflow <--> checkpoint[("SQLite Checkpoint")]
-    workflow --> approval{"Approval Gate"}
-    approval -->|resume| workflow
-    workflow --> verification["pytest Verification"]
-    verification --> workflow
-    workflow --> artifacts["Run Artifacts<br/>events · diff · logs · report"]
+    approval -->|"approve"| apply["套用修改到<br/>Run Workspace"]
+    apply --> workspace
+    apply --> verification["執行專案指定的測試 command<br/>例：pytest"]
+    verification -->|"fail：診斷後再提出修改"| workflow
+    verification -->|"pass"| succeeded["修補成功<br/>結束 Patch Run"]
+    approval -->|"reject"| rejected["不修改 Workspace<br/>結束 Patch Run"]
+
+    approval -.->|"暫停並保存"| storage[("執行記錄<br/>狀態 · diff · logs · report")]
+    succeeded --> storage
+    rejected --> storage
+    cli -->|"command: patch-code-agent status RUN_ID"| status["讀取目前狀態<br/>PatchRunStatusReader"]
+    status --> storage
+    workflow <--> storage
 ```
 
 | 元件 | 負責什麼 |
 |---|---|
-| **CLI** | 建立、查詢、核准或拒絕 Patch Run；對外只暴露 Run Identifier |
-| **LangGraph** | 明確控制 phase、Resource Budget、停止條件與跨程序 resume |
-| **Scripted Model** | 在 pytest 中穩定重現成功、Diagnosis、拒絕與 terminal outcomes |
-| **Gemini 3.7 Flash** | 只用於 opt-in Live Smoke Run，只能接觸 bundled synthetic fixtures |
-| **SQLite Checkpoint** | 保存 bounded control state，不保存大型輸出或原始碼 |
-| **Repository Source Adapter** | 將 bundled fixture 或明確信任的本機 repository 正規化為同一份 Patch Run input |
-| **Run Workspace** | 每個 Patch Run 的獨立副本；Repository Source 永不回寫 |
-| **Run Artifacts** | 保存 Plan、Diagnosis、model transcripts、diff、完整 Verification logs 與 Run Report |
+| **Fixture Repository** | 專案附帶的練習題，例如 `cart-discount`；適合第一次試跑與自動化測試 |
+| **Run Workspace** | 原始專案的獨立副本；所有修改都發生在這裡，不會直接改來源專案 |
+| **LangGraph** | 依序執行測試、規劃、產生 Patch、等待核准、套用修改與再次測試 |
+| **Scripted Model / Gemini** | 未指定 `--model` 時使用離線 Scripted Model；指定後由 Gemini 提出 Plan、Patch 與 Diagnosis |
+| **執行記錄** | 保存目前狀態、diff、測試 logs 與最後的 report，供 `status` 或後續 resume 使用 |
 
 完整狀態機、工具與信任邊界、Approval/replay safety、Resource Budgets、artifact layout 與
 Run Report schema 見 [docs/design.md](./docs/design.md)。單一決策的理由則記在
 [docs/adr/](./docs/adr/0001-prioritize-engineering-demonstration.md)。
+
+### Patch Run graph
+
+以下 Mermaid 圖直接對應 `build_graph()` 編譯出的 nodes、edges 與 conditional routes：
+
+```mermaid
+---
+config:
+  flowchart:
+    curve: linear
+---
+graph TD;
+    __start__([<p>__start__</p>]):::first
+    validate_input(validate_input)
+    baseline_verification(baseline_verification)
+    create_plan(create_plan)
+    create_candidate(create_candidate)
+    approval_gate(approval_gate)
+    reject_candidate(reject_candidate)
+    apply_candidate(apply_candidate)
+    repair_verification(repair_verification)
+    create_diagnosis(create_diagnosis)
+    finalize_report(finalize_report)
+    __end__([<p>__end__</p>]):::last
+    __start__ --> validate_input;
+    apply_candidate -. end .-> finalize_report;
+    apply_candidate -. verify .-> repair_verification;
+    approval_gate -. approve .-> apply_candidate;
+    approval_gate -. reject .-> reject_candidate;
+    baseline_verification -.-> create_plan;
+    baseline_verification -. end .-> finalize_report;
+    create_candidate -. approval .-> approval_gate;
+    create_candidate -. end .-> finalize_report;
+    create_diagnosis -. candidate .-> create_candidate;
+    create_diagnosis -. end .-> finalize_report;
+    create_plan -. candidate .-> create_candidate;
+    create_plan -. end .-> finalize_report;
+    reject_candidate --> finalize_report;
+    repair_verification -. diagnose .-> create_diagnosis;
+    repair_verification -. end .-> finalize_report;
+    validate_input --> baseline_verification;
+    finalize_report --> __end__;
+    classDef default fill:#f2f0ff,line-height:1.2
+    classDef first fill-opacity:0
+    classDef last fill:#bfb6fc
+```
+
+修改 graph 後，執行以下 command 會在終端輸出最新的 Mermaid Markdown，可用來更新上面的圖：
+
+```bash
+uv run python scripts/render_graph.py
+```
 
 ---
 
@@ -69,76 +113,71 @@ Run Report schema 見 [docs/design.md](./docs/design.md)。單一決策的理由
 
 目前需要 **Python 3.12+** 與 [uv](https://docs.astral.sh/uv/)。
 
+### 測試內建練習專案
+
 ```bash
+# 安裝專案執行與開發需要的套件。
 uv sync --dev
+
+# 列出可以直接試跑的內建練習專案。
 uv run patch-code-agent fixtures
+
+# 對 cart-discount 建立 Patch Run；記下輸出的 Run Identifier。
 uv run patch-code-agent run cart-discount
-uv run patch-code-agent status <run-id>
+
+# 把上一步輸出的 Run Identifier 貼到這裡。
+RUN_ID="貼上 Run Identifier"
+
+# 查看 Run 的狀態、Plan 與等待核准的 Candidate Patch。
+uv run patch-code-agent status "$RUN_ID"
+
+# 核准 Candidate Patch、套用修改並重新執行測試。
+uv run patch-code-agent approve "$RUN_ID" --yes
+
+# 查看核准後的最終狀態與測試結果。
+uv run patch-code-agent status "$RUN_ID"
+
+# 若想測試拒絕流程，先建立另一個不會影響前一個結果的 Patch Run。
+uv run patch-code-agent run cart-discount
+
+# 把新 Run 輸出的 Run Identifier 貼到這裡。
+NEW_RUN_ID="貼上新的 Run Identifier"
+
+# 拒絕 Candidate Patch。
+uv run patch-code-agent reject "$NEW_RUN_ID"
+
+# 確認該 Run 已結束且 workspace 沒有套用 Candidate Patch。
+uv run patch-code-agent status "$NEW_RUN_ID"
 ```
 
-`run` 只接受 registry 中的 Fixture Repository ID，並將 fixture 複製到
-`~/.patch-code-agent/runs/<run-id>/workspace/`。系統會先以 Patch Run Contract 的 argv 執行
-Baseline Verification；`cart-discount` 的預期失敗會進入 `pending_approval`，並輸出 typed Plan、
-exact Candidate Patch diff、Run Identifier、artifact checksums 與目前 counters。Candidate 只會保存為
-Run Artifact，尚未套用到 workspace。使用 `approve` 可再次檢視並核准該 Candidate；互動提示預設
-為 No，自動化必須明確加上 `--yes`。套用前仍會驗證 artifact checksum、workspace preimage 與
-per-run lock，成功通過 Verification 後 outcome 為 `Succeeded`。Baseline 通過時結果為
-`Issue Not Reproduced`，非測試失敗的
-exit code 為 `Error`，60 秒逾時則為 `Budget Exceeded`。來源 fixture 永遠不會被修改。
-若 post-apply Verification 以 exit code 1 失敗，系統會保存完整 log 與 bounded excerpt、建立
-Diagnosis 與下一份 Candidate，重新停在 Approval Gate；第三次仍失敗則為 `Attempts Exhausted`。
+核准流程完成後，看到 `Outcome: Succeeded` 和 `Verification: passed` 就代表修補成功。CLI 最後會
+列出完整路徑，可依序查看修改後的檔案、Verification log、`cumulative.diff` 與 `report.json`。
 
-指定本機 Trusted Repository 時，Patch Run Contract 必須放在 repository 外面：
+### 使用 Gemini
 
-```toml
-source_id = "my-repository"
-issue = "Fix the described defect"
-verification = ["pytest"]
-editable_paths = ["src/example.py"]
-```
+要讓 Gemini 實際閱讀程式碼並產生 Candidate Patch，先安裝 optional dependency，再透過環境變數
+提供 AI Studio key：
 
 ```bash
-uv run patch-code-agent run-local /path/to/repository \
-  --contract /path/to/patch-run.toml \
-  --trust-repository
-```
-
-`--trust-repository` 表示使用者接受該 repository 的 Verification 將以 host authority 執行；
-path containment 不是 hostile-code sandbox。Trusted Repository 內容不會送進 Gemini free tier。
-Run storage 固定在來源樹外；任何自訂 data root 與 Repository Source 重疊時都會被拒絕。
-
-Gemini Live Smoke 是選用測試，只能對 registry 中的 synthetic Fixture 執行。一般 pytest、Ruff
-與 CLI 流程完全離線，不需要 API key。需要驗證真實模型整合時，先安裝 optional dependency，
-再透過環境變數提供 AI Studio key：
-
-```bash
+# 安裝 Gemini integration。
 uv sync --extra gemini
-cp .env.example .env
-# Edit .env and set GEMINI_API_KEY.
-uv run patch-code-agent live-smoke cart-discount --yes
-```
 
-CLI 會從目前目錄的 `.env` 載入 `GEMINI_API_KEY`；若 shell 已設定同名環境變數，shell 的值優先。
-`GEMINI_API_KEY` 只交給 Gemini client boundary，不會寫入 checkpoint、Run Events、artifacts、
-Run Report 或 Verification environment。未設定 key，或遇到 quota、429／暫時不可用時，命令會回報
-`Live Smoke Inconclusive`，不會讓 required test suite 失敗。Live Smoke 仍會顯示 exact Candidate；
-省略 `--yes` 時必須由使用者互動核准。每個實際 provider request（包含 retry）的 credential-free
-transcript 會保存在該 run 的 `model-transcripts/*.jsonl`，方便檢查 tool calls 與 typed output。
-預設模型是 issue 指定的 `gemini-3.7-flash`；若該模型回報 high demand，可用
-`--model gemini-3.6-flash` 診斷完整整合流程。替代模型不會改變 synthetic-only policy，且 Run
-Report 會記錄實際 model ID。CLI 只顯示 credential-free HTTP classification，不輸出 provider
-原始錯誤訊息。
+# 建立本機環境變數檔案，再把 GEMINI_API_KEY 填入 .env。
+cp .env.example .env
+
+# 使用 Gemini 處理內建練習專案。
+uv run patch-code-agent run cart-discount --model gemini-3.7-flash
+```
 
 目前可用的 CLI：
 
 ```text
 patch-code-agent fixtures
-patch-code-agent run cart-discount
-patch-code-agent run-local <repository> --contract <contract.toml> --trust-repository
+patch-code-agent run cart-discount [--model gemini-3.7-flash]
+patch-code-agent run-local <repository> --trust-repository [--model gemini-3.7-flash]
 patch-code-agent live-smoke cart-discount [--yes] [--model gemini-3.7-flash]
 patch-code-agent status <run-id>
-patch-code-agent approve <run-id>
-patch-code-agent approve <run-id> --yes
+patch-code-agent approve <run-id> [--yes]
 patch-code-agent reject <run-id>
 ```
 
@@ -151,6 +190,7 @@ patch-code-agent reject <run-id>
 | `uv sync --dev` | 安裝 runtime 與 development dependencies |
 | `uv run pytest` | 執行 graph 與 CLI acceptance tests |
 | `uv run ruff check .` | 執行 Python lint |
+| `uv run python scripts/render_graph.py` | 從 compiled graph 輸出 Mermaid Markdown |
 | `uv run patch-code-agent run cart-discount` | 建立隔離的 CLI smoke run |
 | `uv run patch-code-agent live-smoke cart-discount --yes` | 以 Gemini 執行 opt-in synthetic Live Smoke |
 | `uv run pytest examples/tiny_repo/test_cart.py` | 執行 fixture baseline；目前預期失敗 |
@@ -166,14 +206,14 @@ src/patch_code_agent/
   candidate.py         structured replacement validation、exact diff 與 replay ledger
   cli.py               Typer CLI 與 Rich 輸出
   diagnosis.py         typed Diagnosis、failure evidence 與 replay ledger
-  fixtures/            Fixture manifest validation 與 registry
+  fixtures/            內建 Fixture Repository 的 discovery 與 registry
   gemini.py             Gemini 3.7 Flash transport、tool loop、retry 與 Live Smoke gateway
   graph.py             LangGraph nodes、edges 與 checkpoint 組裝
   inspection.py        bounded list、read、search 與 workspace 安全規則
   locking.py           mutating CLI commands 的 per-run exclusive lock
   patching.py          replay-safe replacement apply、preimage 分類與 cumulative diff
   planning.py          typed Plan validation、artifact checksum 與 replay ledger
-  sources.py           Repository Source、Patch Run Contract 與 trusted-local validation
+  sources.py           共用 Patch Run Manifest、Repository Source 與 validation
   state.py             Patch Run graph state
   verification.py      Baseline／Repair Verification、結果分類與 replay-safe logs
   workspace.py         隔離 Run Workspace 的建立規則
@@ -183,8 +223,11 @@ tests/
   test_gemini.py       Gemini transport contract、tool circulation、retry 與 request budget
   test_graph.py        Graph smoke test
 
+scripts/
+  render_graph.py      從 compiled graph 產生 Mermaid Markdown
+
 examples/tiny_repo/
-  fixture.toml         Fixture ID、Issue、Verification 與 editable paths
+  patch-run.toml       `run` 與 `run-local` 共用的專案設定
   issue.md             Cart discount Issue
   cart.py              刻意保留的錯誤實作
   test_cart.py         Fixture baseline 與 acceptance test
@@ -213,5 +256,5 @@ uv.lock                鎖定 dependencies
 | [ADR-0007](./docs/adr/0007-keep-orchestration-host-controlled.md) · [ADR-0013](./docs/adr/0013-use-langgraph-to-expose-the-harness.md) | Host-controlled LangGraph orchestration 與選擇較低階 abstraction 的原因 |
 | [ADR-0008](./docs/adr/0008-compute-diffs-from-structured-replacements.md) · [ADR-0012](./docs/adr/0012-make-run-mutations-replay-safe.md) | Structured replacements、diff、checksum 與 replay safety |
 | [ADR-0009](./docs/adr/0009-separate-control-state-from-run-artifacts.md) | SQLite control state 與 filesystem Run Artifacts 的分界 |
-| [ADR-0010](./docs/adr/0010-limit-gemini-free-tier-data.md) | Gemini free tier 只能接觸 synthetic fixtures 的資料政策 |
+| [ADR-0014](./docs/adr/0014-require-explicit-model-selection.md) | 使用 `--model` 明確同意把 Repository 內容送到 Gemini |
 | [docs/agents/](./docs/agents/domain.md) | GitHub Issues、triage labels 與 single-context domain docs 的 agent 設定 |

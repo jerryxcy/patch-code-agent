@@ -53,7 +53,7 @@ def test_synthetic_only_model_refuses_trusted_repository_before_model_request(
     repository = tmp_path / "trusted"
     repository.mkdir()
     (repository / "cart.py").write_text("VALUE = 1\n")
-    contract = tmp_path / "contract.toml"
+    contract = repository / "patch-run.toml"
     contract.write_text(
         f'''source_id = "trusted"
 issue = "Do not send this source"
@@ -71,7 +71,6 @@ editable_paths = ["cart.py"]
         with pytest.raises(ValueError, match="only accepts bundled synthetic"):
             application.start_trusted_patch_run(
                 repository=repository,
-                contract_path=contract,
                 run_id="private-run",
             )
     finally:
