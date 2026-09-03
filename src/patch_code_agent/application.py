@@ -70,6 +70,7 @@ class PatchRunStatus:
         source_kind: Whether the Run began from a fixture or trusted local repository.
         source_id: Stable Repository Source identifier shown to the user.
         source_revision: Digest of the immutable initial source snapshot.
+        model_id: Stable identifier of the Model Gateway used by this Run.
         phase: Latest persisted graph status without advancing graph execution.
         model_requests: Durable number of model calls consumed by this Run.
         tool_executions: Durable number of bounded inspection operations.
@@ -98,6 +99,7 @@ class PatchRunStatus:
         ...     source_kind="fixture",
         ...     source_id="cart-discount",
         ...     source_revision="9f86d081884c7d659a2feaa0c55ad015",
+        ...     model_id="scripted",
         ...     phase="planned",
         ...     model_requests=0,
         ...     tool_executions=0,
@@ -128,6 +130,7 @@ class PatchRunStatus:
     source_kind: RepositorySourceKind
     source_id: str
     source_revision: str
+    model_id: str
     phase: str
     model_requests: int
     tool_executions: int
@@ -227,6 +230,7 @@ class PatchRunStatusReader:
             source_kind=state["source_kind"],
             source_id=state["source_id"],
             source_revision=state["source_revision"],
+            model_id=state["model_id"],
             phase=state["status"],
             model_requests=state["model_requests"],
             tool_executions=state.get("tool_executions", 0),
@@ -324,11 +328,10 @@ class PatchCodeAgent:
         self,
         *,
         repository: Path,
-        contract_path: Path,
         run_id: str,
     ) -> RunState:
         """Start a Patch Run from an explicitly selected Trusted Repository."""
-        source = load_trusted_repository(repository, contract_path)
+        source = load_trusted_repository(repository)
         return self._start_patch_run(source=source, run_id=run_id)
 
     def reject_patch_run(self, *, run_id: str) -> RunState:
@@ -357,6 +360,10 @@ class PatchCodeAgent:
             if status.phase != "pending_approval":
                 raise ValueError(
                     f"Patch Run is not awaiting Approval (current phase: {status.phase})"
+                )
+            if status.model_id != self._model_id:
+                raise ValueError(
+                    f"Patch Run requires model {status.model_id}, got {self._model_id}"
                 )
             if not confirm(status):
                 return None

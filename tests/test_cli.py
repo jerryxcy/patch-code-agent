@@ -361,7 +361,7 @@ def _assert_terminal_report(
     )
     assert status.report_artifact is not None
     assert status.report_artifact.sha256 == hashlib.sha256(report_bytes).hexdigest()
-    assert "Run Report: report.json" in output
+    assert f"Run Report: {report_path.resolve()}" in output
     references = list(
         (report.artifacts.events,)
         + report.artifacts.diagnoses
@@ -417,7 +417,7 @@ def _run_trusted_inspection(
         target = repository / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(content)
-    contract = tmp_path / "inspection-contract.toml"
+    contract = repository / "patch-run.toml"
     contract.write_text(
         f"""source_id = "inspection-repository"
 issue = "Inspect the reported problem"
@@ -430,7 +430,7 @@ editable_paths = ["cart.py"]
     cli = create_cli(model_gateway=model, data_root=data_root)
     result = CliRunner().invoke(
         cli,
-        ["run-local", str(repository), "--contract", str(contract), "--trust-repository"],
+        ["run-local", str(repository), "--trust-repository"],
     )
     return result, data_root
 
@@ -446,6 +446,105 @@ def test_user_lists_registered_fixture_repositories(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     assert "cart-discount" in result.output
     assert "Incorrect discount calculation" in result.output
+
+
+def test_gemini_run_approval_does_not_repeat_or_call_the_model_when_verification_passes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GEMINI_API_KEY", "test-only-key")
+    data_root = tmp_path / "runs"
+
+    def factory(_key: str, _data_root: Path, model: str):
+        return ScriptedModel(model_id=model)
+
+    run_result = CliRunner().invoke(
+        create_cli(data_root=data_root, live_model_factory=factory),
+        ["run", "cart-discount", "--model", "gemini-3.6-flash"],
+    )
+
+    assert run_result.exit_code == 0, run_result.output
+    assert "status: pending_approval" in run_result.output
+    assert "Model: gemini-3.6-flash" in run_result.output
+    run_id = _run_identifier(run_result.output)
+
+    monkeypatch.delenv("GEMINI_API_KEY")
+    factory_called = False
+
+    def unexpected_factory(_key: str, _data_root: Path, _model: str):
+        nonlocal factory_called
+        factory_called = True
+        return ScriptedModel()
+
+    approve_result = CliRunner().invoke(
+        create_cli(data_root=data_root, live_model_factory=unexpected_factory),
+        ["approve", run_id, "--yes"],
+    )
+
+    assert approve_result.exit_code == 0, approve_result.output
+    assert "Outcome: Succeeded" in approve_result.output
+    assert factory_called is False
+    assert _assert_terminal_report(data_root, approve_result.output, "succeeded").model_id == (
+        "gemini-3.6-flash"
+    )
+
+
+def test_trusted_repository_run_can_use_gemini(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GEMINI_API_KEY", "test-only-key")
+    repository = tmp_path / "trusted-repository"
+    shutil.copytree(Path(__file__).parents[1] / "examples" / "tiny_repo", repository)
+    model = ScriptedModel(model_id="gemini-3.7-flash")
+
+    result = CliRunner().invoke(
+        create_cli(
+            data_root=tmp_path / "runs",
+            live_model_factory=lambda _key, _data_root, _model: model,
+        ),
+        [
+            "run-local",
+            str(repository),
+            "--trust-repository",
+            "--model",
+            "gemini-3.7-flash",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Trusted Repository: cart-discount" in result.output
+    assert "status: pending_approval" in result.output
+
+
+def test_gemini_is_restored_lazily_when_approval_needs_a_repair(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GEMINI_API_KEY", "test-only-key")
+    data_root = tmp_path / "runs"
+    factory_calls = 0
+
+    def factory(_key: str, _data_root: Path, model: str):
+        nonlocal factory_calls
+        factory_calls += 1
+        return ScriptedModel(model_id=model, repair_failures=1)
+
+    run_result = CliRunner().invoke(
+        create_cli(data_root=data_root, live_model_factory=factory),
+        ["run", "cart-discount", "--model", "gemini-3.7-flash"],
+    )
+    run_id = _run_identifier(run_result.output)
+
+    approve_result = CliRunner().invoke(
+        create_cli(data_root=data_root, live_model_factory=factory),
+        ["approve", run_id, "--yes"],
+    )
+
+    assert approve_result.exit_code == 0, approve_result.output
+    assert "status: pending_approval" in approve_result.output
+    assert "Candidate Artifact: attempts/2/candidate.json" in approve_result.output
+    assert factory_calls == 2
 
 
 def test_live_smoke_without_api_key_is_inconclusive_and_offline(
@@ -522,7 +621,7 @@ def test_live_smoke_rejects_injected_fixture_registry_before_model_request(
     private_fixture = tmp_path / "private-fixture"
     bundled_fixture = Path(__file__).parents[1] / "examples" / "tiny_repo"
     shutil.copytree(bundled_fixture, private_fixture)
-    manifest = private_fixture / "fixture.toml"
+    manifest = private_fixture / "patch-run.toml"
     manifest.write_text(
         manifest.read_text().replace("cart-discount", "private-fixture"),
         encoding="utf-8",
@@ -629,8 +728,8 @@ def test_live_smoke_rejects_unsupported_model_before_client_creation(
 def test_user_gets_clear_error_for_invalid_fixture_manifest(tmp_path: Path) -> None:
     invalid_fixture = tmp_path / "invalid-fixture"
     invalid_fixture.mkdir()
-    (invalid_fixture / "fixture.toml").write_text(
-        """fixture_id = "invalid-fixture"
+    (invalid_fixture / "patch-run.toml").write_text(
+        """source_id = "invalid-fixture"
 issue_path = "missing-issue.md"
 verification = ["pytest"]
 editable_paths = ["missing.py"]
@@ -652,8 +751,8 @@ editable_paths = ["missing.py"]
 def test_user_gets_clear_error_for_malformed_fixture_manifest(tmp_path: Path) -> None:
     invalid_fixture = tmp_path / "invalid-fixture"
     invalid_fixture.mkdir()
-    (invalid_fixture / "fixture.toml").write_text(
-        'fixture_id = ["not", "valid"',
+    (invalid_fixture / "patch-run.toml").write_text(
+        'source_id = ["not", "valid"',
         encoding="utf-8",
     )
     cli = create_cli(
@@ -665,14 +764,14 @@ def test_user_gets_clear_error_for_malformed_fixture_manifest(tmp_path: Path) ->
     result = CliRunner().invoke(cli, ["fixtures"])
 
     assert result.exit_code != 0
-    assert "Invalid Fixture Manifest" in result.output
+    assert "Invalid Patch Run Manifest" in result.output
 
 
 def test_user_gets_clear_error_for_empty_fixture_issue(tmp_path: Path) -> None:
     invalid_fixture = tmp_path / "invalid-fixture"
     invalid_fixture.mkdir()
-    (invalid_fixture / "fixture.toml").write_text(
-        """fixture_id = "empty-issue"
+    (invalid_fixture / "patch-run.toml").write_text(
+        """source_id = "empty-issue"
 issue_path = "issue.md"
 verification = ["pytest"]
 editable_paths = ["cart.py"]
@@ -690,15 +789,15 @@ editable_paths = ["cart.py"]
     result = CliRunner().invoke(cli, ["fixtures"])
 
     assert result.exit_code != 0
-    assert "Fixture Issue must not be empty" in result.output
+    assert "Patch Run Contract Issue must not be empty" in result.output
 
 
 def test_user_gets_clear_error_for_fixture_path_traversal(tmp_path: Path) -> None:
     invalid_fixture = tmp_path / "invalid-fixture"
     invalid_fixture.mkdir()
     (tmp_path / "outside.md").write_text("# Outside", encoding="utf-8")
-    (invalid_fixture / "fixture.toml").write_text(
-        """fixture_id = "path-traversal"
+    (invalid_fixture / "patch-run.toml").write_text(
+        """source_id = "path-traversal"
 issue_path = "../outside.md"
 verification = ["pytest"]
 editable_paths = ["cart.py"]
@@ -723,8 +822,8 @@ def test_user_gets_clear_error_for_symlink_in_fixture_tree(tmp_path: Path) -> No
     invalid_fixture.mkdir()
     outside_file = tmp_path / "outside.py"
     outside_file.write_text("SECRET = True\n", encoding="utf-8")
-    (invalid_fixture / "fixture.toml").write_text(
-        """fixture_id = "symlink-fixture"
+    (invalid_fixture / "patch-run.toml").write_text(
+        """source_id = "symlink-fixture"
 issue_path = "issue.md"
 verification = ["pytest"]
 editable_paths = ["cart.py"]
@@ -763,7 +862,7 @@ def test_user_starts_registered_patch_run_in_isolated_workspace(tmp_path: Path) 
 
     assert (data_root / "checkpoints.sqlite").is_file()
     assert (workspace / "cart.py").read_bytes() == original_cart
-    assert (workspace / "fixture.toml").is_file()
+    assert (workspace / "patch-run.toml").is_file()
     assert not (workspace / "__pycache__").exists()
     assert (fixture_repository / "cart.py").read_bytes() == original_cart
     assert "PatchCodeAgent plan" in result.output
@@ -794,7 +893,12 @@ def test_failing_baseline_creates_a_typed_checksummed_plan_artifact(tmp_path: Pa
     plan_artifact = json.loads(plan_bytes)
     checksum = hashlib.sha256(plan_bytes).hexdigest()
     assert plan_artifact == {
-        "files_read": ["cart.py", "fixture.toml", "issue.md", "test_cart.py"],
+        "files_read": [
+            "cart.py",
+            "issue.md",
+            "patch-run.toml",
+            "test_cart.py",
+        ],
         "model_id": "scripted",
         "model_requests": 1,
         "plan": {
@@ -992,7 +1096,7 @@ def test_files_changed_budget_accumulates_across_attempts(tmp_path: Path) -> Non
     paths = [f"file{index}.py" for index in range(4)]
     for path in paths:
         (repository / path).write_text("VALUE = 1\n", encoding="utf-8")
-    contract = tmp_path / "four-file-contract.toml"
+    contract = repository / "patch-run.toml"
     contract.write_text(
         f'''source_id = "four-file-repository"
 issue = "Change no more than three files"
@@ -1005,7 +1109,7 @@ editable_paths = {json.dumps(paths)}
     model = CumulativeFilesChangedBudgetModel()
     run_result = CliRunner().invoke(
         create_cli(model_gateway=model, data_root=data_root),
-        ["run-local", str(repository), "--contract", str(contract), "--trust-repository"],
+        ["run-local", str(repository), "--trust-repository"],
     )
     run_identifier = _run_identifier(run_result.output)
 
@@ -1102,7 +1206,7 @@ def test_approval_wait_is_excluded_from_active_time(tmp_path: Path) -> None:
     assert "Active Seconds Budget: 0.000/300.0" in status_result.output
 
 
-@pytest.mark.parametrize("path", ["test_cart.py", "issue.md", "fixture.toml"])
+@pytest.mark.parametrize("path", ["test_cart.py", "issue.md", "patch-run.toml"])
 def test_candidate_patch_rejects_tests_issue_and_manifest_changes(
     tmp_path: Path,
     path: str,
@@ -1126,18 +1230,18 @@ def test_candidate_patch_rejects_tests_issue_and_manifest_changes(
     assert not (run_root / "attempts" / "1" / "candidate.json").exists()
 
 
-@pytest.mark.parametrize("path", ["test_cart.py", "issue.md", "fixture.toml"])
+@pytest.mark.parametrize("path", ["test_cart.py", "issue.md", "patch-run.toml"])
 def test_candidate_patch_rejects_protected_files_even_when_manifest_marks_them_editable(
     tmp_path: Path,
     path: str,
 ) -> None:
     fixture = tmp_path / "unsafe-fixture"
     fixture.mkdir()
-    (fixture / "fixture.toml").write_text(
-        """fixture_id = "unsafe-fixture"
+    (fixture / "patch-run.toml").write_text(
+        """source_id = "unsafe-fixture"
 issue_path = "issue.md"
 verification = ["pytest", "test_cart.py"]
-editable_paths = ["cart.py", "test_cart.py", "issue.md", "fixture.toml"]
+editable_paths = ["cart.py", "test_cart.py", "issue.md", "patch-run.toml"]
 """,
         encoding="utf-8",
     )
@@ -1300,7 +1404,7 @@ def test_reject_refuses_a_non_pending_patch_run(tmp_path: Path) -> None:
     repository = tmp_path / "passing-repository"
     repository.mkdir()
     (repository / "cart.py").write_text("VALUE = 1\n", encoding="utf-8")
-    contract = tmp_path / "passing-contract.toml"
+    contract = repository / "patch-run.toml"
     contract.write_text(
         f"""source_id = "passing-repository"
 issue = "No reproducible failure"
@@ -1315,8 +1419,6 @@ editable_paths = ["cart.py"]
         [
             "run-local",
             str(repository),
-            "--contract",
-            str(contract),
             "--trust-repository",
         ],
     )
@@ -1449,7 +1551,7 @@ def test_user_approves_and_verifies_a_candidate_from_a_separate_cli_process(
     assert "Outcome: Succeeded" in approve_result.output
     assert "Repair Attempts: 1" in approve_result.output
     assert "Verification: passed" in approve_result.output
-    assert "Cumulative Diff: cumulative.diff" in approve_result.output
+    assert f"Cumulative Diff: {(run_root / 'cumulative.diff').resolve()}" in approve_result.output
     assert "subtotal = sum(prices)" in (run_root / "workspace" / "cart.py").read_text()
     assert (fixture_repository / "cart.py").read_bytes() == original_source
     report = _assert_terminal_report(data_root, approve_result.output, "succeeded")
@@ -1472,6 +1574,17 @@ def test_user_approves_and_verifies_a_candidate_from_a_separate_cli_process(
     assert "Phase: succeeded" in status_result.output
     assert "Outcome: Succeeded" in status_result.output
     assert "Repair Attempts: 1" in status_result.output
+    for output in (approve_result.output, status_result.output):
+        assert "Patch Run succeeded: the patch was applied and Verification passed." in output
+        assert "Files to review:" in output
+        assert f"Run Workspace: {(run_root / 'workspace').resolve()}" in output
+        assert f"Modified File: {(run_root / 'workspace' / 'cart.py').resolve()}" in output
+        assert (
+            f"Verification Log: {(run_root / 'attempts' / '1' / 'verification.log').resolve()}"
+            in output
+        )
+        assert f"Cumulative Diff: {(run_root / 'cumulative.diff').resolve()}" in output
+        assert f"Run Report: {(run_root / 'report.json').resolve()}" in output
 
 
 def test_approval_prompt_defaults_to_no_and_keeps_the_run_pending(tmp_path: Path) -> None:
@@ -1690,7 +1803,7 @@ def test_apply_does_not_follow_a_parent_symlink_swapped_after_validation(
     repository = tmp_path / "nested-repository"
     (repository / "pkg").mkdir(parents=True)
     (repository / "pkg" / "cart.py").write_text("VALUE = 1\n", encoding="utf-8")
-    contract = tmp_path / "nested-contract.toml"
+    contract = repository / "patch-run.toml"
     contract.write_text(
         f"""source_id = "nested-repository"
 issue = "Repair nested source"
@@ -1708,8 +1821,6 @@ editable_paths = ["pkg/cart.py"]
         [
             "run-local",
             str(repository),
-            "--contract",
-            str(contract),
             "--trust-repository",
         ],
     )
@@ -1759,7 +1870,7 @@ def test_approve_reports_partial_apply_for_mixed_before_and_after_files(
         "raise SystemExit(0 if all('# approved change' in Path(path).read_text() "
         "for path in ('one.py', 'two.py')) else 1)"
     )
-    contract = tmp_path / "two-file-contract.toml"
+    contract = repository / "patch-run.toml"
     contract.write_text(
         f"""source_id = "two-file-repository"
 issue = "Repair both files"
@@ -1774,8 +1885,6 @@ editable_paths = ["one.py", "two.py"]
         [
             "run-local",
             str(repository),
-            "--contract",
-            str(contract),
             "--trust-repository",
         ],
     )
@@ -2057,12 +2166,12 @@ def test_model_plan_is_runtime_validated_before_artifact_persistence(tmp_path: P
     assert not (run_roots[0] / "plan.json").exists()
 
 
-def test_user_starts_trusted_repository_run_from_explicit_contract(tmp_path: Path) -> None:
+def test_user_starts_trusted_repository_run_from_repository_contract(tmp_path: Path) -> None:
     repository = tmp_path / "trusted-repository"
     repository.mkdir()
     original_source = b"def total(items):\n    return sum(items)\n"
     (repository / "cart.py").write_bytes(original_source)
-    contract = tmp_path / "patch-run.toml"
+    contract = repository / "patch-run.toml"
     contract.write_text(
         f"""source_id = "trusted-cart"
 issue = "Fix the incorrect cart total"
@@ -2079,8 +2188,6 @@ editable_paths = ["cart.py"]
         [
             "run-local",
             str(repository),
-            "--contract",
-            str(contract),
             "--trust-repository",
         ],
     )
@@ -2110,7 +2217,7 @@ def test_run_workspace_excludes_visible_virtual_environment(tmp_path: Path) -> N
     virtual_environment = repository / "venv" / "lib"
     virtual_environment.mkdir(parents=True)
     (virtual_environment / "dependency.py").write_text("SECRET = True\n", encoding="utf-8")
-    contract = tmp_path / "patch-run.toml"
+    contract = repository / "patch-run.toml"
     contract.write_text(
         f"""source_id = "trusted-cart"
 issue = "Fix the incorrect cart total"
@@ -2127,8 +2234,6 @@ editable_paths = ["cart.py"]
         [
             "run-local",
             str(repository),
-            "--contract",
-            str(contract),
             "--trust-repository",
         ],
     )
@@ -2143,7 +2248,7 @@ def test_passing_baseline_becomes_issue_not_reproduced(tmp_path: Path) -> None:
     repository = tmp_path / "trusted-repository"
     repository.mkdir()
     (repository / "cart.py").write_text("VALUE = 1\n", encoding="utf-8")
-    contract = tmp_path / "patch-run.toml"
+    contract = repository / "patch-run.toml"
     contract.write_text(
         f"""source_id = "trusted-passing"
 issue = "Reproduce the reported issue"
@@ -2160,8 +2265,6 @@ editable_paths = ["cart.py"]
         [
             "run-local",
             str(repository),
-            "--contract",
-            str(contract),
             "--trust-repository",
         ],
     )
@@ -2185,7 +2288,7 @@ def test_baseline_exit_code_two_becomes_verification_error(tmp_path: Path) -> No
     repository = tmp_path / "trusted-repository"
     repository.mkdir()
     (repository / "cart.py").write_text("VALUE = 1\n", encoding="utf-8")
-    contract = tmp_path / "patch-run.toml"
+    contract = repository / "patch-run.toml"
     contract.write_text(
         f"""source_id = "trusted-error"
 issue = "Reproduce the reported issue"
@@ -2202,8 +2305,6 @@ editable_paths = ["cart.py"]
         [
             "run-local",
             str(repository),
-            "--contract",
-            str(contract),
             "--trust-repository",
         ],
     )
@@ -2257,7 +2358,7 @@ def test_repair_verification_infrastructure_error_is_not_attempts_exhausted(
         "text = Path('cart.py').read_text(); "
         "raise SystemExit(1 if 'sum(prices) - discount' in text else 2)"
     )
-    contract = tmp_path / "repair-verification-error.toml"
+    contract = repository / "patch-run.toml"
     contract.write_text(
         f'''source_id = "repair-verification-error"
 issue = "Repair the discount calculation"
@@ -2269,7 +2370,7 @@ editable_paths = ["cart.py"]
     data_root = tmp_path / "runs"
     run_result = CliRunner().invoke(
         create_cli(model_gateway=ScriptedModel(), data_root=data_root),
-        ["run-local", str(repository), "--contract", str(contract), "--trust-repository"],
+        ["run-local", str(repository), "--trust-repository"],
     )
     run_identifier = _run_identifier(run_result.output)
 
@@ -2289,7 +2390,7 @@ def test_baseline_timeout_becomes_budget_exceeded(tmp_path: Path) -> None:
     repository = tmp_path / "trusted-repository"
     repository.mkdir()
     (repository / "cart.py").write_text("VALUE = 1\n", encoding="utf-8")
-    contract = tmp_path / "patch-run.toml"
+    contract = repository / "patch-run.toml"
     contract.write_text(
         f"""source_id = "trusted-timeout"
 issue = "Reproduce the reported issue"
@@ -2310,8 +2411,6 @@ editable_paths = ["cart.py"]
         [
             "run-local",
             str(repository),
-            "--contract",
-            str(contract),
             "--trust-repository",
         ],
     )
@@ -2345,7 +2444,7 @@ def test_baseline_uses_minimal_environment_and_bounded_checkpoint_summary(
         "print('x' * 40000); "
         "raise SystemExit(1)"
     )
-    contract = tmp_path / "patch-run.toml"
+    contract = repository / "patch-run.toml"
     contract.write_text(
         f"""source_id = "trusted-environment"
 issue = "Reproduce the reported issue"
@@ -2362,8 +2461,6 @@ editable_paths = ["cart.py"]
         [
             "run-local",
             str(repository),
-            "--contract",
-            str(contract),
             "--trust-repository",
         ],
     )
@@ -2384,32 +2481,6 @@ editable_paths = ["cart.py"]
 def test_user_must_explicitly_acknowledge_trusted_repository_execution(tmp_path: Path) -> None:
     repository = tmp_path / "trusted-repository"
     repository.mkdir()
-    contract = tmp_path / "patch-run.toml"
-    contract.write_text(
-        """source_id = "trusted-cart"
-issue = "Fix the incorrect cart total"
-verification = ["pytest"]
-editable_paths = ["cart.py"]
-""",
-        encoding="utf-8",
-    )
-    data_root = tmp_path / "runs"
-    cli = create_cli(model_gateway=ScriptedModel(), data_root=data_root)
-
-    result = CliRunner().invoke(
-        cli,
-        ["run-local", str(repository), "--contract", str(contract)],
-    )
-
-    assert result.exit_code != 0
-    assert "requires explicit --trust-repository acknowledgement" in result.output
-    assert not data_root.exists()
-
-
-def test_trusted_repository_contract_must_stay_outside_source_tree(tmp_path: Path) -> None:
-    repository = tmp_path / "trusted-repository"
-    repository.mkdir()
-    (repository / "cart.py").write_text("def total():\n    return 0\n", encoding="utf-8")
     contract = repository / "patch-run.toml"
     contract.write_text(
         """source_id = "trusted-cart"
@@ -2424,25 +2495,51 @@ editable_paths = ["cart.py"]
 
     result = CliRunner().invoke(
         cli,
+        ["run-local", str(repository)],
+    )
+
+    assert result.exit_code != 0
+    assert "requires explicit --trust-repository acknowledgement" in result.output
+    assert not data_root.exists()
+
+
+def test_trusted_repository_contract_is_protected_in_workspace(tmp_path: Path) -> None:
+    repository = tmp_path / "trusted-repository"
+    repository.mkdir()
+    (repository / "cart.py").write_text("def total():\n    return 0\n", encoding="utf-8")
+    contract = repository / "patch-run.toml"
+    contract.write_text(
+        f"""source_id = "trusted-cart"
+issue = "Fix the incorrect cart total"
+verification = {json.dumps([sys.executable, "-c", "raise SystemExit(1)"])}
+editable_paths = ["cart.py", "patch-run.toml"]
+""",
+        encoding="utf-8",
+    )
+    data_root = tmp_path / "runs"
+    cli = create_cli(
+        model_gateway=CandidateScenarioModel("protected", "patch-run.toml"),
+        data_root=data_root,
+    )
+
+    result = CliRunner().invoke(
+        cli,
         [
             "run-local",
             str(repository),
-            "--contract",
-            str(contract),
             "--trust-repository",
         ],
     )
 
-    assert result.exit_code != 0
-    assert "Patch Run Contract must be outside the Repository Source" in result.output
-    assert not data_root.exists()
+    assert result.exit_code == 2
+    assert "Candidate Patch path is protected: patch-run.toml" in result.output
 
 
 def test_trusted_repository_rejects_run_storage_inside_source_tree(tmp_path: Path) -> None:
     repository = tmp_path / "trusted-repository"
     repository.mkdir()
     (repository / "cart.py").write_text("def total():\n    return 0\n", encoding="utf-8")
-    contract = tmp_path / "patch-run.toml"
+    contract = repository / "patch-run.toml"
     contract.write_text(
         """source_id = "trusted-cart"
 issue = "Fix the incorrect cart total"
@@ -2459,8 +2556,6 @@ editable_paths = ["cart.py"]
         [
             "run-local",
             str(repository),
-            "--contract",
-            str(contract),
             "--trust-repository",
         ],
     )
@@ -2476,7 +2571,7 @@ def test_trusted_repository_rejects_symlinked_source_root(tmp_path: Path) -> Non
     (repository / "cart.py").write_text("def total():\n    return 0\n", encoding="utf-8")
     repository_link = tmp_path / "repository-link"
     repository_link.symlink_to(repository, target_is_directory=True)
-    contract = tmp_path / "patch-run.toml"
+    contract = repository / "patch-run.toml"
     contract.write_text(
         """source_id = "trusted-cart"
 issue = "Fix the incorrect cart total"
@@ -2493,8 +2588,6 @@ editable_paths = ["cart.py"]
         [
             "run-local",
             str(repository_link),
-            "--contract",
-            str(contract),
             "--trust-repository",
         ],
     )
@@ -2507,7 +2600,7 @@ editable_paths = ["cart.py"]
 def test_user_gets_clear_error_for_invalid_trusted_repository_contract(tmp_path: Path) -> None:
     repository = tmp_path / "trusted-repository"
     repository.mkdir()
-    contract = tmp_path / "patch-run.toml"
+    contract = repository / "patch-run.toml"
     contract.write_text('source_id = "trusted-cart"\n', encoding="utf-8")
     data_root = tmp_path / "runs"
     cli = create_cli(model_gateway=ScriptedModel(), data_root=data_root)
@@ -2517,14 +2610,12 @@ def test_user_gets_clear_error_for_invalid_trusted_repository_contract(tmp_path:
         [
             "run-local",
             str(repository),
-            "--contract",
-            str(contract),
             "--trust-repository",
         ],
     )
 
     assert result.exit_code != 0
-    assert "Invalid Patch Run Contract" in result.output
+    assert "Invalid Patch Run Manifest" in result.output
     assert not data_root.exists()
 
 
@@ -2533,7 +2624,7 @@ def test_trusted_repository_rejects_oversized_patch_run_contract(tmp_path: Path)
     repository.mkdir()
     (repository / "cart.py").write_text("def total():\n    return 0\n", encoding="utf-8")
     oversized_issue = "x" * 32_769
-    contract = tmp_path / "patch-run.toml"
+    contract = repository / "patch-run.toml"
     contract.write_text(
         f"""source_id = "trusted-cart"
 issue = "{oversized_issue}"
@@ -2550,14 +2641,12 @@ editable_paths = ["cart.py"]
         [
             "run-local",
             str(repository),
-            "--contract",
-            str(contract),
             "--trust-repository",
         ],
     )
 
     assert result.exit_code != 0
-    assert "Invalid Patch Run Contract" in result.output
+    assert "Invalid Patch Run Manifest" in result.output
     assert "at most 32768 characters" in result.output
     assert not data_root.exists()
 
@@ -2567,7 +2656,7 @@ def test_trusted_repository_rejects_ignored_editable_path(tmp_path: Path) -> Non
     hidden_directory = repository / ".config"
     hidden_directory.mkdir(parents=True)
     (hidden_directory / "settings.py").write_text("VALUE = 1\n", encoding="utf-8")
-    contract = tmp_path / "patch-run.toml"
+    contract = repository / "patch-run.toml"
     contract.write_text(
         """source_id = "trusted-settings"
 issue = "Fix the hidden setting"
@@ -2584,8 +2673,6 @@ editable_paths = [".config/settings.py"]
         [
             "run-local",
             str(repository),
-            "--contract",
-            str(contract),
             "--trust-repository",
         ],
     )

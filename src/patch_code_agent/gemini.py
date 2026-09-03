@@ -1,4 +1,4 @@
-"""Gemini 3.7 Flash adapter for opt-in synthetic Fixture Live Smoke Runs."""
+"""Gemini adapter for explicitly selected Fixture or Trusted Repository Patch Runs."""
 
 import json
 from base64 import b64encode
@@ -12,7 +12,6 @@ from typing import Protocol
 from pydantic import BaseModel
 
 from patch_code_agent.budgets import ResourceBudgetExceededError
-from patch_code_agent.fixtures import bundled_fixture_roots
 from patch_code_agent.inspection import InspectionTools
 from patch_code_agent.model import (
     CandidatePatch,
@@ -95,7 +94,7 @@ class GeminiTransport(Protocol):
 
 
 class GoogleGenAITransport:
-    """Credential-owning ``google-genai`` transport loaded only for Live Smoke Runs."""
+    """Credential-owning ``google-genai`` transport loaded after explicit model selection."""
 
     def __init__(self, api_key: str, *, model_id: str = _DEFAULT_MODEL_ID) -> None:
         _validate_model_id(model_id)
@@ -219,9 +218,7 @@ class GeminiTranscriptWriter:
 
 
 class GeminiModelGateway:
-    """Bounded tool-calling Model Gateway used only with registered synthetic Fixtures."""
-
-    synthetic_only = True
+    """Bounded tool-calling Model Gateway for an explicitly selected Repository Source."""
 
     def __init__(
         self,
@@ -236,7 +233,6 @@ class GeminiModelGateway:
         self._backoff = backoff
         self._transcript_writer = transcript_writer
         self.model_id = model_id
-        self.allowed_fixture_roots = tuple(root.resolve() for root in bundled_fixture_roots())
 
     @classmethod
     def from_api_key(
@@ -245,7 +241,7 @@ class GeminiModelGateway:
         data_root: Path,
         model_id: str = _DEFAULT_MODEL_ID,
     ) -> "GeminiModelGateway":
-        """Create the credential-owning client only after explicit Live Smoke opt-in."""
+        """Create the credential-owning client after explicit Gemini model selection."""
         if not api_key.strip():
             raise ValueError("GEMINI_API_KEY is empty")
         return cls(
@@ -256,7 +252,7 @@ class GeminiModelGateway:
 
     def create_plan(self, request: PlanningRequest, tools: InspectionTools) -> object:
         prompt = (
-            "Create a minimal repair Plan for this synthetic fixture. Inspect only with the "
+            "Create a minimal repair Plan for this repository. Inspect only with the "
             f"declared tools.\nIssue: {request.issue}\nVerification argv: "
             f"{json.dumps(request.verification)}{_correction(request.validation_errors)}"
         )
@@ -272,7 +268,7 @@ class GeminiModelGateway:
     def create_candidate(self, request: CandidateRequest, tools: InspectionTools) -> object:
         prompt = (
             "Create complete text replacements for the smallest repair. During this phase, do "
-            "not call list_files and do not read tests, issue files, or fixture manifests; the "
+            "not call list_files and do not read tests, issue files, or Patch Run manifests; the "
             "Issue, Plan, and editable paths are already provided below. Read only each editable "
             "file you will replace, at most once. Copy the authoritative sha256 returned by "
             "read_file exactly; do not calculate, alter, or invent it. Then immediately return "
@@ -293,7 +289,7 @@ class GeminiModelGateway:
 
     def create_diagnosis(self, request: DiagnosisRequest, tools: InspectionTools) -> object:
         prompt = (
-            "Diagnose why the synthetic fixture still fails and propose the next incremental "
+            "Diagnose why the repository still fails and propose the next incremental "
             f"strategy.\nIssue: {request.issue}\nPlan: {request.plan.model_dump_json()}"
             f"\nAttempt: {request.attempt}\nVerification excerpt: "
             f"{request.verification_output_excerpt}\nVerification artifact: "
