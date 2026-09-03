@@ -13,6 +13,7 @@ from typing import Annotated, assert_never, cast
 from uuid import uuid4
 
 import typer
+from dotenv import dotenv_values
 from rich.console import Console
 from rich.panel import Panel
 
@@ -365,7 +366,10 @@ def create_cli(
         ] = "gemini-3.7-flash",
     ) -> None:
         """Run the opt-in Gemini workflow against a registered synthetic Fixture only."""
-        api_key = os.getenv("GEMINI_API_KEY", "")
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if api_key is None:
+            api_key = dotenv_values(Path.cwd() / ".env").get("GEMINI_API_KEY")
+        api_key = api_key or ""
         if model not in SUPPORTED_GEMINI_MODEL_IDS:
             supported = ", ".join(SUPPORTED_GEMINI_MODEL_IDS)
             console.print(f"[red]Unsupported Gemini model: {model}; choose one of: {supported}[/]")

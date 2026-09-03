@@ -113,9 +113,12 @@ Gemini Live Smoke 是選用測試，只能對 registry 中的 synthetic Fixture 
 
 ```bash
 uv sync --extra gemini
+cp .env.example .env
+# Edit .env and set GEMINI_API_KEY.
 uv run patch-code-agent live-smoke cart-discount --yes
 ```
 
+CLI 會從目前目錄的 `.env` 載入 `GEMINI_API_KEY`；若 shell 已設定同名環境變數，shell 的值優先。
 `GEMINI_API_KEY` 只交給 Gemini client boundary，不會寫入 checkpoint、Run Events、artifacts、
 Run Report 或 Verification environment。未設定 key，或遇到 quota、429／暫時不可用時，命令會回報
 `Live Smoke Inconclusive`，不會讓 required test suite 失敗。Live Smoke 仍會顯示 exact Candidate；
