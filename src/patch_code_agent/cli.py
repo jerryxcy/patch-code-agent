@@ -1,15 +1,9 @@
-"""Expose Patch Run creation and read-only status through a Typer CLI.
-
-Commands translate terminal/domain failures into stable exit code 2 messages and always close the
-application writer after use. ``status`` intentionally takes the separate read-only path, while
-``run-local`` requires an explicit trust acknowledgement before repository code can execute.
-"""
+"""Expose Fixture Patch Run creation and read-only status through a Typer CLI."""
 
 import os
 from collections.abc import Callable
 from pathlib import Path
-from time import monotonic
-from typing import Annotated, assert_never, cast
+from typing import Annotated, cast
 from uuid import uuid4
 
 import typer
@@ -18,10 +12,8 @@ from rich.console import Console
 from rich.panel import Panel
 
 from patch_code_agent.application import PatchCodeAgent, PatchRunStatus, PatchRunStatusReader
-from patch_code_agent.budgets import ResourceBudgets
 from patch_code_agent.candidate import CandidatePatchReference, load_candidate_patch
 from patch_code_agent.diagnosis import DiagnosisArtifactReference, load_diagnosis_artifact
-from patch_code_agent.fixtures import bundled_fixture_roots
 from patch_code_agent.gemini import SUPPORTED_GEMINI_MODEL_IDS, GeminiModelGateway
 from patch_code_agent.inspection import InspectionTools
 from patch_code_agent.model import (
@@ -35,7 +27,6 @@ from patch_code_agent.model import (
 )
 from patch_code_agent.patching import CumulativeDiffReference
 from patch_code_agent.planning import PlanArtifactReference, load_plan_artifact
-from patch_code_agent.sources import RepositorySourceKind
 from patch_code_agent.state import RunState
 
 
@@ -78,7 +69,6 @@ def create_cli(
     data_root: Path | None = None,
     fixture_roots: tuple[Path, ...] | None = None,
     verification_timeout_seconds: float = 60.0,
-    clock: Callable[[], float] = monotonic,
     live_model_factory: Callable[[str, Path, str], ModelGateway] = (
         GeminiModelGateway.from_api_key
     ),
@@ -138,7 +128,6 @@ def create_cli(
                 data_root=selected_data_root,
                 fixture_roots=fixture_roots,
                 verification_timeout_seconds=verification_timeout_seconds,
-                clock=clock,
             )
         return cast(PatchCodeAgent, application)
 
@@ -155,15 +144,6 @@ def create_cli(
         if model_id == selected_model.model_id:
             return get_application()
         return get_application(model_id, defer_model=True)
-
-    def source_label(source_kind: RepositorySourceKind) -> str:
-        """Render the closed Repository Source kind set for humans."""
-        match source_kind:
-            case "fixture":
-                return "Fixture Repository"
-            case "trusted":
-                return "Trusted Repository"
-        assert_never(source_kind)
 
     def print_candidate_patch(reference: CandidatePatchReference, diff: str) -> None:
         """Render the one canonical CLI view of an immutable Candidate Patch."""
@@ -187,7 +167,6 @@ def create_cli(
         """Translate terminal internal states into stable CLI outcome labels."""
         return {
             "issue_not_reproduced": "Issue Not Reproduced",
-            "budget_exceeded": "Budget Exceeded",
             "error": "Error",
             "rejected": "Rejected",
             "workspace_changed": "Workspace Changed",
@@ -248,37 +227,6 @@ def create_cli(
                 soft_wrap=True,
             )
 
-    def print_budgets(budgets: ResourceBudgets) -> None:
-        """Render every Resource Budget as durable used/limit values."""
-        console.print(
-            f"[dim]Repair Attempts Budget:[/] "
-            f"{budgets.repair_attempts.used}/{budgets.repair_attempts.limit}"
-        )
-        console.print(
-            f"[dim]Distinct Files Read Budget:[/] "
-            f"{budgets.files_read.used}/{budgets.files_read.limit}"
-        )
-        console.print(
-            f"[dim]Files Changed Budget:[/] "
-            f"{budgets.files_changed.used}/{budgets.files_changed.limit}"
-        )
-        console.print(
-            f"[dim]Tool Executions Budget:[/] "
-            f"{budgets.tool_executions.used}/{budgets.tool_executions.limit}"
-        )
-        console.print(
-            f"[dim]Model Requests Budget:[/] "
-            f"{budgets.model_requests.used}/{budgets.model_requests.limit}"
-        )
-        console.print(
-            f"[dim]Verification Seconds Budget:[/] "
-            f"{budgets.verification_seconds.used:.3f}/{budgets.verification_seconds.limit:.1f}"
-        )
-        console.print(
-            f"[dim]Active Seconds Budget:[/] "
-            f"{budgets.active_seconds.used:.3f}/{budgets.active_seconds.limit:.1f}"
-        )
-
     def print_run_result(result: RunState, *, display_candidate: bool = True) -> None:
         """Render fields that exist on either planning or terminal graph branches.
 
@@ -312,7 +260,7 @@ def create_cli(
             ).artifact.diagnosis
             print_diagnosis(diagnosis_reference, diagnosis)
         console.print(f"[dim]Run Identifier:[/] {result['run_id']}")
-        console.print(f"[dim]{source_label(result['source_kind'])}:[/] {result['source_id']}")
+        console.print(f"[dim]Fixture Repository:[/] {result['source_id']}")
         console.print(f"[dim]Source Revision:[/] {result['source_revision']}", soft_wrap=True)
         console.print(f"[dim]Model:[/] {result['model_id']}")
         if baseline := result.get("baseline_verification"):
@@ -326,17 +274,13 @@ def create_cli(
         console.print(f"[dim]Files Read:[/] {len(result.get('files_read', []))}")
         console.print(f"[dim]Repair Attempts:[/] {result.get('attempt', 0)}")
         console.print(f"[dim]Files Changed:[/] {len(result.get('files_changed', []))}")
-        print_budgets(ResourceBudgets.from_state(result))
         verification = result.get("verification")
         print_repair_details(
             verification_outcome=(verification.get("outcome") if verification else None),
             error_kind=result.get("error_kind"),
         )
-        if budget_name := result.get("budget_name"):
-            console.print(f"[dim]Budget:[/] {budget_name}")
-            console.print(
-                f"[dim]Budget Usage:[/] {result.get('budget_used')}/{result.get('budget_limit')}"
-            )
+        if reason := result.get("report", {}).get("note"):
+            console.print(f"[dim]Reason:[/] {reason}")
         if report := result.get("report_artifact"):
             console.print(f"[dim]Run Report Checksum:[/] {report['sha256']}", soft_wrap=True)
         console.print(f"[dim]status:[/] {result['status']}")
@@ -383,7 +327,7 @@ def create_cli(
             console.print(f"[red]{error}[/]")
             raise typer.Exit(code=2) from error
         console.print(f"[dim]Run Identifier:[/] {patch_run.run_id}")
-        console.print(f"[dim]{source_label(patch_run.source_kind)}:[/] {patch_run.source_id}")
+        console.print(f"[dim]Fixture Repository:[/] {patch_run.source_id}")
         console.print(
             f"[dim]Source Revision:[/] {patch_run.source_revision}",
             soft_wrap=True,
@@ -397,16 +341,14 @@ def create_cli(
         console.print(f"[dim]Files Read:[/] {len(patch_run.files_read)}")
         console.print(f"[dim]Repair Attempts:[/] {patch_run.attempts}")
         console.print(f"[dim]Files Changed:[/] {len(patch_run.files_changed)}")
-        print_budgets(patch_run.budgets)
         print_repair_details(
             verification_outcome=(
                 patch_run.verification.outcome if patch_run.verification is not None else None
             ),
             error_kind=patch_run.error_kind,
         )
-        if patch_run.budget_name is not None:
-            console.print(f"[dim]Budget:[/] {patch_run.budget_name}")
-            console.print(f"[dim]Budget Usage:[/] {patch_run.budget_used}/{patch_run.budget_limit}")
+        if patch_run.reason is not None:
+            console.print(f"[dim]Reason:[/] {patch_run.reason}")
         if patch_run.report_artifact is not None:
             console.print(
                 f"[dim]Run Report Checksum:[/] {patch_run.report_artifact.sha256}",
@@ -474,91 +416,6 @@ def create_cli(
 
         print_run_result(result)
 
-    @cli.command(name="live-smoke")
-    def live_smoke(
-        fixture_id: Annotated[
-            str,
-            typer.Argument(help="Registered synthetic Fixture Repository identifier."),
-        ] = "cart-discount",
-        yes: Annotated[
-            bool,
-            typer.Option("--yes", help="Approve every displayed Live Smoke Candidate."),
-        ] = False,
-        model: Annotated[
-            str,
-            typer.Option(
-                "--model",
-                help="Gemini model used by this synthetic Live Smoke Run.",
-            ),
-        ] = "gemini-3.7-flash",
-    ) -> None:
-        """Run the opt-in Gemini workflow against a registered synthetic Fixture only."""
-        api_key = os.environ.get("GEMINI_API_KEY")
-        if api_key is None:
-            api_key = dotenv_values(Path.cwd() / ".env").get("GEMINI_API_KEY")
-        api_key = api_key or ""
-        if model not in SUPPORTED_GEMINI_MODEL_IDS:
-            supported = ", ".join(SUPPORTED_GEMINI_MODEL_IDS)
-            console.print(f"[red]Unsupported Gemini model: {model}; choose one of: {supported}[/]")
-            raise typer.Exit(code=2)
-        if not api_key:
-            console.print(
-                "[yellow]Live Smoke Inconclusive: GEMINI_API_KEY is not configured.[/]"
-            )
-            return
-        try:
-            gateway = live_model_factory(api_key, selected_data_root, model)
-            live_application = PatchCodeAgent(
-                model_gateway=gateway,
-                data_root=selected_data_root,
-                # Live model authority is narrower than the ordinary fixture injection seam:
-                # only fixtures shipped with this package may enter provider requests.
-                fixture_roots=bundled_fixture_roots(),
-                verification_timeout_seconds=verification_timeout_seconds,
-                clock=clock,
-            )
-        except (RuntimeError, ValueError) as error:
-            console.print(f"[red]{error}[/]")
-            raise typer.Exit(code=2) from error
-        run_id = str(uuid4())
-        try:
-            result = live_application.start_patch_run(fixture_id=fixture_id, run_id=run_id)
-            while result["status"] == "pending_approval":
-                def confirm_candidate(patch_run: PatchRunStatus) -> bool:
-                    if patch_run.candidate_artifact is None or patch_run.candidate_diff is None:
-                        raise ValueError("Pending Live Smoke Run has no Candidate Patch Artifact")
-                    print_candidate_patch(
-                        patch_run.candidate_artifact,
-                        patch_run.candidate_diff,
-                    )
-                    return yes or typer.confirm(
-                        "Approve this exact Live Smoke Candidate?",
-                        default=False,
-                    )
-
-                resumed = live_application.approve_patch_run(
-                    run_id=run_id,
-                    confirm=confirm_candidate,
-                )
-                if resumed is None:
-                    console.print(
-                        "[yellow]Live Smoke cancelled; Patch Run remains pending.[/]"
-                    )
-                    return
-                result = resumed
-        except (ValueError, RuntimeError) as error:
-            console.print(f"[red]{error}[/]")
-            raise typer.Exit(code=2) from error
-        finally:
-            live_application.close()
-        print_run_result(result)
-        if result.get("error_kind") == "provider_unavailable":
-            status_code = result.get("provider_status_code")
-            status = _provider_status_label(status_code)
-            console.print(f"[yellow]Live Smoke Inconclusive: Gemini unavailable{status}.[/]")
-        elif result["status"] == "succeeded":
-            console.print("[green]Live Smoke Succeeded.[/]")
-
     @cli.command()
     def reject(
         run_id: Annotated[
@@ -615,68 +472,7 @@ def create_cli(
             display_candidate=result["status"] == "pending_approval",
         )
 
-    @cli.command(name="run-local")
-    def run_local(
-        repository: Annotated[
-            Path,
-            typer.Argument(
-                exists=True,
-                file_okay=False,
-                help="Local Trusted Repository containing patch-run.toml.",
-            ),
-        ],
-        trust_repository: Annotated[
-            bool,
-            typer.Option(
-                "--trust-repository",
-                help="Acknowledge that repository Verification executes with host authority.",
-            ),
-        ] = False,
-        model: Annotated[
-            str | None,
-            typer.Option(
-                "--model",
-                help="Send inspected Trusted Repository contents to this Gemini model.",
-            ),
-        ] = None,
-    ) -> None:
-        """Start a Patch Run from an explicitly trusted local repository."""
-        if not trust_repository:
-            console.print(
-                "[red]Trusted Repository requires explicit --trust-repository acknowledgement[/]"
-            )
-            raise typer.Exit(code=2)
-
-        run_id = str(uuid4())
-        try:
-            result = get_application(model).start_trusted_patch_run(
-                repository=repository,
-                run_id=run_id,
-            )
-        except (RuntimeError, ValueError) as error:
-            console.print(f"[red]{error}[/]")
-            raise typer.Exit(code=2) from error
-        finally:
-            close_application()
-
-        print_run_result(result)
-
     return cli
-
-
-def _provider_status_label(status_code: object) -> str:
-    """Format a credential-free provider classification for local CLI diagnostics."""
-    labels = {
-        429: "Resource Exhausted",
-        500: "Internal Server Error",
-        502: "Bad Gateway",
-        503: "Service Unavailable",
-        504: "Gateway Timeout",
-    }
-    if not isinstance(status_code, int):
-        return ""
-    label = labels.get(status_code, "Provider Error")
-    return f" (HTTP {status_code} {label})"
 
 
 app = create_cli()

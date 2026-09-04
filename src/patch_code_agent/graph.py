@@ -9,7 +9,6 @@ workspace.
 
 from collections.abc import Callable
 from pathlib import Path
-from time import monotonic
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import InMemorySaver
@@ -17,9 +16,13 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import interrupt
 
-from patch_code_agent.budgets import ResourceBudgetExceededError, ResourceBudgets
 from patch_code_agent.candidate import CandidatePatchBuilder, CandidatePatchReference
 from patch_code_agent.diagnosis import DiagnosisArtifactReference, Diagnostician
+from patch_code_agent.limits import (
+    MAX_FILES_CHANGED,
+    MAX_REPAIR_ATTEMPTS,
+    RunLimitExceededError,
+)
 from patch_code_agent.model_output import InvalidModelOutputError, ModelInvocationError
 from patch_code_agent.patching import PatchApplier
 from patch_code_agent.planning import PlanArtifactReference, Planner
@@ -36,64 +39,8 @@ _BASELINE_STATUS: dict[BaselineVerificationOutcome, RunStatus] = {
     "failed": "baseline_failed",
     "passed": "issue_not_reproduced",
     "error": "error",
-    "timeout": "budget_exceeded",
+    "timeout": "error",
 }
-
-
-def _enforce_resource_budgets(
-    state: RunState,
-    update: RunState,
-    *,
-    projected_files_changed: list[str] | None = None,
-) -> RunState:
-    """Turn a completed node update into a stable Budget Exceeded result when needed."""
-    if update.get("status") in {"error", "budget_exceeded"}:
-        return update
-    projected: dict[str, object] = dict(state)
-    projected.update(update)
-    if projected_files_changed is not None:
-        projected["files_changed"] = projected_files_changed
-    exceeded = ResourceBudgets.from_state(projected).first_exceeded()
-    if exceeded is None:
-        return update
-    name, limit, used = exceeded
-    return {
-        **update,
-        "status": "budget_exceeded",
-        "error_kind": "resource_budget",
-        "budget_name": name,
-        "budget_limit": limit,
-        "budget_used": used,
-        "report": {
-            "success": False,
-            "phase": "budget_exceeded",
-            "note": f"Resource Budget exceeded: {name} used {used} of {limit}.",
-        },
-    }
-
-
-def _measure_active_time(
-    state: RunState,
-    action: Callable[[RunState], RunState],
-    clock: Callable[[], float],
-    measurement_key: str,
-) -> RunState:
-    """Count host-controlled work while deliberately excluding Approval wait time."""
-    measurements = dict(state.get("active_measurements", {}))
-    if measurement_key in measurements:
-        update = action(state)
-        update["active_measurements"] = measurements
-        update["active_duration_seconds"] = state.get("active_duration_seconds", 0.0)
-        return update
-    started_at = clock()
-    update = action(state)
-    elapsed = max(0.0, clock() - started_at)
-    measurements[measurement_key] = elapsed
-    update["active_measurements"] = measurements
-    update["active_duration_seconds"] = (
-        state.get("active_duration_seconds", 0.0) + elapsed
-    )
-    return _enforce_resource_budgets(state, update)
 
 
 def _audit_transition(
@@ -127,50 +74,40 @@ def _invalid_model_output(state: RunState, error: InvalidModelOutputError) -> Ru
 
 def _model_failure(state: RunState, error: ModelInvocationError) -> RunState:
     """Classify provider/transport failure separately from failed repair Verification."""
-    inconclusive = bool(getattr(error.cause, "inconclusive", False))
+    provider_unavailable = bool(getattr(error.cause, "provider_unavailable", False))
     update: RunState = {
         "model_requests": state.get("model_requests", 0) + error.model_requests,
         "tool_executions": state.get("tool_executions", 0) + error.tool_executions,
         "files_read": sorted(set(state.get("files_read", [])) | set(error.files_read)),
         "status": "error",
-        "error_kind": "provider_unavailable" if inconclusive else "model_failure",
+        "error_kind": "provider_unavailable" if provider_unavailable else "model_failure",
         "report": {
             "success": False,
             "phase": "error",
-            "note": (
-                "Live Smoke Run was inconclusive because Gemini was unavailable."
-                if inconclusive
-                else "Model infrastructure failed before valid typed output was returned."
-            ),
+            "note": "Model infrastructure failed before valid typed output was returned.",
         },
     }
     status_code = getattr(error.cause, "status_code", None)
-    if inconclusive and isinstance(status_code, int):
+    if provider_unavailable and isinstance(status_code, int):
         update["provider_status_code"] = status_code
     return update
 
 
-def _resource_budget_exceeded(
+def _run_limit_reached(
     state: RunState,
-    error: ResourceBudgetExceededError,
+    error: RunLimitExceededError,
 ) -> RunState:
-    """Persist usage observed before a host boundary refused the next operation."""
+    """Persist usage observed before a fixed safety limit refused the next operation."""
     return {
         "model_requests": state.get("model_requests", 0) + error.model_requests,
         "tool_executions": state.get("tool_executions", 0) + error.tool_executions,
         "files_read": sorted(set(state.get("files_read", [])) | set(error.files_read)),
-        "status": "budget_exceeded",
-        "error_kind": "resource_budget",
-        "budget_name": error.budget_name,
-        "budget_limit": error.budget_limit,
-        "budget_used": error.budget_used,
+        "status": "error",
+        "error_kind": "limit_exceeded",
         "report": {
             "success": False,
-            "phase": "budget_exceeded",
-            "note": (
-                f"Resource Budget exhausted: {error.budget_name} used "
-                f"{error.budget_used} of {error.budget_limit}."
-            ),
+            "phase": "error",
+            "note": f"Run limit reached: {error.limit_name} ({error.used}/{error.limit}).",
         },
     }
 
@@ -222,7 +159,6 @@ def run_baseline_verification(state: RunState, verifier: BaselineVerifier) -> Ru
         )
     update: RunState = {
         "baseline_verification": summary.model_dump(mode="json"),
-        "verification_duration_max": summary.duration_seconds,
         "status": _BASELINE_STATUS[summary.outcome],
     }
     if summary.outcome == "passed":
@@ -242,9 +178,6 @@ def run_baseline_verification(state: RunState, verifier: BaselineVerifier) -> Ru
         update.update(
             {
                 "error_kind": "verification_timeout",
-                "budget_name": "verification_seconds",
-                "budget_limit": summary.timeout_seconds,
-                "budget_used": summary.timeout_seconds,
             }
         )
     return update
@@ -258,7 +191,7 @@ def route_after_baseline(state: RunState) -> str:
     """
     if state["status"] == "baseline_failed":
         return "create_plan"
-    return "end"
+    return "finish_without_repair"
 
 
 def create_plan(state: RunState, planner: Planner) -> RunState:
@@ -285,8 +218,8 @@ def create_plan(state: RunState, planner: Planner) -> RunState:
         return _invalid_model_output(state, error)
     except ModelInvocationError as error:
         return _model_failure(state, error)
-    except ResourceBudgetExceededError as error:
-        return _resource_budget_exceeded(state, error)
+    except RunLimitExceededError as error:
+        return _run_limit_reached(state, error)
     except (OSError, RuntimeError):
         return _infrastructure_failure(
             "storage_failure",
@@ -306,13 +239,13 @@ def create_plan(state: RunState, planner: Planner) -> RunState:
             "note": "Plan is complete; Candidate Patch generation follows.",
         },
     }
-    return _enforce_resource_budgets(state, update)
+    return update
 
 
 def route_after_plan(state: RunState) -> str:
-    """Stop on a planning Resource Budget failure; otherwise create a Candidate."""
+    """Stop on a planning error; otherwise create a Candidate."""
     if state["status"] != "planned":
-        return "end"
+        return "plan_failed"
     return "candidate"
 
 
@@ -354,8 +287,8 @@ def create_candidate(state: RunState, builder: CandidatePatchBuilder) -> RunStat
         return _invalid_model_output(state, error)
     except ModelInvocationError as error:
         return _model_failure(state, error)
-    except ResourceBudgetExceededError as error:
-        return _resource_budget_exceeded(state, error)
+    except RunLimitExceededError as error:
+        return _run_limit_reached(state, error)
     except (OSError, RuntimeError):
         return _infrastructure_failure(
             "storage_failure",
@@ -374,14 +307,14 @@ def create_candidate(state: RunState, builder: CandidatePatchBuilder) -> RunStat
             "note": "Candidate Patch is immutable and awaiting an Approval decision.",
         },
     }
-    return _enforce_resource_budgets(state, update)
+    return update
 
 
 def route_after_candidate(state: RunState) -> str:
-    """Stop on Candidate-generation budget failure; otherwise await Approval."""
+    """Stop on a Candidate-generation error; otherwise await Approval."""
     if state["status"] != "pending_approval":
-        return "end"
-    return "approval"
+        return "candidate_failed"
+    return "wait_for_approval"
 
 
 def await_approval(state: RunState) -> RunState:
@@ -427,13 +360,14 @@ def apply_candidate(state: RunState, applier: PatchApplier) -> RunState:
             "storage_failure",
             "Approved Candidate Patch artifact could not be loaded safely.",
         )
-    if len(set(state.get("files_changed", [])) | candidate_paths) > 3:
-        return _resource_budget_exceeded(
+    projected_files_changed = set(state.get("files_changed", [])) | candidate_paths
+    if len(projected_files_changed) > MAX_FILES_CHANGED:
+        return _run_limit_reached(
             state,
-            ResourceBudgetExceededError(
-                budget_name="files_changed",
-                budget_limit=3,
-                budget_used=len(state.get("files_changed", [])),
+            RunLimitExceededError(
+                limit_name="files_changed",
+                limit=MAX_FILES_CHANGED,
+                used=len(projected_files_changed),
             ),
         )
     try:
@@ -460,14 +394,14 @@ def apply_candidate(state: RunState, applier: PatchApplier) -> RunState:
     else:
         update["status"] = "error"
         update["error_kind"] = "partial_apply"
-    return _enforce_resource_budgets(state, update)
+    return update
 
 
 def route_after_apply(state: RunState) -> str:
     """Run Verification only after an all-before or all-after apply state."""
     if state["status"] == "testing":
         return "verify"
-    return "end"
+    return "apply_failed"
 
 
 def run_repair_verification(
@@ -492,10 +426,6 @@ def run_repair_verification(
     update: RunState = {
         "attempt": attempt,
         "verification": summary.model_dump(mode="json"),
-        "verification_duration_max": max(
-            state.get("verification_duration_max", 0.0),
-            summary.duration_seconds,
-        ),
     }
     if summary.outcome == "passed":
         try:
@@ -524,22 +454,19 @@ def run_repair_verification(
     elif summary.outcome == "failed":
         update["status"] = "diagnosing"
     elif summary.outcome == "timeout":
-        update["status"] = "budget_exceeded"
+        update["status"] = "error"
         update["error_kind"] = "verification_timeout"
-        update["budget_name"] = "verification_seconds"
-        update["budget_limit"] = summary.timeout_seconds
-        update["budget_used"] = summary.timeout_seconds
     else:
         update["status"] = "error"
         update["error_kind"] = summary.error_kind or "verification_error"
-    return _enforce_resource_budgets(state, update)
+    return update
 
 
 def route_after_repair_verification(state: RunState) -> str:
     """Create a Diagnosis only for a failed Repair Attempt with budget remaining."""
     if state["status"] == "diagnosing":
         return "diagnose"
-    return "end"
+    return "finish_verification"
 
 
 def create_diagnosis(state: RunState, diagnostician: Diagnostician) -> RunState:
@@ -572,8 +499,8 @@ def create_diagnosis(state: RunState, diagnostician: Diagnostician) -> RunState:
         return _invalid_model_output(state, error)
     except ModelInvocationError as error:
         return _model_failure(state, error)
-    except ResourceBudgetExceededError as error:
-        return _resource_budget_exceeded(state, error)
+    except RunLimitExceededError as error:
+        return _run_limit_reached(state, error)
     except (OSError, RuntimeError):
         return _infrastructure_failure(
             "storage_failure",
@@ -585,27 +512,29 @@ def create_diagnosis(state: RunState, diagnostician: Diagnostician) -> RunState:
         "tool_executions": state["tool_executions"] + result.artifact.tool_executions,
         "files_read": sorted(set(state["files_read"]) | set(result.artifact.files_read)),
     }
-    if verification.attempt >= 3:
+    if verification.attempt >= MAX_REPAIR_ATTEMPTS:
         update.update(
             {
                 "status": "attempts_exhausted",
                 "report": {
                     "success": False,
                     "phase": "attempts_exhausted",
-                    "note": "Three approved Repair Attempts failed Verification.",
+                    "note": (
+                        f"{MAX_REPAIR_ATTEMPTS} approved Repair Attempts failed Verification."
+                    ),
                 },
             }
         )
     else:
         update["status"] = "diagnosed"
-    return _enforce_resource_budgets(state, update)
+    return update
 
 
 def route_after_diagnosis(state: RunState) -> str:
     """Stop after the third Diagnosis; otherwise propose the next Candidate Patch."""
     if state["status"] != "diagnosed":
-        return "end"
-    return "candidate"
+        return "cannot_retry"
+    return "retry"
 
 
 def finalize_report(state: RunState, audit_store: RunAuditStore) -> RunState:
@@ -624,7 +553,6 @@ def build_graph(
     repair_verifier: RepairVerifier,
     audit_store: RunAuditStore,
     checkpointer: BaseCheckpointSaver | None = None,
-    clock: Callable[[], float] = monotonic,
 ) -> CompiledStateGraph:
     """Compile the Patch Run graph with durable or in-memory checkpointing.
 
@@ -639,10 +567,9 @@ def build_graph(
         action: Callable[[RunState], RunState],
         key: Callable[[RunState], str],
     ) -> Callable[[RunState], RunState]:
-        measured_action = lambda state: _measure_active_time(state, action, clock, key(state))
         return lambda state: _audit_transition(
             state,
-            measured_action,
+            action,
             audit_store,
             lambda _state, _update: key(state),
         )
@@ -714,17 +641,23 @@ def build_graph(
     builder.add_conditional_edges(
         "baseline_verification",
         route_after_baseline,
-        {"create_plan": "create_plan", "end": "finalize_report"},
+        {
+            "create_plan": "create_plan",
+            "finish_without_repair": "finalize_report",
+        },
     )
     builder.add_conditional_edges(
         "create_plan",
         route_after_plan,
-        {"candidate": "create_candidate", "end": "finalize_report"},
+        {"candidate": "create_candidate", "plan_failed": "finalize_report"},
     )
     builder.add_conditional_edges(
         "create_candidate",
         route_after_candidate,
-        {"approval": "approval_gate", "end": "finalize_report"},
+        {
+            "wait_for_approval": "approval_gate",
+            "candidate_failed": "finalize_report",
+        },
     )
     builder.add_conditional_edges(
         "approval_gate",
@@ -735,17 +668,20 @@ def build_graph(
     builder.add_conditional_edges(
         "apply_candidate",
         route_after_apply,
-        {"verify": "repair_verification", "end": "finalize_report"},
+        {"verify": "repair_verification", "apply_failed": "finalize_report"},
     )
     builder.add_conditional_edges(
         "repair_verification",
         route_after_repair_verification,
-        {"diagnose": "create_diagnosis", "end": "finalize_report"},
+        {
+            "diagnose": "create_diagnosis",
+            "finish_verification": "finalize_report",
+        },
     )
     builder.add_conditional_edges(
         "create_diagnosis",
         route_after_diagnosis,
-        {"candidate": "create_candidate", "end": "finalize_report"},
+        {"retry": "create_candidate", "cannot_retry": "finalize_report"},
     )
     builder.add_edge("finalize_report", END)
     return builder.compile(checkpointer=selected_checkpointer)

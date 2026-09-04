@@ -9,12 +9,12 @@ import pytest
 
 from patch_code_agent.gemini import (
     GeminiFunctionCall,
-    GeminiInconclusiveError,
     GeminiModelGateway,
     GeminiProviderError,
     GeminiTranscriptPersistenceError,
     GeminiTranscriptWriter,
     GeminiTurn,
+    GeminiUnavailableError,
     GoogleGenAITransport,
 )
 from patch_code_agent.inspection import WorkspaceInspector
@@ -251,13 +251,13 @@ def test_gemini_adapter_returns_bounded_tool_rejection_for_model_correction(
     ]
 
 
-def test_gemini_adapter_marks_provider_exhaustion_inconclusive() -> None:
+def test_gemini_adapter_marks_provider_exhaustion_unavailable() -> None:
     transport = QueueTransport(
         *(GeminiProviderError("busy", status_code=429) for _ in range(3))
     )
     gateway = GeminiModelGateway(transport, backoff=lambda _seconds: None)
 
-    with pytest.raises(GeminiInconclusiveError) as captured:
+    with pytest.raises(GeminiUnavailableError) as captured:
         gateway.create_plan(
             PlanningRequest(
                 issue="Fix discount",
@@ -271,14 +271,14 @@ def test_gemini_adapter_marks_provider_exhaustion_inconclusive() -> None:
     assert captured.value.status_code == 429
 
 
-def test_gemini_adapter_keeps_provider_failure_inconclusive_at_budget_edge() -> None:
+def test_gemini_adapter_keeps_provider_failure_unavailable_at_request_limit() -> None:
     transport = QueueTransport(
         GeminiProviderError("busy", status_code=429),
         GeminiProviderError("busy", status_code=429),
     )
     gateway = GeminiModelGateway(transport, backoff=lambda _seconds: None)
 
-    with pytest.raises(GeminiInconclusiveError) as captured:
+    with pytest.raises(GeminiUnavailableError) as captured:
         gateway.create_plan(
             PlanningRequest(
                 issue="Fix discount",
@@ -298,7 +298,7 @@ def test_gemini_adapter_counts_tool_turn_before_provider_exhaustion(tmp_path: Pa
     )
     gateway = GeminiModelGateway(transport, backoff=lambda _seconds: None)
 
-    with pytest.raises(GeminiInconclusiveError) as captured:
+    with pytest.raises(GeminiUnavailableError) as captured:
         gateway.create_plan(
             PlanningRequest(
                 issue="Fix discount",

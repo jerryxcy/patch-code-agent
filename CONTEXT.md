@@ -48,8 +48,8 @@ Execution of a Patch Run Contract's declared acceptance command against a Run Wo
 _Avoid_: Test run, check, evaluation
 
 **Run Report**:
-The versioned, structured outcome, measurements, budgets, and artifact references produced
-by every completed Patch Run.
+The versioned, structured outcome, counters, and artifact references produced by every
+completed Patch Run.
 _Avoid_: Result, log, summary
 
 **Run Event**:
@@ -66,12 +66,6 @@ _Avoid_: Checkpoint, output file
 The persisted control state required to resume a Patch Run at the correct graph position.
 It is not the Patch Run's audit history or artifact store.
 _Avoid_: Snapshot, log, report
-
-**Resource Budget**:
-The fixed limits on model requests, tool executions, file access, file changes,
-Verification duration, Repair Attempts, and active Patch Run duration; time paused at an
-Approval Gate is excluded.
-_Avoid_: Rate limit, quota, retry limit
 
 **Repository Source**:
 The immutable repository content selected as the origin of a Run Workspace and paired with a
@@ -94,15 +88,8 @@ baseline, used for deterministic Patch Runs and integration checks.
 _Avoid_: Example repo, sample project, test repo
 
 **Patch Run Manifest**:
-The repository-owned representation of a Patch Run Contract, shared by Fixture Repositories and
-Trusted Repositories.
+The packaged representation of a Fixture Repository's Patch Run Contract.
 _Avoid_: Fixture manifest, repository config, fixture metadata
-
-**Trusted Repository**:
-A local Repository Source explicitly selected by a user who accepts that its code and
-Verification command execute with host authority. Sending its contents to an external Model
-Gateway requires a separate, explicit model selection.
-_Avoid_: Arbitrary repository, safe repository
 
 **Run Workspace**:
 The isolated, durable copy of a Repository Source that one Patch Run may inspect, modify,
@@ -118,11 +105,6 @@ _Avoid_: Control agent, ReAct agent
 A deterministic model substitute that returns predefined tool calls and typed artifacts
 to exercise Patch Run behavior without an external API.
 _Avoid_: Mock model, fake response
-
-**Live Smoke Run**:
-An opt-in integration check that uses the configured external model against a synthetic
-Fixture Repository; provider unavailability makes the check inconclusive.
-_Avoid_: Live test, benchmark, production run
 
 ## Outcomes
 
@@ -142,10 +124,6 @@ _Avoid_: Invalid Fixture, already passing, no-op
 **Attempts Exhausted**:
 A Patch Run that used every permitted Repair Attempt without successful Verification.
 _Avoid_: Max retries, failed
-
-**Budget Exceeded**:
-A Patch Run stopped after crossing a resource limit other than its Repair Attempt limit.
-_Avoid_: Timeout, rate limited
 
 **Workspace Changed**:
 A Patch Run stopped because the Run Workspace no longer matched the Candidate Patch that

@@ -1,6 +1,7 @@
 # PatchCodeAgent
 
-以 LangGraph 實作的 test-driven coding-agent harness 練習專案。
+這是一個用來學習 LangGraph 的 test-driven coding agent harness.。它以單一內建練習題展示 conditional routing、interrupt／resume、持久化狀態與
+human-in-the-loop approval。
 
 PatchCodeAgent 的重點不是讓模型自由操作 shell，而是把一次程式修補拆成可觀察、可暫停、
 可核准、可驗證的 **Patch Run**：PatchCodeAgent 程式負責控制流程、修改檔案與執行測試，
@@ -16,8 +17,7 @@ flowchart TD
 
     cli -->|"command: patch-code-agent run cart-discount<br/>可加 --model gemini-..."| fixture["內建練習專案<br/>Fixture Repository<br/>例：cart-discount"]
 
-    fixture --> source["讀取專案與修補規則<br/>Repository Source Adapter"]
-    source --> app["準備並執行一次 Patch Run<br/>PatchCodeAgent"]
+    fixture -->|"讀取 issue、測試 command 與可修改檔案"| app["準備並執行一次 Patch Run<br/>PatchCodeAgent"]
     app -->|"複製；不修改來源專案"| workspace["本次執行的獨立副本<br/>Run Workspace"]
     app --> workflow["修補流程<br/>LangGraph"]
     workspace <--> workflow
@@ -51,9 +51,8 @@ flowchart TD
 | **Scripted Model / Gemini** | 未指定 `--model` 時使用離線 Scripted Model；指定後由 Gemini 提出 Plan、Patch 與 Diagnosis |
 | **執行記錄** | 保存目前狀態、diff、測試 logs 與最後的 report，供 `status` 或後續 resume 使用 |
 
-完整狀態機、工具與信任邊界、Approval/replay safety、Resource Budgets、artifact layout 與
-Run Report schema 見 [docs/design.md](./docs/design.md)。單一決策的理由則記在
-[docs/adr/](./docs/adr/0001-prioritize-engineering-demonstration.md)。
+完整狀態機、工具與信任邊界、Approval/replay safety、固定安全上限、artifact layout 與
+Run Report schema 見 [docs/design.md](./docs/design.md)。
 
 ### Patch Run graph
 
@@ -79,21 +78,21 @@ graph TD;
     finalize_report(finalize_report)
     __end__([<p>__end__</p>]):::last
     __start__ --> validate_input;
-    apply_candidate -. end .-> finalize_report;
+    apply_candidate -. apply_failed .-> finalize_report;
     apply_candidate -. verify .-> repair_verification;
     approval_gate -. approve .-> apply_candidate;
     approval_gate -. reject .-> reject_candidate;
     baseline_verification -.-> create_plan;
-    baseline_verification -. end .-> finalize_report;
-    create_candidate -. approval .-> approval_gate;
-    create_candidate -. end .-> finalize_report;
-    create_diagnosis -. candidate .-> create_candidate;
-    create_diagnosis -. end .-> finalize_report;
+    baseline_verification -. finish_without_repair .-> finalize_report;
+    create_candidate -. wait_for_approval .-> approval_gate;
+    create_candidate -. candidate_failed .-> finalize_report;
+    create_diagnosis -. retry .-> create_candidate;
+    create_diagnosis -. cannot_retry .-> finalize_report;
     create_plan -. candidate .-> create_candidate;
-    create_plan -. end .-> finalize_report;
+    create_plan -. plan_failed .-> finalize_report;
     reject_candidate --> finalize_report;
     repair_verification -. diagnose .-> create_diagnosis;
-    repair_verification -. end .-> finalize_report;
+    repair_verification -. finish_verification .-> finalize_report;
     validate_input --> baseline_verification;
     finalize_report --> __end__;
     classDef default fill:#f2f0ff,line-height:1.2
@@ -169,13 +168,14 @@ cp .env.example .env
 uv run patch-code-agent run cart-discount --model gemini-3.7-flash
 ```
 
+Gemini 產生 Candidate Patch 後也會停在 Approval Gate；記下 Run Identifier，再接續前一節的
+`status` 與 `approve` commands。
+
 目前可用的 CLI：
 
 ```text
 patch-code-agent fixtures
 patch-code-agent run cart-discount [--model gemini-3.7-flash]
-patch-code-agent run-local <repository> --trust-repository [--model gemini-3.7-flash]
-patch-code-agent live-smoke cart-discount [--yes] [--model gemini-3.7-flash]
 patch-code-agent status <run-id>
 patch-code-agent approve <run-id> [--yes]
 patch-code-agent reject <run-id>
@@ -191,8 +191,7 @@ patch-code-agent reject <run-id>
 | `uv run pytest` | 執行 graph 與 CLI acceptance tests |
 | `uv run ruff check .` | 執行 Python lint |
 | `uv run python scripts/render_graph.py` | 從 compiled graph 輸出 Mermaid Markdown |
-| `uv run patch-code-agent run cart-discount` | 建立隔離的 CLI smoke run |
-| `uv run patch-code-agent live-smoke cart-discount --yes` | 以 Gemini 執行 opt-in synthetic Live Smoke |
+| `uv run patch-code-agent run cart-discount` | 建立隔離的 Patch Run |
 | `uv run pytest examples/tiny_repo/test_cart.py` | 執行 fixture baseline；目前預期失敗 |
 
 ---
@@ -207,33 +206,36 @@ src/patch_code_agent/
   cli.py               Typer CLI 與 Rich 輸出
   diagnosis.py         typed Diagnosis、failure evidence 與 replay ledger
   fixtures/            內建 Fixture Repository 的 discovery 與 registry
-  gemini.py             Gemini 3.7 Flash transport、tool loop、retry 與 Live Smoke gateway
+  gemini.py             Gemini transport、tool loop 與 retry
   graph.py             LangGraph nodes、edges 與 checkpoint 組裝
   inspection.py        bounded list、read、search 與 workspace 安全規則
-  locking.py           mutating CLI commands 的 per-run exclusive lock
+  limits.py            repair、檔案、tool 與 model request 的固定安全上限
+  model.py             模型輸入、輸出與離線 Scripted Model
+  model_output.py      structured output validation 與修正重試
   patching.py          replay-safe replacement apply、preimage 分類與 cumulative diff
   planning.py          typed Plan validation、artifact checksum 與 replay ledger
-  sources.py           共用 Patch Run Manifest、Repository Source 與 validation
+  reporting.py         Run Events 與最終 report.json
+  sources.py           Fixture 的 Patch Run Manifest、Repository Source 與 validation
   state.py             Patch Run graph state
   verification.py      Baseline／Repair Verification、結果分類與 replay-safe logs
   workspace.py         隔離 Run Workspace 的建立規則
 
 tests/
   test_cli.py          Registry、workspace、baseline outcomes、artifacts 與 durable status
-  test_gemini.py       Gemini transport contract、tool circulation、retry 與 request budget
+  test_gemini.py       Gemini transport contract、tool circulation、retry 與 request limit
   test_graph.py        Graph smoke test
 
 scripts/
   render_graph.py      從 compiled graph 產生 Mermaid Markdown
 
 examples/tiny_repo/
-  patch-run.toml       `run` 與 `run-local` 共用的專案設定
+  patch-run.toml       內建練習題的 Issue、Verification 與 editable paths
   issue.md             Cart discount Issue
   cart.py              刻意保留的錯誤實作
   test_cart.py         Fixture baseline 與 acceptance test
 
 CONTEXT.md             PatchCodeAgent domain glossary
-docs/design.md         狀態機、邊界、budgets、artifacts 與 report schema
+docs/design.md         狀態機、邊界、安全限制、artifacts 與 report schema
 docs/adr/              單一架構決策與取捨
 docs/agents/           Engineering skills 的 repo 設定
 AGENTS.md              Agent 需要讀取的 tracker 與 domain docs 入口
@@ -245,16 +247,5 @@ uv.lock                鎖定 dependencies
 
 ## 延伸閱讀
 
-| 文件 | 內容 |
-|---|---|
-| **[GitHub Issue #2](https://github.com/jerryxcy/patch-code-agent/issues/2)** | MVP implementation 與 acceptance spec：user stories、驗收 seam、測試矩陣、完成條件與 non-goals |
-| **[docs/design.md](./docs/design.md)** | 從上方架構圖逐層展開：Patch Run lifecycle、工具邊界、Approval、replay safety、artifacts 與 Run Report |
-| **[CONTEXT.md](./CONTEXT.md)** | Repository Source、Patch Run、Candidate Patch、Verification 與 terminal outcomes 的正式詞彙 |
-| [ADR-0001](./docs/adr/0001-prioritize-engineering-demonstration.md) | 一日 MVP 優先完成可解釋的 end-to-end engineering demonstration |
-| [ADR-0002](./docs/adr/0002-make-patch-runs-resumable.md) · [ADR-0004](./docs/adr/0004-isolate-each-run-workspace.md) · [ADR-0006](./docs/adr/0006-accumulate-repair-attempts.md) | Run resume、workspace isolation 與累加 Repair Attempts |
-| [ADR-0003](./docs/adr/0003-constrain-the-mvp-trust-boundary.md) · [ADR-0005](./docs/adr/0005-keep-side-effects-outside-the-model.md) · [ADR-0011](./docs/adr/0011-protect-the-verification-boundary.md) | Repository、model side effects 與 Verification 的信任邊界 |
-| [ADR-0007](./docs/adr/0007-keep-orchestration-host-controlled.md) · [ADR-0013](./docs/adr/0013-use-langgraph-to-expose-the-harness.md) | Host-controlled LangGraph orchestration 與選擇較低階 abstraction 的原因 |
-| [ADR-0008](./docs/adr/0008-compute-diffs-from-structured-replacements.md) · [ADR-0012](./docs/adr/0012-make-run-mutations-replay-safe.md) | Structured replacements、diff、checksum 與 replay safety |
-| [ADR-0009](./docs/adr/0009-separate-control-state-from-run-artifacts.md) | SQLite control state 與 filesystem Run Artifacts 的分界 |
-| [ADR-0014](./docs/adr/0014-require-explicit-model-selection.md) | 使用 `--model` 明確同意把 Repository 內容送到 Gemini |
-| [docs/agents/](./docs/agents/domain.md) | GitHub Issues、triage labels 與 single-context domain docs 的 agent 設定 |
+完整的 graph lifecycle、工具限制、Approval、replay safety、artifacts 與 Run Report 設計，請閱讀
+[docs/design.md](./docs/design.md)。

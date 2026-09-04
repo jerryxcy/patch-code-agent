@@ -87,8 +87,7 @@ class BaselineVerificationSummary(BaseModel):
 class BaselineVerifier:
     """Execute baseline Verification once per Run Identifier.
 
-    The verifier is source-neutral: it only receives an already validated argv and workspace,
-    so bundled fixtures and explicitly trusted repositories use the same execution path.
+    The verifier receives only an already validated argv and Run Workspace.
     """
 
     def __init__(

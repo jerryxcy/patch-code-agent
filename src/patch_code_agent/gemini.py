@@ -1,4 +1,4 @@
-"""Gemini adapter for explicitly selected Fixture or Trusted Repository Patch Runs."""
+"""Gemini adapter for explicitly selected Fixture Repository Patch Runs."""
 
 import json
 from base64 import b64encode
@@ -11,8 +11,8 @@ from typing import Protocol
 
 from pydantic import BaseModel
 
-from patch_code_agent.budgets import ResourceBudgetExceededError
 from patch_code_agent.inspection import InspectionTools
+from patch_code_agent.limits import MAX_MODEL_REQUESTS, RunLimitExceededError
 from patch_code_agent.model import (
     CandidatePatch,
     CandidateRequest,
@@ -37,10 +37,10 @@ class GeminiProviderError(RuntimeError):
         self.transient = status_code in _TRANSIENT_STATUS_CODES
 
 
-class GeminiInconclusiveError(RuntimeError):
-    """Signal that an opt-in Live Smoke Run could not establish a provider result."""
+class GeminiUnavailableError(RuntimeError):
+    """Signal that Gemini remained unavailable after bounded retries."""
 
-    inconclusive = True
+    provider_unavailable = True
 
     def __init__(
         self,
@@ -325,7 +325,7 @@ class GeminiModelGateway:
                     allowance=allowance - requests,
                     run_id=run_id,
                     phase=phase,
-                    request_offset=8 - allowance + requests,
+                    request_offset=MAX_MODEL_REQUESTS - allowance + requests,
                 )
             except Exception as error:
                 if hasattr(error, "model_requests"):
@@ -342,7 +342,7 @@ class GeminiModelGateway:
                         # Invalid model arguments reveal no workspace data. Return the bounded
                         # host rejection so Gemini can correct the call within the same budget.
                         response_payload = {"error": str(error)}
-                    except ResourceBudgetExceededError as error:
+                    except RunLimitExceededError as error:
                         error.model_requests += requests
                         raise
                     function_call = {"name": call.name, "args": dict(call.arguments)}
@@ -365,15 +365,15 @@ class GeminiModelGateway:
                 )
                 continue
             if turn.output is None:
-                raise GeminiInconclusiveError(
+                raise GeminiUnavailableError(
                     "Gemini returned neither tool calls nor structured output",
                     model_requests=requests,
                 )
             return ModelGatewayResult(output=turn.output, model_requests=requests)
-        raise ResourceBudgetExceededError(
-            budget_name="model_requests",
-            budget_limit=8,
-            budget_used=8,
+        raise RunLimitExceededError(
+            limit_name="model_requests",
+            limit=MAX_MODEL_REQUESTS,
+            used=MAX_MODEL_REQUESTS,
             model_requests=requests,
         )
 
@@ -418,19 +418,19 @@ class GeminiModelGateway:
                     model_requests=consumed,
                 )
                 if not error.transient:
-                    raise GeminiInconclusiveError(
+                    raise GeminiUnavailableError(
                         str(error),
                         model_requests=consumed,
                         status_code=error.status_code,
                     ) from error
                 if consumed >= 3:
-                    raise GeminiInconclusiveError(
+                    raise GeminiUnavailableError(
                         str(error),
                         model_requests=consumed,
                         status_code=error.status_code,
                     ) from error
                 if consumed >= allowance:
-                    raise GeminiInconclusiveError(
+                    raise GeminiUnavailableError(
                         str(error),
                         model_requests=consumed,
                         status_code=error.status_code,

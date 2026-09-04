@@ -1,9 +1,4 @@
-"""Load every repository source through one Patch Run manifest interface.
-
-Bundled fixtures and explicitly trusted local repositories share ``patch-run.toml`` and normalize
-into the same ``RepositorySource`` and ``PatchRunContract`` types. This module also enforces bounded
-Issue text, controlled Verification argv, editable paths, containment checks, and no symlinks.
-"""
+"""Load bounded Fixture Repository sources from Patch Run manifests."""
 
 from __future__ import annotations
 
@@ -78,7 +73,7 @@ def _validate_issue(value: str) -> str:
     return value
 
 
-type RepositorySourceKind = Literal["fixture", "trusted"]
+type RepositorySourceKind = Literal["fixture"]
 type RepositorySourceId = Annotated[
     str,
     StringConstraints(
@@ -142,7 +137,7 @@ class PatchRunContract(BaseModel):
 
 
 class PatchRunManifest(BaseModel):
-    """Shared ``patch-run.toml`` representation for every Repository Source.
+    """Validated ``patch-run.toml`` representation for a Fixture Repository.
 
     Attributes:
         source_id: Lowercase kebab-case identifier used by CLI commands and output.
@@ -183,7 +178,7 @@ class RepositorySource:
     """Immutable repository content prepared for Patch Run execution.
 
     Attributes:
-        kind: Source adapter category, either ``fixture`` or ``trusted``.
+        kind: Fixture Repository source category.
         source_id: Stable contract/registry identifier displayed by the CLI.
         root: Resolved directory whose visible contents will seed the Run Workspace.
         contract: Source-neutral Issue, Verification argv, and edit policy.
@@ -209,13 +204,8 @@ class RepositorySource:
     contract: PatchRunContract
 
 
-def load_trusted_repository(repository: Path) -> RepositorySource:
-    """Load an explicitly trusted local repository and its ``patch-run.toml`` contract."""
-    return load_repository_source(repository, kind="trusted")
-
-
-def load_repository_source(repository: Path, *, kind: RepositorySourceKind) -> RepositorySource:
-    """Load either source kind through the shared ``patch-run.toml`` interface."""
+def load_repository_source(repository: Path) -> RepositorySource:
+    """Load one Fixture Repository through its ``patch-run.toml`` manifest."""
     reject_source_symlinks(repository)
     resolved_root = repository.resolve()
     manifest_path = resolved_root / "patch-run.toml"
@@ -241,7 +231,7 @@ def load_repository_source(repository: Path, *, kind: RepositorySourceKind) -> R
     except ValueError as error:
         raise ValueError(f"Invalid Patch Run Manifest at {manifest_path}: {error}") from error
     return RepositorySource(
-        kind=kind,
+        kind="fixture",
         source_id=manifest.source_id,
         root=resolved_root,
         contract=contract,

@@ -10,7 +10,6 @@ from typing import Literal, cast, get_args
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
-from patch_code_agent.budgets import ResourceBudgets
 from patch_code_agent.state import RunState
 
 TerminalOutcome = Literal[
@@ -18,7 +17,6 @@ TerminalOutcome = Literal[
     "rejected",
     "issue_not_reproduced",
     "attempts_exhausted",
-    "budget_exceeded",
     "workspace_changed",
     "error",
 ]
@@ -93,7 +91,7 @@ class RunReport(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: Literal["1"] = "1"
+    schema_version: Literal["2"] = "2"
     run_id: str
     source_kind: str
     source_id: str
@@ -105,7 +103,6 @@ class RunReport(BaseModel):
     error_kind: str | None
     started_at: str
     finished_at: str
-    active_duration_seconds: float = Field(ge=0)
     attempts: int = Field(ge=0, le=3)
     model_requests: int = Field(ge=0)
     tool_executions: int = Field(ge=0)
@@ -113,7 +110,6 @@ class RunReport(BaseModel):
     files_changed: tuple[str, ...]
     verification: VerificationHistory
     artifacts: ArtifactInventory
-    budgets: ResourceBudgets
 
 
 class RunReportReference(BaseModel):
@@ -224,7 +220,7 @@ class RunAuditStore:
         terminal_reason = (
             str(report_note)
             if report_note is not None
-            else cast(str | None, state.get("budget_name") or state.get("error_kind"))
+            else cast(str | None, state.get("error_kind"))
         )
         return RunReport(
             run_id=state["run_id"],
@@ -238,7 +234,6 @@ class RunAuditStore:
             error_kind=state.get("error_kind"),
             started_at=events[0].occurred_at,
             finished_at=events[-1].occurred_at,
-            active_duration_seconds=state.get("active_duration_seconds", 0.0),
             attempts=state.get("attempt", 0),
             model_requests=state.get("model_requests", 0),
             tool_executions=state.get("tool_executions", 0),
@@ -261,7 +256,6 @@ class RunAuditStore:
                     run_root / "cumulative.diff", run_root
                 ),
             ),
-            budgets=ResourceBudgets.from_state(state),
         )
 
     def _verification_history(

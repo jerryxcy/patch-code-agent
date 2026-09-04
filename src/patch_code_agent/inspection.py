@@ -5,7 +5,11 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Protocol
 
-from patch_code_agent.budgets import ResourceBudgetExceededError
+from patch_code_agent.limits import (
+    MAX_FILES_READ,
+    MAX_TOOL_EXECUTIONS,
+    RunLimitExceededError,
+)
 from patch_code_agent.sources import is_ignored_source_path, validate_relative_path
 
 _MAX_FILE_BYTES = 100 * 1024
@@ -156,11 +160,11 @@ class WorkspaceInspector:
         return SearchResult(output.decode("utf-8"), truncated)
 
     def _claim_tool_execution(self) -> None:
-        if self._prior_tool_executions + self._tool_executions >= 20:
-            raise ResourceBudgetExceededError(
-                budget_name="tool_executions",
-                budget_limit=20,
-                budget_used=20,
+        if self._prior_tool_executions + self._tool_executions >= MAX_TOOL_EXECUTIONS:
+            raise RunLimitExceededError(
+                limit_name="tool_executions",
+                limit=MAX_TOOL_EXECUTIONS,
+                used=MAX_TOOL_EXECUTIONS,
                 tool_executions=self._tool_executions,
                 files_read=self.files_read,
             )
@@ -169,11 +173,11 @@ class WorkspaceInspector:
     def _claim_file_read(self, relative: str) -> None:
         if relative in self._previously_read or relative in self._files_read:
             return
-        if len(self._previously_read | self._files_read) >= 12:
-            raise ResourceBudgetExceededError(
-                budget_name="files_read",
-                budget_limit=12,
-                budget_used=12,
+        if len(self._previously_read | self._files_read) >= MAX_FILES_READ:
+            raise RunLimitExceededError(
+                limit_name="files_read",
+                limit=MAX_FILES_READ,
+                used=MAX_FILES_READ,
                 tool_executions=self._tool_executions,
                 files_read=self.files_read,
             )

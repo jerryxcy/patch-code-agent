@@ -15,7 +15,6 @@ RunStatus = Literal[
     "validated",
     "baseline_failed",
     "issue_not_reproduced",
-    "budget_exceeded",
     "error",
     "inspected",
     "planned",
@@ -42,7 +41,7 @@ class RunState(TypedDict, total=False):
 
     Attributes:
         run_id: Public UUID and LangGraph thread identifier for one Patch Run.
-        source_kind: Whether content came from a bundled fixture or explicitly trusted repository.
+        source_kind: The Fixture Repository source kind.
         source_id: Stable, human-readable Repository Source identifier.
         source_revision: SHA-256 identity of the initial copied workspace tree.
         model_id: Stable identity of the configured Model Gateway.
@@ -68,12 +67,6 @@ class RunState(TypedDict, total=False):
         cumulative_diff: Path/checksum reference for the aggregate workspace repair.
         error_kind: Stable machine-readable terminal error category, when applicable.
         provider_status_code: Credential-free HTTP status for an unavailable model provider.
-        budget_name: Specific Resource Budget that caused Budget Exceeded.
-        budget_limit: Configured limit for the exceeded Resource Budget.
-        budget_used: Observed usage when the limit was exceeded.
-        active_duration_seconds: Host-controlled execution time, excluding Approval wait.
-        active_measurements: Replay-stable elapsed seconds keyed by logical node execution.
-        verification_duration_max: Longest completed Verification duration across the Run.
         status: Current lifecycle phase or terminal outcome used for routing and CLI status.
         report: Bounded structured progress/report data; complete evidence remains in artifacts.
         report_artifact: Path/checksum reference to the immutable terminal Run Report.
@@ -121,12 +114,6 @@ class RunState(TypedDict, total=False):
     cumulative_diff: dict[str, object]
     error_kind: str
     provider_status_code: int
-    budget_name: str
-    budget_limit: int | float
-    budget_used: int | float
-    active_duration_seconds: float
-    active_measurements: dict[str, float]
-    verification_duration_max: float
     status: RunStatus
     report: dict[str, object]
     report_artifact: dict[str, object]
