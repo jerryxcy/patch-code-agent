@@ -9,9 +9,9 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from patch_code_agent.budgets import ResourceBudgetExceededError
 from patch_code_agent.diagnosis import DiagnosisArtifactReference, load_diagnosis_artifact
 from patch_code_agent.inspection import WorkspaceInspector
+from patch_code_agent.limits import RunLimitExceededError
 from patch_code_agent.model import CandidatePatch, CandidateRequest, ModelGateway
 from patch_code_agent.model_output import (
     InvalidModelOutputError,
@@ -161,7 +161,7 @@ class CandidatePatchBuilder:
         except (
             InvalidModelOutputError,
             ModelInvocationError,
-            ResourceBudgetExceededError,
+            RunLimitExceededError,
         ) as error:
             error.record_inspection(
                 tool_executions=inspector.tool_executions,

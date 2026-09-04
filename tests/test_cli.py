@@ -2,7 +2,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -12,7 +11,7 @@ from typer.testing import CliRunner
 
 from patch_code_agent.application import PatchRunStatusReader
 from patch_code_agent.cli import create_cli
-from patch_code_agent.gemini import GeminiInconclusiveError
+from patch_code_agent.gemini import GeminiUnavailableError
 from patch_code_agent.inspection import WorkspaceInspector
 from patch_code_agent.model import ScriptedInspectionCall, ScriptedModel
 from patch_code_agent.patching import PatchApplier
@@ -81,13 +80,13 @@ class FailingPlanModel:
         raise AssertionError("Diagnosis must not run after model failure")
 
 
-class UnavailableLiveModel:
+class UnavailableGeminiModel:
     model_id = "gemini-3.7-flash"
     synthetic_only = True
     allowed_fixture_roots = (Path(__file__).parents[1] / "examples" / "tiny_repo",)
 
     def create_plan(self, request, tools):
-        raise GeminiInconclusiveError(
+        raise GeminiUnavailableError(
             "simulated provider outage",
             model_requests=1,
             status_code=503,
@@ -100,8 +99,8 @@ class UnavailableLiveModel:
         raise AssertionError("Diagnosis must not run after provider exhaustion")
 
 
-class ToolBudgetModel:
-    model_id = "tool-budget"
+class ToolLimitModel:
+    model_id = "tool-limit"
 
     def create_plan(self, request, tools):
         for _ in range(21):
@@ -120,37 +119,8 @@ class ToolBudgetModel:
         return ScriptedModel().create_diagnosis(request, tools)
 
 
-class FakeClock:
-    def __init__(self) -> None:
-        self.now = 0.0
-
-    def __call__(self) -> float:
-        return self.now
-
-    def advance(self, seconds: float) -> None:
-        self.now += seconds
-
-
-class SlowPlanModel:
-    model_id = "slow-plan"
-
-    def __init__(self, clock: FakeClock) -> None:
-        self.clock = clock
-
-    def create_plan(self, request, tools):
-        result = ScriptedModel().create_plan(request, tools)
-        self.clock.advance(301.0)
-        return result
-
-    def create_candidate(self, request, tools):
-        return ScriptedModel().create_candidate(request, tools)
-
-    def create_diagnosis(self, request, tools):
-        return ScriptedModel().create_diagnosis(request, tools)
-
-
-class FilesReadBudgetModel:
-    model_id = "files-read-budget"
+class FilesReadLimitModel:
+    model_id = "files-read-limit"
 
     def create_plan(self, request, tools):
         paths = tools.list_files().paths
@@ -170,8 +140,8 @@ class FilesReadBudgetModel:
         return ScriptedModel().create_diagnosis(request, tools)
 
 
-class SearchFilesReadBudgetModel:
-    model_id = "search-files-read-budget"
+class SearchFilesReadLimitModel:
+    model_id = "search-files-read-limit"
 
     def create_plan(self, request, tools):
         tools.search_code("VALUE")
@@ -189,8 +159,8 @@ class SearchFilesReadBudgetModel:
         raise AssertionError("Diagnosis must not run after budget exhaustion")
 
 
-class CumulativeFilesChangedBudgetModel:
-    model_id = "cumulative-files-changed-budget"
+class CumulativeFilesChangedLimitModel:
+    model_id = "cumulative-files-changed-limit"
 
     def create_plan(self, request, tools):
         return {
@@ -336,7 +306,7 @@ def _assert_terminal_report(
     )
     status = PatchRunStatusReader(data_root).get(run_identifier)
 
-    assert report.schema_version == "1"
+    assert report.schema_version == "2"
     assert report.outcome == expected_outcome
     assert report.run_id == run_identifier
     assert report.issue
@@ -346,7 +316,6 @@ def _assert_terminal_report(
     assert report.tool_executions == status.tool_executions
     assert report.files_read == status.files_read
     assert report.files_changed == status.files_changed
-    assert report.budgets == status.budgets
     assert report.started_at <= report.finished_at
     assert len({event.event_id for event in events}) == len(events)
     assert all(event.run_id == run_identifier for event in events)
@@ -403,7 +372,7 @@ def _invoke_cli_process(
     )
 
 
-def _run_trusted_inspection(
+def _run_fixture_inspection(
     tmp_path: Path,
     model,
     *,
@@ -417,20 +386,24 @@ def _run_trusted_inspection(
         target = repository / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(content)
-    contract = repository / "patch-run.toml"
-    contract.write_text(
+    (repository / "issue.md").write_text("Inspect the reported problem\n", encoding="utf-8")
+    (repository / "patch-run.toml").write_text(
         f"""source_id = "inspection-repository"
-issue = "Inspect the reported problem"
+issue_path = "issue.md"
 verification = {json.dumps([sys.executable, "-c", baseline_program])}
 editable_paths = ["cart.py"]
 """,
         encoding="utf-8",
     )
     data_root = tmp_path / "runs"
-    cli = create_cli(model_gateway=model, data_root=data_root)
+    cli = create_cli(
+        model_gateway=model,
+        data_root=data_root,
+        fixture_roots=(repository,),
+    )
     result = CliRunner().invoke(
         cli,
-        ["run-local", str(repository), "--trust-repository"],
+        ["run", "inspection-repository"],
     )
     return result, data_root
 
@@ -452,7 +425,8 @@ def test_gemini_run_approval_does_not_repeat_or_call_the_model_when_verification
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("GEMINI_API_KEY", "test-only-key")
+    api_key = "test-only-key"
+    monkeypatch.setenv("GEMINI_API_KEY", api_key)
     data_root = tmp_path / "runs"
 
     def factory(_key: str, _data_root: Path, model: str):
@@ -487,34 +461,9 @@ def test_gemini_run_approval_does_not_repeat_or_call_the_model_when_verification
     assert _assert_terminal_report(data_root, approve_result.output, "succeeded").model_id == (
         "gemini-3.6-flash"
     )
-
-
-def test_trusted_repository_run_can_use_gemini(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("GEMINI_API_KEY", "test-only-key")
-    repository = tmp_path / "trusted-repository"
-    shutil.copytree(Path(__file__).parents[1] / "examples" / "tiny_repo", repository)
-    model = ScriptedModel(model_id="gemini-3.7-flash")
-
-    result = CliRunner().invoke(
-        create_cli(
-            data_root=tmp_path / "runs",
-            live_model_factory=lambda _key, _data_root, _model: model,
-        ),
-        [
-            "run-local",
-            str(repository),
-            "--trust-repository",
-            "--model",
-            "gemini-3.7-flash",
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    assert "Trusted Repository: cart-discount" in result.output
-    assert "status: pending_approval" in result.output
+    for path in data_root.rglob("*"):
+        if path.is_file():
+            assert api_key.encode() not in path.read_bytes()
 
 
 def test_gemini_is_restored_lazily_when_approval_needs_a_repair(
@@ -547,7 +496,7 @@ def test_gemini_is_restored_lazily_when_approval_needs_a_repair(
     assert factory_calls == 2
 
 
-def test_live_smoke_without_api_key_is_inconclusive_and_offline(
+def test_gemini_run_without_api_key_fails_before_creating_a_run(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -562,16 +511,16 @@ def test_live_smoke_without_api_key_is_inconclusive_and_offline(
 
     result = CliRunner().invoke(
         create_cli(data_root=tmp_path / "runs", live_model_factory=factory),
-        ["live-smoke"],
+        ["run", "cart-discount", "--model", "gemini-3.7-flash"],
     )
 
-    assert result.exit_code == 0, result.output
-    assert "Live Smoke Inconclusive: GEMINI_API_KEY is not configured" in result.output
+    assert result.exit_code == 2
+    assert "GEMINI_API_KEY is not configured" in result.output
     assert factory_called is False
     assert not (tmp_path / "runs").exists()
 
 
-def test_live_smoke_loads_gemini_api_key_from_dotenv(
+def test_gemini_run_loads_api_key_from_dotenv(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -586,14 +535,14 @@ def test_live_smoke_loads_gemini_api_key_from_dotenv(
 
     result = CliRunner().invoke(
         create_cli(data_root=tmp_path / "runs", live_model_factory=factory),
-        ["live-smoke", "cart-discount", "--yes"],
+        ["run", "cart-discount", "--model", "gemini-3.7-flash"],
     )
 
     assert result.exit_code == 0, result.output
-    assert "Live Smoke Succeeded" in result.output
+    assert "status: pending_approval" in result.output
 
 
-def test_live_smoke_environment_api_key_overrides_dotenv(
+def test_gemini_run_environment_api_key_overrides_dotenv(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -607,80 +556,14 @@ def test_live_smoke_environment_api_key_overrides_dotenv(
 
     result = CliRunner().invoke(
         create_cli(data_root=tmp_path / "runs", live_model_factory=factory),
-        ["live-smoke", "cart-discount", "--yes"],
+        ["run", "cart-discount", "--model", "gemini-3.7-flash"],
     )
 
     assert result.exit_code == 0, result.output
-    assert "Live Smoke Succeeded" in result.output
+    assert "status: pending_approval" in result.output
 
 
-def test_live_smoke_rejects_injected_fixture_registry_before_model_request(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    private_fixture = tmp_path / "private-fixture"
-    bundled_fixture = Path(__file__).parents[1] / "examples" / "tiny_repo"
-    shutil.copytree(bundled_fixture, private_fixture)
-    manifest = private_fixture / "patch-run.toml"
-    manifest.write_text(
-        manifest.read_text().replace("cart-discount", "private-fixture"),
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("GEMINI_API_KEY", "test-only-key")
-    model = RecordingModel()
-
-    result = CliRunner().invoke(
-        create_cli(
-            data_root=tmp_path / "runs",
-            fixture_roots=(private_fixture,),
-            live_model_factory=lambda _key, _data_root, _model: model,
-        ),
-        ["live-smoke", "private-fixture", "--yes"],
-    )
-
-    assert result.exit_code == 2
-    assert "Unknown Fixture Repository: private-fixture" in result.output
-    assert model.plan_requests == 0
-
-
-def test_live_smoke_uses_registered_fixture_without_persisting_api_key(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    api_key = "test-only-gemini-secret"
-    monkeypatch.setenv("GEMINI_API_KEY", api_key)
-    data_root = tmp_path / "runs"
-    fixture_source = Path(__file__).parents[1] / "examples" / "tiny_repo" / "cart.py"
-    original_source = fixture_source.read_bytes()
-
-    def factory(observed_key: str, observed_data_root: Path, observed_model: str):
-        assert observed_key == api_key
-        assert observed_data_root == data_root
-        assert observed_model == "gemini-3.6-flash"
-        return ScriptedModel()
-
-    result = CliRunner().invoke(
-        create_cli(data_root=data_root, live_model_factory=factory),
-        [
-            "live-smoke",
-            "cart-discount",
-            "--yes",
-            "--model",
-            "gemini-3.6-flash",
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    assert "Live Smoke Succeeded" in result.output
-    report = _assert_terminal_report(data_root, result.output, "succeeded")
-    assert report.source_kind == "fixture"
-    assert fixture_source.read_bytes() == original_source
-    for path in data_root.rglob("*"):
-        if path.is_file():
-            assert api_key.encode() not in path.read_bytes()
-
-
-def test_live_smoke_provider_unavailable_is_inconclusive_not_cli_failure(
+def test_gemini_provider_unavailable_is_saved_as_an_error(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -690,20 +573,20 @@ def test_live_smoke_provider_unavailable_is_inconclusive_not_cli_failure(
     result = CliRunner().invoke(
         create_cli(
             data_root=data_root,
-            live_model_factory=lambda _key, _data_root, _model: UnavailableLiveModel(),
+            live_model_factory=lambda _key, _data_root, _model: UnavailableGeminiModel(),
         ),
-        ["live-smoke", "cart-discount", "--yes"],
+        ["run", "cart-discount", "--model", "gemini-3.7-flash"],
     )
 
     assert result.exit_code == 0, result.output
-    assert "Live Smoke Inconclusive: Gemini unavailable" in result.output
-    assert "HTTP 503 Service Unavailable" in result.output
+    assert "Outcome: Error" in result.output
+    assert "Error Kind: provider_unavailable" in result.output
     report = _assert_terminal_report(data_root, result.output, "error")
     assert report.error_kind == "provider_unavailable"
     assert report.model_requests == 1
 
 
-def test_live_smoke_rejects_unsupported_model_before_client_creation(
+def test_gemini_run_rejects_unsupported_model_before_client_creation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -717,7 +600,7 @@ def test_live_smoke_rejects_unsupported_model_before_client_creation(
 
     result = CliRunner().invoke(
         create_cli(data_root=tmp_path / "runs", live_model_factory=factory),
-        ["live-smoke", "--model", "gemini-private"],
+        ["run", "cart-discount", "--model", "gemini-private"],
     )
 
     assert result.exit_code == 2
@@ -975,47 +858,22 @@ def test_run_pauses_with_an_immutable_candidate_patch_visible_from_status(
     assert "Repair Attempts: 0" in status_result.output
 
 
-def test_status_displays_independent_resource_budget_usage(tmp_path: Path) -> None:
-    data_root = tmp_path / "runs"
-    run_result = CliRunner().invoke(
-        create_cli(model_gateway=ScriptedModel(), data_root=data_root),
-        ["run", "cart-discount"],
-    )
-    run_identifier = _run_identifier(run_result.output)
-
-    status_result = CliRunner().invoke(
-        create_cli(model_gateway=ScriptedModel(), data_root=data_root),
-        ["status", run_identifier],
-    )
-
-    assert status_result.exit_code == 0, status_result.output
-    assert "Repair Attempts Budget: 0/3" in status_result.output
-    assert "Distinct Files Read Budget: 4/12" in status_result.output
-    assert "Files Changed Budget: 0/3" in status_result.output
-    assert "Tool Executions Budget: 5/20" in status_result.output
-    assert "Model Requests Budget: 2/8" in status_result.output
-    assert "Verification Seconds Budget:" in status_result.output
-    assert "/60.0" in status_result.output
-    assert "Active Seconds Budget:" in status_result.output
-    assert "/300.0" in status_result.output
-
-
-def test_tool_execution_budget_exceeded_names_limit_and_usage(tmp_path: Path) -> None:
+def test_tool_execution_limit_stops_the_run(tmp_path: Path) -> None:
     data_root = tmp_path / "runs"
 
     result = CliRunner().invoke(
-        create_cli(model_gateway=ToolBudgetModel(), data_root=data_root),
+        create_cli(model_gateway=ToolLimitModel(), data_root=data_root),
         ["run", "cart-discount"],
     )
 
     assert result.exit_code == 0, result.output
-    assert "Outcome: Budget Exceeded" in result.output
-    assert "Budget: tool_executions" in result.output
-    assert "Budget Usage: 20/20" in result.output
+    assert "Outcome: Error" in result.output
+    assert "Error Kind: limit_exceeded" in result.output
+    assert "Reason: Run limit reached: tool_executions (20/20)." in result.output
     run_root = data_root / _run_identifier(result.output)
     assert not (run_root / "plan.json").exists()
     assert not (run_root / "attempts").exists()
-    report = _assert_terminal_report(data_root, result.output, "budget_exceeded")
+    report = _assert_terminal_report(data_root, result.output, "error")
     assert report.artifacts.plan is None
     assert report.verification.baseline is not None
 
@@ -1063,34 +921,34 @@ def test_plan_storage_failure_is_a_stable_error(
     assert "Attempts Exhausted" not in result.output
 
 
-def test_distinct_files_read_budget_exceeded_names_limit_and_usage(tmp_path: Path) -> None:
-    result, data_root = _run_trusted_inspection(
+def test_distinct_files_read_limit_stops_the_run(tmp_path: Path) -> None:
+    result, data_root = _run_fixture_inspection(
         tmp_path,
-        FilesReadBudgetModel(),
+        FilesReadLimitModel(),
         extra_files={f"file{index:02}.py": b"VALUE = 1\n" for index in range(12)},
     )
 
     assert result.exit_code == 0, result.output
-    assert "Outcome: Budget Exceeded" in result.output
-    assert "Budget: files_read" in result.output
-    assert "Budget Usage: 12/12" in result.output
+    assert "Outcome: Error" in result.output
+    assert "Error Kind: limit_exceeded" in result.output
+    assert "Reason: Run limit reached: files_read (12/12)." in result.output
     assert not (data_root / _run_identifier(result.output) / "attempts").exists()
 
 
-def test_search_enforces_the_distinct_files_read_budget(tmp_path: Path) -> None:
-    result, _ = _run_trusted_inspection(
+def test_search_enforces_the_distinct_files_read_limit(tmp_path: Path) -> None:
+    result, _ = _run_fixture_inspection(
         tmp_path,
-        SearchFilesReadBudgetModel(),
+        SearchFilesReadLimitModel(),
         extra_files={f"file{index:02}.py": b"VALUE = 1\n" for index in range(12)},
     )
 
     assert result.exit_code == 0, result.output
-    assert "Outcome: Budget Exceeded" in result.output
-    assert "Budget: files_read" in result.output
-    assert "Budget Usage: 12/12" in result.output
+    assert "Outcome: Error" in result.output
+    assert "Error Kind: limit_exceeded" in result.output
+    assert "Reason: Run limit reached: files_read (12/12)." in result.output
 
 
-def test_files_changed_budget_accumulates_across_attempts(tmp_path: Path) -> None:
+def test_files_changed_limit_accumulates_across_attempts(tmp_path: Path) -> None:
     repository = tmp_path / "four-file-repository"
     repository.mkdir()
     paths = [f"file{index}.py" for index in range(4)]
@@ -1106,10 +964,14 @@ editable_paths = {json.dumps(paths)}
         encoding="utf-8",
     )
     data_root = tmp_path / "runs"
-    model = CumulativeFilesChangedBudgetModel()
+    model = CumulativeFilesChangedLimitModel()
     run_result = CliRunner().invoke(
-        create_cli(model_gateway=model, data_root=data_root),
-        ["run-local", str(repository), "--trust-repository"],
+        create_cli(
+            model_gateway=model,
+            data_root=data_root,
+            fixture_roots=(repository,),
+        ),
+        ["run", "four-file-repository"],
     )
     run_identifier = _run_identifier(run_result.output)
 
@@ -1125,16 +987,16 @@ editable_paths = {json.dumps(paths)}
     assert first_approval.exit_code == 0, first_approval.output
     assert "status: pending_approval" in first_approval.output
     assert approve_result.exit_code == 0, approve_result.output
-    assert "Outcome: Budget Exceeded" in approve_result.output
-    assert "Budget: files_changed" in approve_result.output
-    assert "Budget Usage: 3/3" in approve_result.output
+    assert "Outcome: Error" in approve_result.output
+    assert "Error Kind: limit_exceeded" in approve_result.output
+    assert "Reason: Run limit reached: files_changed (4/3)." in approve_result.output
     assert "Repair Attempts: 1" in approve_result.output
     workspace = data_root / run_identifier / "workspace"
     assert all("# attempt 1" in (workspace / path).read_text() for path in paths[:3])
     assert (workspace / paths[3]).read_text() == "VALUE = 1\n"
 
 
-def test_model_request_budget_counts_schema_correction_requests(tmp_path: Path) -> None:
+def test_model_request_limit_counts_schema_correction_requests(tmp_path: Path) -> None:
     data_root = tmp_path / "runs"
     model = CorrectedEveryOutputModel()
     run_result = CliRunner().invoke(
@@ -1155,55 +1017,11 @@ def test_model_request_budget_counts_schema_correction_requests(tmp_path: Path) 
     assert first_approval.exit_code == 0, first_approval.output
     assert "status: pending_approval" in first_approval.output
     assert second_approval.exit_code == 0, second_approval.output
-    assert "Outcome: Budget Exceeded" in second_approval.output
-    assert "Budget: model_requests" in second_approval.output
-    assert "Budget Usage: 8/8" in second_approval.output
+    assert "Outcome: Error" in second_approval.output
+    assert "Error Kind: limit_exceeded" in second_approval.output
+    assert "Reason: Run limit reached: model_requests (8/8)." in second_approval.output
     assert "Repair Attempts: 2" in second_approval.output
     assert "Attempts Exhausted" not in second_approval.output
-
-
-def test_active_time_budget_counts_model_work(tmp_path: Path) -> None:
-    clock = FakeClock()
-
-    result = CliRunner().invoke(
-        create_cli(
-            model_gateway=SlowPlanModel(clock),
-            data_root=tmp_path / "runs",
-            clock=clock,
-        ),
-        ["run", "cart-discount"],
-    )
-
-    assert result.exit_code == 0, result.output
-    assert "Outcome: Budget Exceeded" in result.output
-    assert "Budget: active_seconds" in result.output
-    assert "Budget Usage: 301.0/300.0" in result.output
-    assert "Candidate Patch" not in result.output
-
-
-def test_approval_wait_is_excluded_from_active_time(tmp_path: Path) -> None:
-    clock = FakeClock()
-    data_root = tmp_path / "runs"
-    run_result = CliRunner().invoke(
-        create_cli(model_gateway=ScriptedModel(), data_root=data_root, clock=clock),
-        ["run", "cart-discount"],
-    )
-    run_identifier = _run_identifier(run_result.output)
-
-    clock.advance(1_000.0)
-    approve_result = CliRunner().invoke(
-        create_cli(model_gateway=ScriptedModel(), data_root=data_root, clock=clock),
-        ["approve", run_identifier, "--yes"],
-    )
-    status_result = CliRunner().invoke(
-        create_cli(model_gateway=ScriptedModel(), data_root=data_root, clock=clock),
-        ["status", run_identifier],
-    )
-
-    assert approve_result.exit_code == 0, approve_result.output
-    assert "Outcome: Succeeded" in approve_result.output
-    assert status_result.exit_code == 0, status_result.output
-    assert "Active Seconds Budget: 0.000/300.0" in status_result.output
 
 
 @pytest.mark.parametrize("path", ["test_cart.py", "issue.md", "patch-run.toml"])
@@ -1303,7 +1121,7 @@ def test_candidate_patch_rejects_unsafe_structured_replacements(
 
 
 def test_candidate_diff_marks_a_missing_trailing_newline_exactly(tmp_path: Path) -> None:
-    result, data_root = _run_trusted_inspection(
+    result, data_root = _run_fixture_inspection(
         tmp_path,
         CandidateScenarioModel("valid"),
         extra_files={"cart.py": b"VALUE = 1"},
@@ -1415,12 +1233,12 @@ editable_paths = ["cart.py"]
     )
     data_root = tmp_path / "runs"
     run_result = CliRunner().invoke(
-        create_cli(model_gateway=ScriptedModel(), data_root=data_root),
-        [
-            "run-local",
-            str(repository),
-            "--trust-repository",
-        ],
+        create_cli(
+            model_gateway=ScriptedModel(),
+            data_root=data_root,
+            fixture_roots=(repository,),
+        ),
+        ["run", "passing-repository"],
     )
     run_identifier = _run_identifier(run_result.output)
 
@@ -1431,96 +1249,6 @@ editable_paths = ["cart.py"]
 
     assert reject_result.exit_code == 2
     assert "not awaiting Approval (current phase: issue_not_reproduced)" in reject_result.output
-
-
-def test_reject_reports_busy_without_advancing_the_pending_run(tmp_path: Path) -> None:
-    data_root = tmp_path / "runs"
-    run_result = CliRunner().invoke(
-        create_cli(model_gateway=ScriptedModel(), data_root=data_root),
-        ["run", "cart-discount"],
-    )
-    run_identifier = _run_identifier(run_result.output)
-    candidate_path = data_root / run_identifier / "attempts" / "1" / "candidate.json"
-    candidate_before = candidate_path.read_bytes()
-
-    lock_holder = subprocess.Popen(
-        [
-            sys.executable,
-            "-c",
-            (
-                "import sys; from pathlib import Path; "
-                "from patch_code_agent.locking import RunMutationLock; "
-                "lock = RunMutationLock(Path(sys.argv[1]), sys.argv[2]); "
-                "lock.__enter__(); print('locked', flush=True); "
-                "sys.stdin.readline(); lock.__exit__(None, None, None)"
-            ),
-            str(data_root),
-            run_identifier,
-        ],
-        cwd=Path(__file__).parents[1],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        text=True,
-    )
-    try:
-        assert lock_holder.stdout is not None
-        assert lock_holder.stdout.readline().strip() == "locked"
-        reject_result = CliRunner().invoke(
-            create_cli(model_gateway=ScriptedModel(), data_root=data_root),
-            ["reject", run_identifier],
-        )
-    finally:
-        if lock_holder.stdin is not None:
-            lock_holder.stdin.write("release\n")
-            lock_holder.stdin.flush()
-        lock_holder.wait(timeout=10)
-
-    assert reject_result.exit_code == 2
-    assert f"Patch Run is busy: {run_identifier}" in reject_result.output
-    assert candidate_path.read_bytes() == candidate_before
-    status_result = CliRunner().invoke(
-        create_cli(model_gateway=ScriptedModel(), data_root=data_root),
-        ["status", run_identifier],
-    )
-    assert status_result.exit_code == 0, status_result.output
-    assert "Phase: pending_approval" in status_result.output
-
-
-def test_reject_never_creates_a_lock_outside_the_data_root(tmp_path: Path) -> None:
-    outside_directory = tmp_path / "outside"
-    outside_directory.mkdir()
-    data_root = tmp_path / "runs"
-    data_root.mkdir()
-
-    result = CliRunner().invoke(
-        create_cli(model_gateway=ScriptedModel(), data_root=data_root),
-        ["reject", str(outside_directory)],
-    )
-
-    assert result.exit_code == 2
-    assert "Invalid Run Identifier" in result.output
-    assert not (outside_directory / ".mutation.lock").exists()
-
-
-def test_reject_never_follows_a_symlinked_lock_file(tmp_path: Path) -> None:
-    data_root = tmp_path / "runs"
-    run_result = CliRunner().invoke(
-        create_cli(model_gateway=ScriptedModel(), data_root=data_root),
-        ["run", "cart-discount"],
-    )
-    run_identifier = _run_identifier(run_result.output)
-    outside_lock = tmp_path / "outside-lock"
-    outside_lock.write_text("unchanged\n", encoding="utf-8")
-    (data_root / run_identifier / ".mutation.lock").symlink_to(outside_lock)
-
-    reject_result = CliRunner().invoke(
-        create_cli(model_gateway=ScriptedModel(), data_root=data_root),
-        ["reject", run_identifier],
-    )
-
-    assert reject_result.exit_code == 2
-    assert f"Unsafe Patch Run lock file: {run_identifier}" in reject_result.output
-    assert outside_lock.read_text(encoding="utf-8") == "unchanged\n"
 
 
 def test_user_approves_and_verifies_a_candidate_from_a_separate_cli_process(
@@ -1696,54 +1424,6 @@ def test_repeated_approve_does_not_repeat_apply_verification_or_counters(tmp_pat
     assert "Repair Attempts: 1" in status_result.output
 
 
-def test_approve_reports_busy_without_advancing_the_pending_run(tmp_path: Path) -> None:
-    data_root = tmp_path / "runs"
-    run_result = CliRunner().invoke(
-        create_cli(model_gateway=ScriptedModel(), data_root=data_root),
-        ["run", "cart-discount"],
-    )
-    run_identifier = _run_identifier(run_result.output)
-    candidate_path = data_root / run_identifier / "attempts" / "1" / "candidate.json"
-    candidate_before = candidate_path.read_bytes()
-
-    lock_holder = subprocess.Popen(
-        [
-            sys.executable,
-            "-c",
-            (
-                "import sys; from pathlib import Path; "
-                "from patch_code_agent.locking import RunMutationLock; "
-                "lock = RunMutationLock(Path(sys.argv[1]), sys.argv[2]); "
-                "lock.__enter__(); print('locked', flush=True); "
-                "sys.stdin.readline(); lock.__exit__(None, None, None)"
-            ),
-            str(data_root),
-            run_identifier,
-        ],
-        cwd=Path(__file__).parents[1],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        text=True,
-    )
-    try:
-        assert lock_holder.stdout is not None
-        assert lock_holder.stdout.readline().strip() == "locked"
-        approve_result = CliRunner().invoke(
-            create_cli(model_gateway=ScriptedModel(), data_root=data_root),
-            ["approve", run_identifier, "--yes"],
-        )
-    finally:
-        if lock_holder.stdin is not None:
-            lock_holder.stdin.write("release\n")
-            lock_holder.stdin.flush()
-        lock_holder.wait(timeout=10)
-
-    assert approve_result.exit_code == 2
-    assert f"Patch Run is busy: {run_identifier}" in approve_result.output
-    assert candidate_path.read_bytes() == candidate_before
-    assert not (data_root / run_identifier / "attempts" / "1" / "apply.json").exists()
-
-
 def test_approve_continues_when_every_replacement_is_already_applied(tmp_path: Path) -> None:
     data_root = tmp_path / "runs"
     run_result = CliRunner().invoke(
@@ -1817,12 +1497,9 @@ editable_paths = ["pkg/cart.py"]
         create_cli(
             model_gateway=CandidateScenarioModel("valid", "pkg/cart.py"),
             data_root=data_root,
+            fixture_roots=(repository,),
         ),
-        [
-            "run-local",
-            str(repository),
-            "--trust-repository",
-        ],
+        ["run", "nested-repository"],
     )
     run_identifier = _run_identifier(run_result.output)
     workspace = data_root / run_identifier / "workspace"
@@ -1881,12 +1558,12 @@ editable_paths = ["one.py", "two.py"]
     )
     data_root = tmp_path / "runs"
     run_result = CliRunner().invoke(
-        create_cli(model_gateway=TwoFileCandidateModel(), data_root=data_root),
-        [
-            "run-local",
-            str(repository),
-            "--trust-repository",
-        ],
+        create_cli(
+            model_gateway=TwoFileCandidateModel(),
+            data_root=data_root,
+            fixture_roots=(repository,),
+        ),
+        ["run", "two-file-repository"],
     )
     run_identifier = _run_identifier(run_result.output)
     run_root = data_root / run_identifier
@@ -2091,7 +1768,7 @@ def test_model_cannot_read_an_absolute_workspace_path(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("path", ["../outside.py", ".git/config", "venv/secret.py"])
 def test_model_cannot_read_traversing_or_ignored_paths(tmp_path: Path, path: str) -> None:
-    result, _ = _run_trusted_inspection(
+    result, _ = _run_fixture_inspection(
         tmp_path,
         ScriptedModel(inspection_calls=(ScriptedInspectionCall("read", path),)),
     )
@@ -2114,7 +1791,7 @@ def test_model_can_only_read_bounded_utf8_text(
     content: bytes,
     message: str,
 ) -> None:
-    result, _ = _run_trusted_inspection(
+    result, _ = _run_fixture_inspection(
         tmp_path,
         ScriptedModel(inspection_calls=(ScriptedInspectionCall("read", name),)),
         extra_files={name: content},
@@ -2128,7 +1805,7 @@ def test_model_cannot_read_a_symlink_created_during_baseline(tmp_path: Path) -> 
     outside = tmp_path / "outside.py"
     outside.write_text("SECRET = True\n", encoding="utf-8")
     program = f"import os; os.symlink({str(outside)!r}, 'link.py'); raise SystemExit(1)"
-    result, _ = _run_trusted_inspection(
+    result, _ = _run_fixture_inspection(
         tmp_path,
         ScriptedModel(inspection_calls=(ScriptedInspectionCall("read", "link.py"),)),
         baseline_program=program,
@@ -2140,7 +1817,7 @@ def test_model_cannot_read_a_symlink_created_during_baseline(tmp_path: Path) -> 
 
 def test_search_response_is_predictably_limited_to_32_kib(tmp_path: Path) -> None:
     model = SearchRecordingModel()
-    result, _ = _run_trusted_inspection(
+    result, _ = _run_fixture_inspection(
         tmp_path,
         model,
         extra_files={"large.txt": ("needle: matching source line\n" * 2500).encode()},
@@ -2154,7 +1831,7 @@ def test_search_response_is_predictably_limited_to_32_kib(tmp_path: Path) -> Non
 
 
 def test_model_plan_is_runtime_validated_before_artifact_persistence(tmp_path: Path) -> None:
-    result, data_root = _run_trusted_inspection(tmp_path, InvalidPlanModel())
+    result, data_root = _run_fixture_inspection(tmp_path, InvalidPlanModel())
 
     assert result.exit_code == 0, result.output
     assert "Outcome: Error" in result.output
@@ -2166,52 +1843,8 @@ def test_model_plan_is_runtime_validated_before_artifact_persistence(tmp_path: P
     assert not (run_roots[0] / "plan.json").exists()
 
 
-def test_user_starts_trusted_repository_run_from_repository_contract(tmp_path: Path) -> None:
-    repository = tmp_path / "trusted-repository"
-    repository.mkdir()
-    original_source = b"def total(items):\n    return sum(items)\n"
-    (repository / "cart.py").write_bytes(original_source)
-    contract = repository / "patch-run.toml"
-    contract.write_text(
-        f"""source_id = "trusted-cart"
-issue = "Fix the incorrect cart total"
-verification = {json.dumps([sys.executable, "-c", "raise SystemExit(1)"])}
-editable_paths = ["cart.py"]
-""",
-        encoding="utf-8",
-    )
-    data_root = tmp_path / "runs"
-    cli = create_cli(model_gateway=ScriptedModel(), data_root=data_root)
-
-    result = CliRunner().invoke(
-        cli,
-        [
-            "run-local",
-            str(repository),
-            "--trust-repository",
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    run_identifier = _run_identifier(result.output)
-    workspace = data_root / run_identifier / "workspace"
-    assert (workspace / "cart.py").read_bytes() == original_source
-    assert (repository / "cart.py").read_bytes() == original_source
-    assert "Trusted Repository: trusted-cart" in result.output
-    assert "status: pending_approval" in result.output
-    revision_match = re.search(r"Source Revision: ([0-9a-f]{64})", result.output)
-    assert revision_match is not None
-
-    status_cli = create_cli(model_gateway=ScriptedModel(), data_root=data_root)
-    status = CliRunner().invoke(status_cli, ["status", run_identifier])
-    assert status.exit_code == 0, status.output
-    assert "Trusted Repository: trusted-cart" in status.output
-    assert f"Source Revision: {revision_match.group(1)}" in status.output
-    assert "Phase: pending_approval" in status.output
-
-
 def test_run_workspace_excludes_visible_virtual_environment(tmp_path: Path) -> None:
-    repository = tmp_path / "trusted-repository"
+    repository = tmp_path / "custom-fixture"
     repository.mkdir()
     (repository / "cart.py").write_text("def total():\n    return 0\n", encoding="utf-8")
     virtual_environment = repository / "venv" / "lib"
@@ -2219,7 +1852,7 @@ def test_run_workspace_excludes_visible_virtual_environment(tmp_path: Path) -> N
     (virtual_environment / "dependency.py").write_text("SECRET = True\n", encoding="utf-8")
     contract = repository / "patch-run.toml"
     contract.write_text(
-        f"""source_id = "trusted-cart"
+        f"""source_id = "custom-cart"
 issue = "Fix the incorrect cart total"
 verification = {json.dumps([sys.executable, "-c", "raise SystemExit(1)"])}
 editable_paths = ["cart.py"]
@@ -2227,15 +1860,15 @@ editable_paths = ["cart.py"]
         encoding="utf-8",
     )
     data_root = tmp_path / "runs"
-    cli = create_cli(model_gateway=ScriptedModel(), data_root=data_root)
+    cli = create_cli(
+        model_gateway=ScriptedModel(),
+        data_root=data_root,
+        fixture_roots=(repository,),
+    )
 
     result = CliRunner().invoke(
         cli,
-        [
-            "run-local",
-            str(repository),
-            "--trust-repository",
-        ],
+        ["run", "custom-cart"],
     )
 
     assert result.exit_code == 0, result.output
@@ -2245,12 +1878,12 @@ editable_paths = ["cart.py"]
 
 
 def test_passing_baseline_becomes_issue_not_reproduced(tmp_path: Path) -> None:
-    repository = tmp_path / "trusted-repository"
+    repository = tmp_path / "custom-fixture"
     repository.mkdir()
     (repository / "cart.py").write_text("VALUE = 1\n", encoding="utf-8")
     contract = repository / "patch-run.toml"
     contract.write_text(
-        f"""source_id = "trusted-passing"
+        f"""source_id = "passing-fixture"
 issue = "Reproduce the reported issue"
 verification = {json.dumps([sys.executable, "-c", "raise SystemExit(0)"])}
 editable_paths = ["cart.py"]
@@ -2258,15 +1891,15 @@ editable_paths = ["cart.py"]
         encoding="utf-8",
     )
     data_root = tmp_path / "runs"
-    cli = create_cli(model_gateway=ScriptedModel(), data_root=data_root)
+    cli = create_cli(
+        model_gateway=ScriptedModel(),
+        data_root=data_root,
+        fixture_roots=(repository,),
+    )
 
     result = CliRunner().invoke(
         cli,
-        [
-            "run-local",
-            str(repository),
-            "--trust-repository",
-        ],
+        ["run", "passing-fixture"],
     )
 
     assert result.exit_code == 0, result.output
@@ -2285,12 +1918,12 @@ editable_paths = ["cart.py"]
 
 
 def test_baseline_exit_code_two_becomes_verification_error(tmp_path: Path) -> None:
-    repository = tmp_path / "trusted-repository"
+    repository = tmp_path / "custom-fixture"
     repository.mkdir()
     (repository / "cart.py").write_text("VALUE = 1\n", encoding="utf-8")
     contract = repository / "patch-run.toml"
     contract.write_text(
-        f"""source_id = "trusted-error"
+        f"""source_id = "error-fixture"
 issue = "Reproduce the reported issue"
 verification = {json.dumps([sys.executable, "-c", "raise SystemExit(2)"])}
 editable_paths = ["cart.py"]
@@ -2298,15 +1931,15 @@ editable_paths = ["cart.py"]
         encoding="utf-8",
     )
     data_root = tmp_path / "runs"
-    cli = create_cli(model_gateway=ScriptedModel(), data_root=data_root)
+    cli = create_cli(
+        model_gateway=ScriptedModel(),
+        data_root=data_root,
+        fixture_roots=(repository,),
+    )
 
     result = CliRunner().invoke(
         cli,
-        [
-            "run-local",
-            str(repository),
-            "--trust-repository",
-        ],
+        ["run", "error-fixture"],
     )
 
     assert result.exit_code == 0, result.output
@@ -2369,8 +2002,12 @@ editable_paths = ["cart.py"]
     )
     data_root = tmp_path / "runs"
     run_result = CliRunner().invoke(
-        create_cli(model_gateway=ScriptedModel(), data_root=data_root),
-        ["run-local", str(repository), "--trust-repository"],
+        create_cli(
+            model_gateway=ScriptedModel(),
+            data_root=data_root,
+            fixture_roots=(repository,),
+        ),
+        ["run", "repair-verification-error"],
     )
     run_identifier = _run_identifier(run_result.output)
 
@@ -2386,13 +2023,13 @@ editable_paths = ["cart.py"]
     assert "Attempts Exhausted" not in approve_result.output
 
 
-def test_baseline_timeout_becomes_budget_exceeded(tmp_path: Path) -> None:
-    repository = tmp_path / "trusted-repository"
+def test_baseline_timeout_becomes_verification_error(tmp_path: Path) -> None:
+    repository = tmp_path / "custom-fixture"
     repository.mkdir()
     (repository / "cart.py").write_text("VALUE = 1\n", encoding="utf-8")
     contract = repository / "patch-run.toml"
     contract.write_text(
-        f"""source_id = "trusted-timeout"
+        f"""source_id = "timeout-fixture"
 issue = "Reproduce the reported issue"
 verification = {json.dumps([sys.executable, "-c", "import time; time.sleep(1)"])}
 editable_paths = ["cart.py"]
@@ -2403,21 +2040,19 @@ editable_paths = ["cart.py"]
     cli = create_cli(
         model_gateway=ScriptedModel(),
         data_root=data_root,
+        fixture_roots=(repository,),
         verification_timeout_seconds=0.01,
     )
 
     result = CliRunner().invoke(
         cli,
-        [
-            "run-local",
-            str(repository),
-            "--trust-repository",
-        ],
+        ["run", "timeout-fixture"],
     )
 
     assert result.exit_code == 0, result.output
     assert "Baseline Verification: timeout" in result.output
-    assert "Outcome: Budget Exceeded" in result.output
+    assert "Outcome: Error" in result.output
+    assert "Error Kind: verification_timeout" in result.output
     assert "PatchCodeAgent plan" not in result.output
     run_identifier = _run_identifier(result.output)
     baseline = json.loads((data_root / run_identifier / "baseline" / "result.json").read_text())
@@ -2427,7 +2062,7 @@ editable_paths = ["cart.py"]
     status_cli = create_cli(model_gateway=ScriptedModel(), data_root=data_root)
     status = CliRunner().invoke(status_cli, ["status", run_identifier])
     assert status.exit_code == 0, status.output
-    assert "Phase: budget_exceeded" in status.output
+    assert "Phase: error" in status.output
 
 
 def test_baseline_uses_minimal_environment_and_bounded_checkpoint_summary(
@@ -2435,7 +2070,7 @@ def test_baseline_uses_minimal_environment_and_bounded_checkpoint_summary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("GEMINI_API_KEY", "must-not-reach-verification")
-    repository = tmp_path / "trusted-repository"
+    repository = tmp_path / "custom-fixture"
     repository.mkdir()
     (repository / "cart.py").write_text("VALUE = 1\n", encoding="utf-8")
     script = (
@@ -2446,7 +2081,7 @@ def test_baseline_uses_minimal_environment_and_bounded_checkpoint_summary(
     )
     contract = repository / "patch-run.toml"
     contract.write_text(
-        f"""source_id = "trusted-environment"
+        f"""source_id = "environment-fixture"
 issue = "Reproduce the reported issue"
 verification = {json.dumps([sys.executable, "-c", script])}
 editable_paths = ["cart.py"]
@@ -2454,15 +2089,15 @@ editable_paths = ["cart.py"]
         encoding="utf-8",
     )
     data_root = tmp_path / "runs"
-    cli = create_cli(model_gateway=ScriptedModel(), data_root=data_root)
+    cli = create_cli(
+        model_gateway=ScriptedModel(),
+        data_root=data_root,
+        fixture_roots=(repository,),
+    )
 
     result = CliRunner().invoke(
         cli,
-        [
-            "run-local",
-            str(repository),
-            "--trust-repository",
-        ],
+        ["run", "environment-fixture"],
     )
 
     assert result.exit_code == 0, result.output
@@ -2478,38 +2113,13 @@ editable_paths = ["cart.py"]
     assert "must-not-reach-verification" not in baseline["output_excerpt"]
 
 
-def test_user_must_explicitly_acknowledge_trusted_repository_execution(tmp_path: Path) -> None:
-    repository = tmp_path / "trusted-repository"
-    repository.mkdir()
-    contract = repository / "patch-run.toml"
-    contract.write_text(
-        """source_id = "trusted-cart"
-issue = "Fix the incorrect cart total"
-verification = ["pytest"]
-editable_paths = ["cart.py"]
-""",
-        encoding="utf-8",
-    )
-    data_root = tmp_path / "runs"
-    cli = create_cli(model_gateway=ScriptedModel(), data_root=data_root)
-
-    result = CliRunner().invoke(
-        cli,
-        ["run-local", str(repository)],
-    )
-
-    assert result.exit_code != 0
-    assert "requires explicit --trust-repository acknowledgement" in result.output
-    assert not data_root.exists()
-
-
-def test_trusted_repository_contract_is_protected_in_workspace(tmp_path: Path) -> None:
-    repository = tmp_path / "trusted-repository"
+def test_fixture_manifest_is_protected_in_workspace(tmp_path: Path) -> None:
+    repository = tmp_path / "custom-fixture"
     repository.mkdir()
     (repository / "cart.py").write_text("def total():\n    return 0\n", encoding="utf-8")
     contract = repository / "patch-run.toml"
     contract.write_text(
-        f"""source_id = "trusted-cart"
+        f"""source_id = "custom-cart"
 issue = "Fix the incorrect cart total"
 verification = {json.dumps([sys.executable, "-c", "raise SystemExit(1)"])}
 editable_paths = ["cart.py", "patch-run.toml"]
@@ -2520,28 +2130,25 @@ editable_paths = ["cart.py", "patch-run.toml"]
     cli = create_cli(
         model_gateway=CandidateScenarioModel("protected", "patch-run.toml"),
         data_root=data_root,
+        fixture_roots=(repository,),
     )
 
     result = CliRunner().invoke(
         cli,
-        [
-            "run-local",
-            str(repository),
-            "--trust-repository",
-        ],
+        ["run", "custom-cart"],
     )
 
     assert result.exit_code == 2
     assert "Candidate Patch path is protected: patch-run.toml" in result.output
 
 
-def test_trusted_repository_rejects_run_storage_inside_source_tree(tmp_path: Path) -> None:
-    repository = tmp_path / "trusted-repository"
+def test_fixture_rejects_run_storage_inside_source_tree(tmp_path: Path) -> None:
+    repository = tmp_path / "custom-fixture"
     repository.mkdir()
     (repository / "cart.py").write_text("def total():\n    return 0\n", encoding="utf-8")
     contract = repository / "patch-run.toml"
     contract.write_text(
-        """source_id = "trusted-cart"
+        """source_id = "custom-cart"
 issue = "Fix the incorrect cart total"
 verification = ["pytest"]
 editable_paths = ["cart.py"]
@@ -2549,15 +2156,15 @@ editable_paths = ["cart.py"]
         encoding="utf-8",
     )
     data_root = repository / "runs"
-    cli = create_cli(model_gateway=ScriptedModel(), data_root=data_root)
+    cli = create_cli(
+        model_gateway=ScriptedModel(),
+        data_root=data_root,
+        fixture_roots=(repository,),
+    )
 
     result = CliRunner().invoke(
         cli,
-        [
-            "run-local",
-            str(repository),
-            "--trust-repository",
-        ],
+        ["run", "custom-cart"],
     )
 
     assert result.exit_code != 0
@@ -2565,15 +2172,15 @@ editable_paths = ["cart.py"]
     assert not data_root.exists()
 
 
-def test_trusted_repository_rejects_symlinked_source_root(tmp_path: Path) -> None:
-    repository = tmp_path / "trusted-repository"
+def test_fixture_rejects_symlinked_source_root(tmp_path: Path) -> None:
+    repository = tmp_path / "custom-fixture"
     repository.mkdir()
     (repository / "cart.py").write_text("def total():\n    return 0\n", encoding="utf-8")
     repository_link = tmp_path / "repository-link"
     repository_link.symlink_to(repository, target_is_directory=True)
     contract = repository / "patch-run.toml"
     contract.write_text(
-        """source_id = "trusted-cart"
+        """source_id = "custom-cart"
 issue = "Fix the incorrect cart total"
 verification = ["pytest"]
 editable_paths = ["cart.py"]
@@ -2581,15 +2188,15 @@ editable_paths = ["cart.py"]
         encoding="utf-8",
     )
     data_root = tmp_path / "runs"
-    cli = create_cli(model_gateway=ScriptedModel(), data_root=data_root)
+    cli = create_cli(
+        model_gateway=ScriptedModel(),
+        data_root=data_root,
+        fixture_roots=(repository_link,),
+    )
 
     result = CliRunner().invoke(
         cli,
-        [
-            "run-local",
-            str(repository_link),
-            "--trust-repository",
-        ],
+        ["run", "custom-cart"],
     )
 
     assert result.exit_code != 0
@@ -2597,21 +2204,21 @@ editable_paths = ["cart.py"]
     assert not data_root.exists()
 
 
-def test_user_gets_clear_error_for_invalid_trusted_repository_contract(tmp_path: Path) -> None:
-    repository = tmp_path / "trusted-repository"
+def test_fixture_manifest_requires_contract_fields(tmp_path: Path) -> None:
+    repository = tmp_path / "custom-fixture"
     repository.mkdir()
     contract = repository / "patch-run.toml"
-    contract.write_text('source_id = "trusted-cart"\n', encoding="utf-8")
+    contract.write_text('source_id = "custom-cart"\n', encoding="utf-8")
     data_root = tmp_path / "runs"
-    cli = create_cli(model_gateway=ScriptedModel(), data_root=data_root)
+    cli = create_cli(
+        model_gateway=ScriptedModel(),
+        data_root=data_root,
+        fixture_roots=(repository,),
+    )
 
     result = CliRunner().invoke(
         cli,
-        [
-            "run-local",
-            str(repository),
-            "--trust-repository",
-        ],
+        ["run", "custom-cart"],
     )
 
     assert result.exit_code != 0
@@ -2619,14 +2226,14 @@ def test_user_gets_clear_error_for_invalid_trusted_repository_contract(tmp_path:
     assert not data_root.exists()
 
 
-def test_trusted_repository_rejects_oversized_patch_run_contract(tmp_path: Path) -> None:
-    repository = tmp_path / "trusted-repository"
+def test_fixture_rejects_oversized_patch_run_contract(tmp_path: Path) -> None:
+    repository = tmp_path / "custom-fixture"
     repository.mkdir()
     (repository / "cart.py").write_text("def total():\n    return 0\n", encoding="utf-8")
     oversized_issue = "x" * 32_769
     contract = repository / "patch-run.toml"
     contract.write_text(
-        f"""source_id = "trusted-cart"
+        f"""source_id = "custom-cart"
 issue = "{oversized_issue}"
 verification = ["pytest"]
 editable_paths = ["cart.py"]
@@ -2634,15 +2241,15 @@ editable_paths = ["cart.py"]
         encoding="utf-8",
     )
     data_root = tmp_path / "runs"
-    cli = create_cli(model_gateway=ScriptedModel(), data_root=data_root)
+    cli = create_cli(
+        model_gateway=ScriptedModel(),
+        data_root=data_root,
+        fixture_roots=(repository,),
+    )
 
     result = CliRunner().invoke(
         cli,
-        [
-            "run-local",
-            str(repository),
-            "--trust-repository",
-        ],
+        ["run", "custom-cart"],
     )
 
     assert result.exit_code != 0
@@ -2651,14 +2258,14 @@ editable_paths = ["cart.py"]
     assert not data_root.exists()
 
 
-def test_trusted_repository_rejects_ignored_editable_path(tmp_path: Path) -> None:
-    repository = tmp_path / "trusted-repository"
+def test_fixture_rejects_ignored_editable_path(tmp_path: Path) -> None:
+    repository = tmp_path / "custom-fixture"
     hidden_directory = repository / ".config"
     hidden_directory.mkdir(parents=True)
     (hidden_directory / "settings.py").write_text("VALUE = 1\n", encoding="utf-8")
     contract = repository / "patch-run.toml"
     contract.write_text(
-        """source_id = "trusted-settings"
+        """source_id = "settings-fixture"
 issue = "Fix the hidden setting"
 verification = ["pytest"]
 editable_paths = [".config/settings.py"]
@@ -2666,15 +2273,15 @@ editable_paths = [".config/settings.py"]
         encoding="utf-8",
     )
     data_root = tmp_path / "runs"
-    cli = create_cli(model_gateway=ScriptedModel(), data_root=data_root)
+    cli = create_cli(
+        model_gateway=ScriptedModel(),
+        data_root=data_root,
+        fixture_roots=(repository,),
+    )
 
     result = CliRunner().invoke(
         cli,
-        [
-            "run-local",
-            str(repository),
-            "--trust-repository",
-        ],
+        ["run", "settings-fixture"],
     )
 
     assert result.exit_code != 0

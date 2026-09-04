@@ -1,63 +1,66 @@
 # PatchCodeAgent
 
-以 LangGraph 實作的 test-driven coding-agent harness 練習專案。
+English | [繁體中文](./README.zh-TW.md)
 
-PatchCodeAgent 的重點不是讓模型自由操作 shell，而是把一次程式修補拆成可觀察、可暫停、
-可核准、可驗證的 **Patch Run**：PatchCodeAgent 程式負責控制流程、修改檔案與執行測試，
-模型只負責提出 Plan、Candidate Patch 與 Diagnosis。
+This is a test-driven coding agent harness for learning LangGraph. It uses one bundled exercise to
+demonstrate conditional routing, interrupt/resume, persistent state, and human-in-the-loop
+approval.
+
+Instead of giving a model unrestricted shell access, PatchCodeAgent breaks a code repair into an
+observable, pausable, reviewable, and verifiable **Patch Run**. PatchCodeAgent controls the flow,
+modifies files, and runs tests; the model only proposes a Plan, Candidate Patch, and Diagnosis.
 
 ---
 
-## 架構
+## Architecture
 
 ```mermaid
 flowchart TD
-    human["使用者"] --> cli["PatchCodeAgent CLI"]
+    human["User"] --> cli["PatchCodeAgent CLI"]
 
-    cli -->|"command: patch-code-agent run cart-discount<br/>可加 --model gemini-..."| fixture["內建練習專案<br/>Fixture Repository<br/>例：cart-discount"]
+    cli -->|"command: patch-code-agent run cart-discount<br/>optionally add --model gemini-..."| fixture["Bundled exercise repository<br/>Fixture Repository<br/>Example: cart-discount"]
 
-    fixture --> source["讀取專案與修補規則<br/>Repository Source Adapter"]
-    source --> app["準備並執行一次 Patch Run<br/>PatchCodeAgent"]
-    app -->|"複製；不修改來源專案"| workspace["本次執行的獨立副本<br/>Run Workspace"]
-    app --> workflow["修補流程<br/>LangGraph"]
+    fixture -->|"Read the issue, test command,<br/>and editable files"| app["Prepare and run one Patch Run<br/>PatchCodeAgent"]
+    app -->|"Copy without modifying the source"| workspace["Isolated copy for this run<br/>Run Workspace"]
+    app --> workflow["Repair workflow<br/>LangGraph"]
     workspace <--> workflow
 
-    model["選用的模型<br/>自動化測試：Scripted Model<br/>實際模型：Gemini"] -.->|"只提出 Plan、Patch、Diagnosis"| workflow
-    workflow --> candidate["等待核准的修改<br/>Candidate Patch"]
-    candidate --> approval{"要不要套用這份修改？<br/>Approval Gate"}
+    model["Selected model<br/>Automated tests: Scripted Model<br/>External model: Gemini"] -.->|"Only proposes a Plan,<br/>Patch, and Diagnosis"| workflow
+    workflow --> candidate["Proposed change awaiting review<br/>Candidate Patch"]
+    candidate --> approval{"Apply this change?<br/>Approval Gate"}
     cli -->|"command: patch-code-agent approve RUN_ID"| approval
     cli -->|"command: patch-code-agent reject RUN_ID"| approval
 
-    approval -->|"approve"| apply["套用修改到<br/>Run Workspace"]
+    approval -->|"approve"| apply["Apply changes to the<br/>Run Workspace"]
     apply --> workspace
-    apply --> verification["執行專案指定的測試 command<br/>例：pytest"]
-    verification -->|"fail：診斷後再提出修改"| workflow
-    verification -->|"pass"| succeeded["修補成功<br/>結束 Patch Run"]
-    approval -->|"reject"| rejected["不修改 Workspace<br/>結束 Patch Run"]
+    apply --> verification["Run the configured test command<br/>Example: pytest"]
+    verification -->|"fail: diagnose and propose another change"| workflow
+    verification -->|"pass"| succeeded["Repair succeeded<br/>End Patch Run"]
+    approval -->|"reject"| rejected["Leave the Workspace unchanged<br/>End Patch Run"]
 
-    approval -.->|"暫停並保存"| storage[("執行記錄<br/>狀態 · diff · logs · report")]
+    approval -.->|"Pause and persist"| storage[("Run records<br/>state · diff · logs · report")]
     succeeded --> storage
     rejected --> storage
-    cli -->|"command: patch-code-agent status RUN_ID"| status["讀取目前狀態<br/>PatchRunStatusReader"]
+    cli -->|"command: patch-code-agent status RUN_ID"| status["Read the current state<br/>PatchRunStatusReader"]
     status --> storage
     workflow <--> storage
 ```
 
-| 元件 | 負責什麼 |
+| Module | Responsibility |
 |---|---|
-| **Fixture Repository** | 專案附帶的練習題，例如 `cart-discount`；適合第一次試跑與自動化測試 |
-| **Run Workspace** | 原始專案的獨立副本；所有修改都發生在這裡，不會直接改來源專案 |
-| **LangGraph** | 依序執行測試、規劃、產生 Patch、等待核准、套用修改與再次測試 |
-| **Scripted Model / Gemini** | 未指定 `--model` 時使用離線 Scripted Model；指定後由 Gemini 提出 Plan、Patch 與 Diagnosis |
-| **執行記錄** | 保存目前狀態、diff、測試 logs 與最後的 report，供 `status` 或後續 resume 使用 |
+| **Fixture Repository** | A bundled exercise such as `cart-discount`; useful for a first run and automated tests |
+| **Run Workspace** | An isolated copy of the source; all changes happen here, never in the source fixture |
+| **LangGraph** | Runs verification, planning, patch generation, approval, patch application, and verification again |
+| **Scripted Model / Gemini** | Uses the offline Scripted Model unless `--model` selects Gemini to propose a Plan, Patch, and Diagnosis |
+| **Run records** | Persist state, diffs, test logs, and the final report for `status` and later resume operations |
 
-完整狀態機、工具與信任邊界、Approval/replay safety、Resource Budgets、artifact layout 與
-Run Report schema 見 [docs/design.md](./docs/design.md)。單一決策的理由則記在
-[docs/adr/](./docs/adr/0001-prioritize-engineering-demonstration.md)。
+See [docs/design.md](./docs/design.md) for the full state machine, tool and trust boundaries,
+Approval and replay safety, fixed safety limits, artifact layout, and Run Report schema.
 
 ### Patch Run graph
 
-以下 Mermaid 圖直接對應 `build_graph()` 編譯出的 nodes、edges 與 conditional routes：
+The Mermaid graph below directly reflects the nodes, edges, and conditional routes compiled by
+`build_graph()`:
 
 ```mermaid
 ---
@@ -79,21 +82,21 @@ graph TD;
     finalize_report(finalize_report)
     __end__([<p>__end__</p>]):::last
     __start__ --> validate_input;
-    apply_candidate -. end .-> finalize_report;
+    apply_candidate -. apply_failed .-> finalize_report;
     apply_candidate -. verify .-> repair_verification;
     approval_gate -. approve .-> apply_candidate;
     approval_gate -. reject .-> reject_candidate;
     baseline_verification -.-> create_plan;
-    baseline_verification -. end .-> finalize_report;
-    create_candidate -. approval .-> approval_gate;
-    create_candidate -. end .-> finalize_report;
-    create_diagnosis -. candidate .-> create_candidate;
-    create_diagnosis -. end .-> finalize_report;
+    baseline_verification -. finish_without_repair .-> finalize_report;
+    create_candidate -. wait_for_approval .-> approval_gate;
+    create_candidate -. candidate_failed .-> finalize_report;
+    create_diagnosis -. retry .-> create_candidate;
+    create_diagnosis -. cannot_retry .-> finalize_report;
     create_plan -. candidate .-> create_candidate;
-    create_plan -. end .-> finalize_report;
+    create_plan -. plan_failed .-> finalize_report;
     reject_candidate --> finalize_report;
     repair_verification -. diagnose .-> create_diagnosis;
-    repair_verification -. end .-> finalize_report;
+    repair_verification -. finish_verification .-> finalize_report;
     validate_input --> baseline_verification;
     finalize_report --> __end__;
     classDef default fill:#f2f0ff,line-height:1.2
@@ -101,7 +104,8 @@ graph TD;
     classDef last fill:#bfb6fc
 ```
 
-修改 graph 後，執行以下 command 會在終端輸出最新的 Mermaid Markdown，可用來更新上面的圖：
+After changing the graph, run this command to print the latest Mermaid Markdown for updating the
+diagram above:
 
 ```bash
 uv run python scripts/render_graph.py
@@ -109,73 +113,75 @@ uv run python scripts/render_graph.py
 
 ---
 
-## 快速開始
+## Quick start
 
-目前需要 **Python 3.12+** 與 [uv](https://docs.astral.sh/uv/)。
+PatchCodeAgent requires **Python 3.12+** and [uv](https://docs.astral.sh/uv/).
 
-### 測試內建練習專案
+### Try the bundled exercise
 
 ```bash
-# 安裝專案執行與開發需要的套件。
+# Install runtime and development dependencies.
 uv sync --dev
 
-# 列出可以直接試跑的內建練習專案。
+# List the bundled exercises that are ready to run.
 uv run patch-code-agent fixtures
 
-# 對 cart-discount 建立 Patch Run；記下輸出的 Run Identifier。
+# Start a Patch Run for cart-discount and note the printed Run Identifier.
 uv run patch-code-agent run cart-discount
 
-# 把上一步輸出的 Run Identifier 貼到這裡。
-RUN_ID="貼上 Run Identifier"
+# Paste the Run Identifier from the previous command here.
+RUN_ID="paste the Run Identifier here"
 
-# 查看 Run 的狀態、Plan 與等待核准的 Candidate Patch。
+# Inspect the Run state, Plan, and Candidate Patch awaiting approval.
 uv run patch-code-agent status "$RUN_ID"
 
-# 核准 Candidate Patch、套用修改並重新執行測試。
+# Approve the Candidate Patch, apply it, and rerun the tests.
 uv run patch-code-agent approve "$RUN_ID" --yes
 
-# 查看核准後的最終狀態與測試結果。
+# Inspect the final state and test result.
 uv run patch-code-agent status "$RUN_ID"
 
-# 若想測試拒絕流程，先建立另一個不會影響前一個結果的 Patch Run。
+# To try rejection, start a separate Patch Run that will not affect the previous result.
 uv run patch-code-agent run cart-discount
 
-# 把新 Run 輸出的 Run Identifier 貼到這裡。
-NEW_RUN_ID="貼上新的 Run Identifier"
+# Paste the new Run Identifier here.
+NEW_RUN_ID="paste the new Run Identifier here"
 
-# 拒絕 Candidate Patch。
+# Reject the Candidate Patch.
 uv run patch-code-agent reject "$NEW_RUN_ID"
 
-# 確認該 Run 已結束且 workspace 沒有套用 Candidate Patch。
+# Confirm that the Run ended without applying the Candidate Patch to its workspace.
 uv run patch-code-agent status "$NEW_RUN_ID"
 ```
 
-核准流程完成後，看到 `Outcome: Succeeded` 和 `Verification: passed` 就代表修補成功。CLI 最後會
-列出完整路徑，可依序查看修改後的檔案、Verification log、`cumulative.diff` 與 `report.json`。
+When the approval flow finishes, `Outcome: Succeeded` and `Verification: passed` mean the repair
+succeeded. The CLI prints full paths to the modified files, Verification log, `cumulative.diff`,
+and `report.json` so you can inspect the result.
 
-### 使用 Gemini
+### Use Gemini
 
-要讓 Gemini 實際閱讀程式碼並產生 Candidate Patch，先安裝 optional dependency，再透過環境變數
-提供 AI Studio key：
+To let Gemini read the code and propose a Candidate Patch, install the optional dependency and
+provide a Google AI Studio key through an environment variable:
 
 ```bash
-# 安裝 Gemini integration。
+# Install the Gemini integration.
 uv sync --extra gemini
 
-# 建立本機環境變數檔案，再把 GEMINI_API_KEY 填入 .env。
+# Create a local environment file, then add your GEMINI_API_KEY to .env.
 cp .env.example .env
 
-# 使用 Gemini 處理內建練習專案。
+# Use Gemini for the bundled exercise.
 uv run patch-code-agent run cart-discount --model gemini-3.7-flash
 ```
 
-目前可用的 CLI：
+The graph still pauses at the Approval Gate after Gemini produces a Candidate Patch. Note the Run
+Identifier, then continue with the `status` and `approve` commands from the previous section.
+
+Available CLI commands:
 
 ```text
 patch-code-agent fixtures
 patch-code-agent run cart-discount [--model gemini-3.7-flash]
-patch-code-agent run-local <repository> --trust-repository [--model gemini-3.7-flash]
-patch-code-agent live-smoke cart-discount [--yes] [--model gemini-3.7-flash]
 patch-code-agent status <run-id>
 patch-code-agent approve <run-id> [--yes]
 patch-code-agent reject <run-id>
@@ -183,78 +189,69 @@ patch-code-agent reject <run-id>
 
 ---
 
-## 開發與測試
+## Development and testing
 
-| 指令 | 做什麼 |
+| Command | Purpose |
 |---|---|
-| `uv sync --dev` | 安裝 runtime 與 development dependencies |
-| `uv run pytest` | 執行 graph 與 CLI acceptance tests |
-| `uv run ruff check .` | 執行 Python lint |
-| `uv run python scripts/render_graph.py` | 從 compiled graph 輸出 Mermaid Markdown |
-| `uv run patch-code-agent run cart-discount` | 建立隔離的 CLI smoke run |
-| `uv run patch-code-agent live-smoke cart-discount --yes` | 以 Gemini 執行 opt-in synthetic Live Smoke |
-| `uv run pytest examples/tiny_repo/test_cart.py` | 執行 fixture baseline；目前預期失敗 |
+| `uv sync --dev` | Install runtime and development dependencies |
+| `uv run pytest` | Run the graph and CLI acceptance tests |
+| `uv run ruff check .` | Run the Python linter |
+| `uv run python scripts/render_graph.py` | Print Mermaid Markdown from the compiled graph |
+| `uv run patch-code-agent run cart-discount` | Create an isolated Patch Run |
+| `uv run pytest examples/tiny_repo/test_cart.py` | Run the fixture baseline; it is expected to fail |
 
 ---
 
-## 專案結構
+## Project structure
 
 ```text
 src/patch_code_agent/
-  __main__.py          python -m patch_code_agent 入口
-  application.py       Fixture、workspace 與 checkpoint 的應用層 seam
-  candidate.py         structured replacement validation、exact diff 與 replay ledger
-  cli.py               Typer CLI 與 Rich 輸出
-  diagnosis.py         typed Diagnosis、failure evidence 與 replay ledger
-  fixtures/            內建 Fixture Repository 的 discovery 與 registry
-  gemini.py             Gemini 3.7 Flash transport、tool loop、retry 與 Live Smoke gateway
-  graph.py             LangGraph nodes、edges 與 checkpoint 組裝
-  inspection.py        bounded list、read、search 與 workspace 安全規則
-  locking.py           mutating CLI commands 的 per-run exclusive lock
-  patching.py          replay-safe replacement apply、preimage 分類與 cumulative diff
-  planning.py          typed Plan validation、artifact checksum 與 replay ledger
-  sources.py           共用 Patch Run Manifest、Repository Source 與 validation
-  state.py             Patch Run graph state
-  verification.py      Baseline／Repair Verification、結果分類與 replay-safe logs
-  workspace.py         隔離 Run Workspace 的建立規則
+  __main__.py          Entry point for python -m patch_code_agent
+  application.py       Application seam for fixtures, workspaces, and checkpoints
+  candidate.py         Structured replacement validation, exact diffs, and replay ledger
+  cli.py               Typer CLI and Rich output
+  diagnosis.py         Typed Diagnosis, failure evidence, and replay ledger
+  fixtures/            Discovery and registry for bundled Fixture Repositories
+  gemini.py             Gemini transport, tool loop, and retries
+  graph.py              LangGraph nodes, edges, and checkpoint assembly
+  inspection.py         Bounded list, read, and search tools plus workspace safety rules
+  limits.py             Fixed safety limits for repairs, files, tools, and model requests
+  model.py              Model inputs, outputs, and the offline Scripted Model
+  model_output.py       Structured output validation and correction retry
+  patching.py           Replay-safe replacement apply, preimage classification, and cumulative diff
+  planning.py           Typed Plan validation, artifact checksum, and replay ledger
+  reporting.py          Run Events and the final report.json
+  sources.py            Fixture Patch Run Manifest, Repository Source, and validation
+  state.py              Patch Run graph state
+  verification.py      Baseline/Repair Verification, outcome classification, and replay-safe logs
+  workspace.py         Rules for creating isolated Run Workspaces
 
 tests/
-  test_cli.py          Registry、workspace、baseline outcomes、artifacts 與 durable status
-  test_gemini.py       Gemini transport contract、tool circulation、retry 與 request budget
+  test_cli.py          Registry, workspace, baseline outcomes, artifacts, and durable status
+  test_gemini.py       Gemini transport contract, tool circulation, retries, and request limit
   test_graph.py        Graph smoke test
 
 scripts/
-  render_graph.py      從 compiled graph 產生 Mermaid Markdown
+  render_graph.py      Generate Mermaid Markdown from the compiled graph
 
 examples/tiny_repo/
-  patch-run.toml       `run` 與 `run-local` 共用的專案設定
+  patch-run.toml       Issue, Verification command, and editable paths for the bundled exercise
   issue.md             Cart discount Issue
-  cart.py              刻意保留的錯誤實作
-  test_cart.py         Fixture baseline 與 acceptance test
+  cart.py              Deliberately incorrect implementation
+  test_cart.py         Fixture baseline and acceptance test
 
 CONTEXT.md             PatchCodeAgent domain glossary
-docs/design.md         狀態機、邊界、budgets、artifacts 與 report schema
-docs/adr/              單一架構決策與取捨
-docs/agents/           Engineering skills 的 repo 設定
-AGENTS.md              Agent 需要讀取的 tracker 與 domain docs 入口
-pyproject.toml          Package、dependencies、pytest 與 Ruff 設定
-uv.lock                鎖定 dependencies
+docs/design.md         State machine, boundaries, safety limits, artifacts, and report schema
+docs/adr/              Individual architectural decisions and tradeoffs
+docs/agents/           Repository configuration for engineering skills
+AGENTS.md              Entry point for tracker and domain documentation used by agents
+pyproject.toml          Package, dependency, pytest, and Ruff configuration
+uv.lock                Locked dependencies
 ```
 
 ---
 
-## 延伸閱讀
+## Further reading
 
-| 文件 | 內容 |
-|---|---|
-| **[GitHub Issue #2](https://github.com/jerryxcy/patch-code-agent/issues/2)** | MVP implementation 與 acceptance spec：user stories、驗收 seam、測試矩陣、完成條件與 non-goals |
-| **[docs/design.md](./docs/design.md)** | 從上方架構圖逐層展開：Patch Run lifecycle、工具邊界、Approval、replay safety、artifacts 與 Run Report |
-| **[CONTEXT.md](./CONTEXT.md)** | Repository Source、Patch Run、Candidate Patch、Verification 與 terminal outcomes 的正式詞彙 |
-| [ADR-0001](./docs/adr/0001-prioritize-engineering-demonstration.md) | 一日 MVP 優先完成可解釋的 end-to-end engineering demonstration |
-| [ADR-0002](./docs/adr/0002-make-patch-runs-resumable.md) · [ADR-0004](./docs/adr/0004-isolate-each-run-workspace.md) · [ADR-0006](./docs/adr/0006-accumulate-repair-attempts.md) | Run resume、workspace isolation 與累加 Repair Attempts |
-| [ADR-0003](./docs/adr/0003-constrain-the-mvp-trust-boundary.md) · [ADR-0005](./docs/adr/0005-keep-side-effects-outside-the-model.md) · [ADR-0011](./docs/adr/0011-protect-the-verification-boundary.md) | Repository、model side effects 與 Verification 的信任邊界 |
-| [ADR-0007](./docs/adr/0007-keep-orchestration-host-controlled.md) · [ADR-0013](./docs/adr/0013-use-langgraph-to-expose-the-harness.md) | Host-controlled LangGraph orchestration 與選擇較低階 abstraction 的原因 |
-| [ADR-0008](./docs/adr/0008-compute-diffs-from-structured-replacements.md) · [ADR-0012](./docs/adr/0012-make-run-mutations-replay-safe.md) | Structured replacements、diff、checksum 與 replay safety |
-| [ADR-0009](./docs/adr/0009-separate-control-state-from-run-artifacts.md) | SQLite control state 與 filesystem Run Artifacts 的分界 |
-| [ADR-0014](./docs/adr/0014-require-explicit-model-selection.md) | 使用 `--model` 明確同意把 Repository 內容送到 Gemini |
-| [docs/agents/](./docs/agents/domain.md) | GitHub Issues、triage labels 與 single-context domain docs 的 agent 設定 |
+For the complete graph lifecycle, tool limits, Approval flow, replay safety, artifacts, and Run
+Report design, see [docs/design.md](./docs/design.md).

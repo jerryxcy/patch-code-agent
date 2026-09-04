@@ -61,7 +61,7 @@ def bundled_fixture_roots() -> tuple[Path, ...]:
 
 
 def load_fixture_registry(roots: tuple[Path, ...]) -> FixtureRegistry:
-    """Load fixtures through the same manifest interface as local repositories."""
+    """Load and validate the configured Fixture Repository roots."""
     return FixtureRegistry(
-        tuple(FixtureRepository(load_repository_source(root, kind="fixture")) for root in roots)
+        tuple(FixtureRepository(load_repository_source(root)) for root in roots)
     )

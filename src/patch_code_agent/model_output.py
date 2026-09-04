@@ -4,7 +4,7 @@ from collections.abc import Callable
 
 from pydantic import BaseModel, ValidationError
 
-from patch_code_agent.budgets import ResourceBudgetExceededError
+from patch_code_agent.limits import MAX_MODEL_REQUESTS, RunLimitExceededError
 from patch_code_agent.model import ModelGatewayResult
 
 
@@ -61,17 +61,17 @@ def request_typed_output[StructuredModel: BaseModel](
     validation_errors: tuple[str, ...] = ()
     model_requests = 0
     for _schema_attempt in range(2):
-        remaining = 8 - prior_model_requests - model_requests
+        remaining = MAX_MODEL_REQUESTS - prior_model_requests - model_requests
         if remaining <= 0:
-            raise ResourceBudgetExceededError(
-                budget_name="model_requests",
-                budget_limit=8,
-                budget_used=8,
+            raise RunLimitExceededError(
+                limit_name="model_requests",
+                limit=MAX_MODEL_REQUESTS,
+                used=MAX_MODEL_REQUESTS,
                 model_requests=model_requests,
             )
         try:
             raw = request(validation_errors, remaining)
-        except ResourceBudgetExceededError as error:
+        except RunLimitExceededError as error:
             error.model_requests += model_requests
             raise
         except ValueError:
@@ -86,10 +86,10 @@ def request_typed_output[StructuredModel: BaseModel](
             ) from error
         if isinstance(raw, ModelGatewayResult):
             if raw.model_requests > remaining:
-                raise ResourceBudgetExceededError(
-                    budget_name="model_requests",
-                    budget_limit=8,
-                    budget_used=8,
+                raise RunLimitExceededError(
+                    limit_name="model_requests",
+                    limit=MAX_MODEL_REQUESTS,
+                    used=MAX_MODEL_REQUESTS,
                     model_requests=model_requests + remaining,
                 )
             model_requests += raw.model_requests

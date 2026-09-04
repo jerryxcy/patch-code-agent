@@ -1,7 +1,7 @@
 """Compose source, workspace, graph, Verification, and checkpoint dependencies.
 
 The CLI delegates use cases to this module instead of constructing infrastructure itself. A
-``PatchCodeAgent`` normalizes either source kind, creates an isolated workspace, invokes LangGraph
+``PatchCodeAgent`` loads a Fixture Repository, creates an isolated workspace, invokes LangGraph
 under the Run Identifier, and owns the writable SQLite connection. ``PatchRunStatusReader`` is a
 separate read-only path so a status command cannot accidentally advance the graph.
 """
@@ -10,7 +10,6 @@ import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from time import monotonic
 from typing import cast
 
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
@@ -18,7 +17,6 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command
 
-from patch_code_agent.budgets import ResourceBudgets
 from patch_code_agent.candidate import (
     CandidatePatchArtifact,
     CandidatePatchBuilder,
@@ -38,7 +36,6 @@ from patch_code_agent.fixtures import (
     load_fixture_registry,
 )
 from patch_code_agent.graph import build_graph
-from patch_code_agent.locking import RunMutationLock
 from patch_code_agent.model import ModelGateway, Plan
 from patch_code_agent.patching import CumulativeDiffReference, PatchApplier
 from patch_code_agent.planning import (
@@ -47,11 +44,7 @@ from patch_code_agent.planning import (
     load_plan_artifact,
 )
 from patch_code_agent.reporting import RunAuditStore, RunReportReference
-from patch_code_agent.sources import (
-    RepositorySource,
-    RepositorySourceKind,
-    load_trusted_repository,
-)
+from patch_code_agent.sources import RepositorySource, RepositorySourceKind
 from patch_code_agent.state import RunState
 from patch_code_agent.verification import (
     BaselineVerifier,
@@ -67,7 +60,7 @@ class PatchRunStatus:
 
     Attributes:
         run_id: Public Run Identifier used to query and eventually resume this workflow.
-        source_kind: Whether the Run began from a fixture or trusted local repository.
+        source_kind: The Fixture Repository source kind.
         source_id: Stable Repository Source identifier shown to the user.
         source_revision: Digest of the immutable initial source snapshot.
         model_id: Stable identifier of the Model Gateway used by this Run.
@@ -87,10 +80,7 @@ class PatchRunStatus:
         verification: Latest post-apply Verification summary, when present.
         cumulative_diff: Durable checksum reference for the aggregate repair.
         error_kind: Stable terminal error category, when present.
-        budget_name: Exceeded Resource Budget name, when present.
-        budget_limit: Configured limit of the exceeded budget.
-        budget_used: Observed usage at failure.
-        budgets: Fixed limits and current durable usage for every Resource Budget.
+        reason: Human-readable terminal explanation, when present.
         report_artifact: Immutable terminal Run Report reference, when finalized.
 
     Example:
@@ -116,10 +106,7 @@ class PatchRunStatus:
         ...     verification=None,
         ...     cumulative_diff=None,
         ...     error_kind=None,
-        ...     budget_name=None,
-        ...     budget_limit=None,
-        ...     budget_used=None,
-        ...     budgets=ResourceBudgets.from_state({}),
+        ...     reason=None,
         ...     report_artifact=None,
         ... )
         >>> status.phase
@@ -147,10 +134,7 @@ class PatchRunStatus:
     verification: RepairVerificationSummary | None
     cumulative_diff: CumulativeDiffReference | None
     error_kind: str | None
-    budget_name: str | None
-    budget_limit: int | float | None
-    budget_used: int | float | None
-    budgets: ResourceBudgets
+    reason: str | None
     report_artifact: RunReportReference | None
 
 
@@ -255,10 +239,11 @@ class PatchRunStatusReader:
                 else None
             ),
             error_kind=state.get("error_kind"),
-            budget_name=state.get("budget_name"),
-            budget_limit=state.get("budget_limit"),
-            budget_used=state.get("budget_used"),
-            budgets=ResourceBudgets.from_state(state),
+            reason=(
+                str(state["report"]["note"])
+                if state.get("report", {}).get("note") is not None
+                else None
+            ),
             report_artifact=(
                 RunReportReference.model_validate(state["report_artifact"])
                 if "report_artifact" in state
@@ -271,8 +256,8 @@ class PatchCodeAgent:
     """Application service coordinating one process's Patch Run operations.
 
     Expensive stateful dependencies are lazy: listing fixtures does not open SQLite, and the graph
-    plus connection are created only when a Run starts. Source-specific work ends at the
-    ``RepositorySource`` seam; both fixture and trusted-local paths then share the same workflow.
+    plus connection are created only when a Run starts. Fixture loading ends at the
+    ``RepositorySource`` seam before the workflow begins.
     """
 
     def __init__(
@@ -282,12 +267,10 @@ class PatchCodeAgent:
         data_root: Path,
         fixture_roots: tuple[Path, ...] | None = None,
         verification_timeout_seconds: float = 60.0,
-        clock: Callable[[], float] = monotonic,
     ) -> None:
         """Configure lazy application dependencies around one durable data root."""
         self._model_gateway = model_gateway
         self._model_id = model_gateway.model_id
-        self._clock = clock
         self._data_root = data_root.resolve()
         self._fixture_roots = (
             fixture_roots if fixture_roots is not None else bundled_fixture_roots()
@@ -324,29 +307,18 @@ class PatchCodeAgent:
         source = self._fixture_registry().get(fixture_id).as_repository_source()
         return self._start_patch_run(source=source, run_id=run_id)
 
-    def start_trusted_patch_run(
-        self,
-        *,
-        repository: Path,
-        run_id: str,
-    ) -> RunState:
-        """Start a Patch Run from an explicitly selected Trusted Repository."""
-        source = load_trusted_repository(repository)
-        return self._start_patch_run(source=source, run_id=run_id)
-
     def reject_patch_run(self, *, run_id: str) -> RunState:
         """Resume one pending Approval Gate with a durable rejection decision."""
-        with RunMutationLock(self._data_root, run_id):
-            status = PatchRunStatusReader(self._data_root).get(run_id)
-            if status.phase != "pending_approval":
-                raise ValueError(
-                    f"Patch Run is not awaiting Approval (current phase: {status.phase})"
-                )
-            result = self._run_graph().invoke(
-                Command(resume="reject"),
-                config={"configurable": {"thread_id": run_id}},
+        status = PatchRunStatusReader(self._data_root).get(run_id)
+        if status.phase != "pending_approval":
+            raise ValueError(
+                f"Patch Run is not awaiting Approval (current phase: {status.phase})"
             )
-            return cast(RunState, result)
+        result = self._run_graph().invoke(
+            Command(resume="reject"),
+            config={"configurable": {"thread_id": run_id}},
+        )
+        return cast(RunState, result)
 
     def approve_patch_run(
         self,
@@ -354,24 +326,23 @@ class PatchCodeAgent:
         run_id: str,
         confirm: Callable[[PatchRunStatus], bool],
     ) -> RunState | None:
-        """Display and confirm one exact Candidate while holding the per-run mutation lock."""
-        with RunMutationLock(self._data_root, run_id):
-            status = PatchRunStatusReader(self._data_root).get(run_id)
-            if status.phase != "pending_approval":
-                raise ValueError(
-                    f"Patch Run is not awaiting Approval (current phase: {status.phase})"
-                )
-            if status.model_id != self._model_id:
-                raise ValueError(
-                    f"Patch Run requires model {status.model_id}, got {self._model_id}"
-                )
-            if not confirm(status):
-                return None
-            result = self._run_graph().invoke(
-                Command(resume="approve"),
-                config={"configurable": {"thread_id": run_id}},
+        """Display and confirm one exact Candidate before resuming its graph."""
+        status = PatchRunStatusReader(self._data_root).get(run_id)
+        if status.phase != "pending_approval":
+            raise ValueError(
+                f"Patch Run is not awaiting Approval (current phase: {status.phase})"
             )
-            return cast(RunState, result)
+        if status.model_id != self._model_id:
+            raise ValueError(
+                f"Patch Run requires model {status.model_id}, got {self._model_id}"
+            )
+        if not confirm(status):
+            return None
+        result = self._run_graph().invoke(
+            Command(resume="approve"),
+            config={"configurable": {"thread_id": run_id}},
+        )
+        return cast(RunState, result)
 
     def _start_patch_run(self, *, source: RepositorySource, run_id: str) -> RunState:
         """Snapshot a normalized source and invoke its graph under one thread ID.
@@ -385,7 +356,7 @@ class PatchCodeAgent:
                 Path(root).resolve()
                 for root in getattr(self._model_gateway, "allowed_fixture_roots", ())
             )
-            if source.kind != "fixture" or source.root.resolve() not in allowed_roots:
+            if source.root.resolve() not in allowed_roots:
                 raise ValueError(
                     "This Model Gateway only accepts bundled synthetic Fixture Repositories"
                 )
@@ -406,8 +377,6 @@ class PatchCodeAgent:
                 "tool_executions": 0,
                 "files_read": [],
                 "files_changed": [],
-                "active_duration_seconds": 0.0,
-                "active_measurements": {},
                 "workspace_path": str(workspace.path),
                 "status": "created",
             },
@@ -456,6 +425,5 @@ class PatchCodeAgent:
                 repair_verifier=self._repair_verifier,
                 audit_store=self._audit_store,
                 checkpointer=checkpointer,
-                clock=self._clock,
             )
         return self._graph
